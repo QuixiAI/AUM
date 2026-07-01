@@ -215,10 +215,9 @@ def decode(
             return True
         return False
 
-    start = torch.cuda.Event(enable_timing=enable_timing)
-    end = torch.cuda.Event(enable_timing=enable_timing)
-
-    if enable_timing:
+    if enable_timing:                                  # CUDA-only timing path
+        start = torch.cuda.Event(enable_timing=enable_timing)
+        end = torch.cuda.Event(enable_timing=enable_timing)
         start.record()
     scores, sequences = [], [input_ids]
     sequences_cat = input_ids
@@ -244,7 +243,10 @@ def decode(
         end.record()
         torch.cuda.synchronize()
         print(f"Prompt processing + decoding time: {(start.elapsed_time(end)):.0f}ms")
-    return GenerateDecoderOnlyOutput(sequences=torch.cat(sequences, dim=1), scores=tuple(scores))
+    output_cls = GenerateDecoderOnlyOutput
+    if output_cls is None:                             # transformers not installed (CPU/MPS dev)
+        output_cls = namedtuple("SampleDecoderOnlyOutput", ["sequences", "scores"])
+    return output_cls(sequences=torch.cat(sequences, dim=1), scores=tuple(scores))
 
 
 class GenerationMixin:

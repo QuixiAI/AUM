@@ -136,20 +136,53 @@ class AumBackbone(nn.Module):
             return (g_t, None) if return_aux else g_t
 
         phi = ctx["phi"]
-        phi_prev = torch.cat([torch.zeros_like(phi[:, :1]), phi[:, :-1]], dim=1)
-        logits_fn = lambda o: F.linear(o, self.embedding.weight)  # tied classifier for H_t (§12)
         read_fn, m_t, s_t = ctx["read_fn"], ctx["m_t"], ctx["s_t"]
-        # Two-pass truncated sigma carry (§9/§10): seed with zero, then feed the detached, shifted
-        # sigma_bar so each token's revision starts from the previous interpretation (TBPTT window 1).
+        logits_fn = lambda o: F.linear(o, self.embedding.weight)  # tied classifier for H_t (§12)
+        decoding = inference_params is not None and inference_params.seqlen_offset > 0
+        if decoding:                                          # single token: carry sigma_bar1 + phi_prev
+            slot = self._silence_slot(inference_params, g_t.shape[0], g_t.device)
+            phi_prev = slot["phi_prev"]
+            _, aux1 = self.silence(g_t, read_fn, phi, phi_prev, None, m_t, s_t, logits_fn, ablation)
+            o_t, aux = self.silence(g_t, read_fn, phi, phi_prev,
+                                    slot["sigma_bar1"].unsqueeze(1), m_t, s_t, logits_fn, ablation)
+            slot["sigma_bar1"].copy_(aux1.sigma_bar[:, 0])
+            slot["phi_prev"].copy_(phi)
+            return (o_t, aux) if return_aux else o_t
+
+        # prefill / training: two-pass truncated sigma carry over the sequence (§9/§10, TBPTT-1) —
+        # seed with zero, then feed the detached, shifted pass-1 sigma_bar.
+        phi_prev = torch.cat([torch.zeros_like(phi[:, :1]), phi[:, :-1]], dim=1)
         _, aux0 = self.silence(g_t, read_fn, phi, phi_prev, None, m_t, s_t, logits_fn, ablation)
         sigma_prev = torch.cat(
             [torch.zeros_like(aux0.sigma_bar[:, :1]), aux0.sigma_bar[:, :-1].detach()], dim=1)
         o_t, aux = self.silence(g_t, read_fn, phi, phi_prev, sigma_prev, m_t, s_t, logits_fn, ablation)
+        if inference_params is not None:                      # prefill: seed the silence carry slot
+            slot = self._silence_slot(inference_params, g_t.shape[0], g_t.device)
+            slot["sigma_bar1"].copy_(aux0.sigma_bar[:, -1])
+            slot["phi_prev"].copy_(phi[:, -1:])
         return (o_t, aux) if return_aux else o_t
 
+    def _silence_slot(self, inference_params, batch, device):
+        kv = inference_params.key_value_memory_dict
+        if "silence" not in kv:
+            H = self.layers[-1].unfold.nheads
+            kv["silence"] = {
+                "sigma_bar1": torch.zeros(batch, self.silence.d_sigma, device=device, dtype=torch.float32),
+                "phi_prev": torch.zeros(batch, 1, H, device=device, dtype=torch.float32),
+            }
+        return kv["silence"]
+
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
-        return {i: layer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
-                for i, layer in enumerate(self.layers)}
+        cache = {i: layer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
+                 for i, layer in enumerate(self.layers)}
+        if self.silence_enabled:
+            dev = self.embedding.weight.device
+            H = self.layers[-1].unfold.nheads
+            cache["silence"] = {
+                "sigma_bar1": torch.zeros(batch_size, self.silence.d_sigma, device=dev, dtype=torch.float32),
+                "phi_prev": torch.zeros(batch_size, 1, H, device=dev, dtype=torch.float32),
+            }
+        return cache
 
 
 class AumLMHeadModel(nn.Module, GenerationMixin):

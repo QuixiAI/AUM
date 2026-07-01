@@ -49,9 +49,16 @@ class GroundAttn(nn.Module):
         j = torch.arange(L, device=device)[None, :]
         return (j <= i) & (j > i - self.window_size)
 
-    def forward(self, x, inference_params=None, **kwargs):
-        if inference_params is not None:
-            raise NotImplementedError("GroundAttn decode path is a later milestone (Phase 3)")
+    def _cache_mask(self, Lq, Lk, device):
+        # query row i sits at absolute position (Lk - Lq + i); attend key j <= pos (+ window)
+        pos = torch.arange(Lq, device=device)[:, None] + (Lk - Lq)
+        j = torch.arange(Lk, device=device)[None, :]
+        m = j <= pos
+        if self.window_size is not None:
+            m = m & (j > pos - self.window_size)
+        return m
+
+    def forward(self, x, inference_params=None, cache=None, **kwargs):
         B, L, _ = x.shape
         q = rearrange(self.q_proj(x), "b l (h d) -> b l h d", d=self.head_dim)
         k = rearrange(self.k_proj(x), "b l (h d) -> b l h d", d=self.head_dim)
@@ -59,19 +66,29 @@ class GroundAttn(nn.Module):
         if self.q_norm is not None:
             q = self.q_norm(q)
             k = self.k_norm(k)
-        # GQA expand
+        if cache is not None:                          # prefill (offset 0) or single-token decode
+            k_cache, v_cache = cache
+            off = inference_params.seqlen_offset
+            k_cache[:, off:off + L] = k
+            v_cache[:, off:off + L] = v
+            k, v = k_cache[:, :off + L], v_cache[:, :off + L]
         rep = self.num_heads // self.num_heads_kv
         k = k.repeat_interleave(rep, dim=2)
         v = v.repeat_interleave(rep, dim=2)
         q, k, v = (rearrange(t, "b l h d -> b h l d") for t in (q, k, v))
 
-        if self.window_size is not None and self.causal:
-            attn_mask = self._window_mask(L, x.device)
-            ctx = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        if cache is not None:
+            ctx = F.scaled_dot_product_attention(q, k, v, attn_mask=self._cache_mask(L, k.shape[2], x.device))
+        elif self.window_size is not None and self.causal:
+            ctx = F.scaled_dot_product_attention(q, k, v, attn_mask=self._window_mask(L, x.device))
         else:
             ctx = F.scaled_dot_product_attention(q, k, v, is_causal=self.causal)
         ctx = rearrange(ctx, "b h l d -> b l (h d)")
         return self.o_proj(ctx)
 
-    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
-        raise NotImplementedError("GroundAttn decode cache is a later milestone (Phase 3)")
+    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, device=None, **kwargs):
+        dtype = dtype or self.o_proj.weight.dtype
+        device = device or self.o_proj.weight.device
+        shape = (batch_size, max_seqlen, self.num_heads_kv, self.head_dim)
+        return (torch.zeros(shape, device=device, dtype=dtype),
+                torch.zeros(shape, device=device, dtype=dtype))

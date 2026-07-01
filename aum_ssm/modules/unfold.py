@@ -100,59 +100,114 @@ class Unfold(nn.Module):
             raise NotImplementedError("triton backend deferred to NVIDIA bring-up")
         raise ValueError(f"unknown kernel_backend {backend!r}")
 
-    def forward(self, x, inference_params=None, return_read=False, **kwargs):
+    def forward(self, x, inference_params=None, cache=None, return_read=False, **kwargs):
         """x: (B, L, d_model) — already layer-normed by the evidence layer (§5 shared LN).
 
-        Returns (out, m_t, s_t): out (B,L,d_model); m_t (B,L,m_dim) for the M phase;
-        s_t (B,L,1) pressure drive for the top-layer silence block. When return_read=True,
-        also returns (phi, read_fn) for the silence block's swapped-query reads (§4/§10).
+        Returns (out, m_t, s_t) [+ (phi, read_fn) when return_read]. Handles three modes:
+        training (chunk kernel), prefill (chunk ref + capture S_T,phi_T,conv), and single-token
+        decode (recurrent step via aum_unfold_step_ref). `cache` = (conv_state, S, phi) is supplied
+        by the evidence layer; decode always uses the reference step.
         """
-        if inference_params is not None:
-            raise NotImplementedError("Unfold single-token decode is a later milestone (M2/Phase 3)")
+        from aum_ssm.modules.ssd_reference import (
+            aum_dynamics, aum_state_readout_ref, aum_unfold_chunk_ref, aum_unfold_step_ref,
+            _rotate_single_phase,
+        )
         B, L, _ = x.shape
+        decoding = inference_params is not None and inference_params.seqlen_offset > 0
+        conv_state = S_cache = phi_cache = None
+        if cache is not None:
+            conv_state, S_cache, phi_cache = cache
 
-        qkv = self.in_proj_qkv(x)                                    # (B,L,3*d_inner)
-        qkv = F.silu(self.conv1d(qkv.transpose(1, 2))[..., :L].transpose(1, 2))
+        # ---- projections (shared) + conv (branch on decode) ----
+        pre = self.in_proj_qkv(x)                                   # (B,L,3*d_inner)
+        if decoding:
+            qkv_c, new_conv = self._conv_step(pre[:, 0], conv_state)
+            conv_state.copy_(new_conv)
+            qkv = F.silu(qkv_c).unsqueeze(1)
+        else:
+            qkv = F.silu(self.conv1d(pre.transpose(1, 2))[..., :L].transpose(1, 2))
+            if conv_state is not None:                             # prefill: seed the conv state
+                cs = pre.transpose(1, 2)
+                conv_state.copy_(cs[..., -(self.d_conv - 1):] if L >= self.d_conv - 1
+                                 else F.pad(cs, (self.d_conv - 1 - L, 0)))
         q, k, v = qkv.split(self.d_inner, dim=-1)
         q = rearrange(q, "b l (h p) -> b l h p", p=self.headdim)
         k = rearrange(k, "b l (h p) -> b l h p", p=self.headdim)
         v = rearrange(v, "b l (h p) -> b l h p", p=self.headdim)
         z = rearrange(self.in_proj_z(x), "b l (h p) -> b l h p", p=self.headdim)
 
-        c = self.controller(x)
-        dyn = self.in_proj_dyn(c)
+        dyn = self.in_proj_dyn(self.controller(x))
         heads = dyn[..., : 4 * self.nheads].reshape(B, L, self.nheads, 4)
-        tau_bar, lam_bar, r, theta = heads.unbind(dim=-1)           # each (B,L,nheads)
-        m_t = dyn[..., 4 * self.nheads : 4 * self.nheads + self.m_dim]   # (B,L,m_dim)
-        s_t = dyn[..., 4 * self.nheads + self.m_dim :]                   # (B,L,1)
-
-        lam_bar = lam_bar + self.A_log                              # per-head lambda base offset (effective lambda_bar)
+        tau_bar, lam_bar, r, theta = heads.unbind(dim=-1)
+        m_t = dyn[..., 4 * self.nheads : 4 * self.nheads + self.m_dim]
+        s_t = dyn[..., 4 * self.nheads + self.m_dim :]
+        lam_bar = lam_bar + self.A_log
         D_hd = self.D.view(self.nheads, self.headdim)
+        nw = self.norm.weight
 
-        h = self._dispatch(q, k, v, tau_bar, lam_bar, r, theta, z, D_hd)  # (B,L,nheads,headdim)
+        # ---- recurrence ----
+        if decoding:
+            S_pre = S_cache.clone()                                # S_{t-1} for the predictive read
+            h, (S_new, phi_new) = aum_unfold_step_ref(
+                q, k, v, tau_bar, lam_bar, r, theta, z=z, D=D_hd, dt_bias=self.dt_bias,
+                eps=self.eps, S0=S_cache, phi0=phi_cache, norm_weight=nw)
+            S_cache.copy_(S_new); phi_cache.copy_(phi_new)
+            out = self.out_proj(rearrange(h, "b l h p -> b l (h p)"))
+            if not return_read:
+                return out, m_t, s_t
+            phi_1H = phi_new                                       # (B,H) current phase
+
+            def read_fn(query, phi_arg=None, exclude_current=False):
+                S = S_pre if exclude_current else S_new
+                qh = rearrange(query, "b l (h p) -> b l h p", p=self.headdim)
+                q_rot = _rotate_single_phase(qh, phi_1H.unsqueeze(1))
+                rr = torch.einsum("bhpn,blhn->blhp", S, q_rot)
+                return rearrange(rr, "b l h p -> b l (h p)")
+
+            return out, m_t, s_t, phi_new.unsqueeze(1), read_fn
+
+        if cache is not None:                                     # prefill: capture final state
+            bl = self.chunk_size if (L % self.chunk_size == 0) else L
+            h, (S_T, phi_T) = aum_unfold_chunk_ref(
+                q, k, v, tau_bar, lam_bar, r, theta, z=z, D=D_hd, dt_bias=self.dt_bias,
+                eps=self.eps, block_len=bl, norm_weight=nw)
+            S_cache.copy_(S_T); phi_cache.copy_(phi_T)
+        else:                                                     # training
+            h = self._dispatch(q, k, v, tau_bar, lam_bar, r, theta, z, D_hd)
         out = self.out_proj(rearrange(h, "b l h p -> b l (h p)"))
         if not return_read:
             return out, m_t, s_t
 
-        # Bind the swapped-query read against THIS layer's evidence state (§4/§10). The read is a
-        # linear-attention readout with the same write (k, v, dynamics); only the query changes.
-        from aum_ssm.modules.ssd_reference import aum_dynamics, aum_state_readout_ref
         _, _, _, dphi = aum_dynamics(tau_bar, lam_bar, r, theta, self.dt_bias, self.eps)
-        phi = torch.cumsum(dphi, dim=1)                             # (B,L,nheads) resonance phase
+        phi = torch.cumsum(dphi, dim=1)
         k_c, v_c, tb, lb, rw, th = k, v, tau_bar, lam_bar, r, theta
 
         def read_fn(query, phi_arg=None, exclude_current=False):
             L_ = query.shape[1]
-            bl = self.chunk_size if (L_ % self.chunk_size == 0) else L_
+            bl_ = self.chunk_size if (L_ % self.chunk_size == 0) else L_
             qh = rearrange(query, "b l (h p) -> b l h p", p=self.headdim)
             rr = aum_state_readout_ref(qh, k_c, v_c, tb, lb, rw, th, phi=phi, dt_bias=self.dt_bias,
-                                       eps=self.eps, block_len=bl, exclude_current=exclude_current)
+                                       eps=self.eps, block_len=bl_, exclude_current=exclude_current)
             return rearrange(rr, "b l h p -> b l (h p)")
 
         return out, m_t, s_t, phi, read_fn
 
-    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
-        raise NotImplementedError("Unfold decode cache is a later milestone (M2/Phase 3)")
+    def _conv_step(self, x_new, conv_state):
+        """Single-token causal depthwise conv. x_new (B,3*d_inner); conv_state (B,3*d_inner,d_conv-1)."""
+        w = self.conv1d.weight.squeeze(1)                          # (3*d_inner, d_conv)
+        window = torch.cat([conv_state, x_new.unsqueeze(-1)], dim=-1)   # (B,C,d_conv)
+        out = (window * w).sum(-1)
+        if self.conv1d.bias is not None:
+            out = out + self.conv1d.bias
+        return out, window[..., 1:]
+
+    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, device=None, **kwargs):
+        dtype = dtype or self.out_proj.weight.dtype
+        device = device or self.out_proj.weight.device
+        conv_state = torch.zeros(batch_size, 3 * self.d_inner, self.d_conv - 1, device=device, dtype=dtype)
+        S = torch.zeros(batch_size, self.nheads, self.headdim, self.headdim, device=device, dtype=torch.float32)
+        phi = torch.zeros(batch_size, self.nheads, device=device, dtype=torch.float32)
+        return conv_state, S, phi
 
 
 class _NormWeight(nn.Module):

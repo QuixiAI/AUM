@@ -32,18 +32,26 @@ class EvidenceLayer(nn.Module):
 
     def forward(self, hidden_states: Tensor, residual: Optional[Tensor] = None,
                 inference_params=None, return_silence_ctx=False, **kwargs):
+        attn_cache = unfold_cache = None
+        if inference_params is not None:                  # lazily allocate the layer cache if absent
+            kv = inference_params.key_value_memory_dict
+            if self.layer_idx not in kv:
+                kv[self.layer_idx] = self.allocate_inference_cache(
+                    hidden_states.shape[0], inference_params.max_seqlen)
+            attn_cache, unfold_cache = kv[self.layer_idx]["attn"], kv[self.layer_idx]["unfold"]
+
         # fold the previous block's output into the residual stream
         residual = (hidden_states + residual) if residual is not None else hidden_states
         if self.residual_in_fp32:
             residual = residual.to(torch.float32)
 
         x_bar = self.input_layernorm(residual)
-        h_A = self.ground_attn(x_bar, inference_params=inference_params)
+        h_A = self.ground_attn(x_bar, inference_params=inference_params, cache=attn_cache)
         if return_silence_ctx:                            # top layer: expose read closure + phase
             h_U, m_t, s_t, phi, read_fn = self.unfold(
-                x_bar, inference_params=inference_params, return_read=True)
+                x_bar, inference_params=inference_params, cache=unfold_cache, return_read=True)
         else:
-            h_U, m_t, s_t = self.unfold(x_bar, inference_params=inference_params)
+            h_U, m_t, s_t = self.unfold(x_bar, inference_params=inference_params, cache=unfold_cache)
         h_M, _mu = self.modulate(h_A, h_U, m_t)           # h^A + h^U + Δh (§8)
 
         residual = residual + h_M
@@ -54,4 +62,5 @@ class EvidenceLayer(nn.Module):
         return hidden_states, residual
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
-        raise NotImplementedError("Evidence-layer decode cache is a later milestone (Phase 3)")
+        return {"attn": self.ground_attn.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs),
+                "unfold": self.unfold.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)}
