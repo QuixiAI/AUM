@@ -1,474 +1,461 @@
-# AUM-Ø v5.3 (final): Attentive Unfolding Modulation with Silence
+# AUM-Ø v6: Attentive Unfolding Modulation with Silence
 
-## Recent-Evidence Hypothesis Revision — An Affine Resonant Evidence Core with a Benefit-Gated Global Hypothesis Register
+## An Affine Resonant Evidence Core with a Benefit-Gated Global Hypothesis Register
 
-**AUM-Ø**, pronounced **Aum-nought**, is a phase-typed recurrent architecture for adaptive test-time inference. Its core principle is:
+**AUM-Ø**, pronounced **Aum-nought**, is a recurrent sequence architecture built on one principle:
 
 $$
 \text{Continuation arises from temporary configuration.}
 $$
 
-AUM-Ø separates an **evidence state** $S_t$ that accumulates observations across the sequence from a **hypothesis register** $\sigma_t$ that holds the current interpretation of that evidence. The token clock accumulates evidence; the silence clock revises hypothesis. The four phases are $A \rightarrow U \rightarrow M \rightarrow \varnothing$ — observe, accumulate evidence, assign precision, revise hypothesis when useful.
-
-This is the **final** specification. Every choice below is committed. The base model performs **recent-evidence hypothesis revision**: the silent read is phase-locked to the current token and therefore preferentially reinterprets recent evidence. Reaching older evidence is the job of the **temporal hypothesis search** extension (§24), which is explicitly *not* part of this specification. The recency bias is a designed property that yields a falsifiable mechanistic prediction (§22), not a limitation to be patched before the first run.
-
-The defining claim:
+and one structural commitment:
 
 $$
-\text{Adaptive inference requires separating evidence from interpretation, and spending extra computation only where revising the interpretation pays.}
+\text{Separate evidence from interpretation, and spend extra computation only where revising the interpretation pays.}
 $$
 
----
+The architecture maintains two kinds of state on two different clocks. An **evidence state** $S_t$ — a phase-addressed associative memory, updated once per token by an affine recurrence — records *what has been observed*. A **hypothesis register** $\sigma_t$ — a small nonlinear state, revised zero or more times per token by an inner "silence" loop — holds *how the evidence is currently interpreted*: which rule is active, which branch is live, which binding holds, whether a correction has invalidated a prior assumption. The token clock writes evidence; the silence clock revises hypothesis; a learned **integration pressure** $\pi_t$, trained against measured counterfactual benefit, decides when revision is worth the compute.
 
-## 0. Design Commitments
+The base model performs **recent-evidence hypothesis revision**: its silent read is phase-locked to the current token, so it preferentially reinterprets recently written evidence. This is a designed property, not a defect — it yields the sharpest available mechanistic falsifier (§14). Extending the read to older evidence (**temporal hypothesis search**) is the first scoped follow-up (§17), deliberately excluded from v6 so the falsifier stays clean.
 
-These forks are settled. They are recorded here as the architecture's rationale, not as open choices.
-
-1. **Top-only hypothesis register.** One global $\sigma$ and one shared halting policy, attached as a single block on top of the evidence stack. Predictive grounding, prediction error $e_t$, error-fed precision, and $\sigma$ exist only there. The $L$ evidence layers run pure token-clock recurrence. This makes the silence mechanism a ~2% add-on over a nearly parameter-matched evidence-core baseline, so any measured benefit is attributable to the mechanism, not to capacity.
-2. **Affine evidence recurrence (invariant).** The $S$-update is affine in $S_{t-1}$; no nonlinearity inside the state recurrence. This preserves scan-parallel training and efficient recurrent inference, and is invariant across all variants and extensions.
-3. **Stable evidence addressing.** Prediction error never perturbs the write key $\hat k_t$. Surprise may modulate write strength or value, never the address.
-4. **Bottlenecked register.** $d_\sigma \ll d$, fixed at $128$ in the reference model. The register is forced toward a low-dimensional interpretation rather than a second readout buffer. Whether this is too small is answered by the σ-decode probe at the gate (§23), not assumed.
-5. **Hypothesis-conditioned predictive grounding.** The prediction head reads the evidence state *through the current hypothesis*, symmetric with the silent read. A wrong hypothesis reads the wrong evidence and predicts the next grounding poorly — this is how $\sigma$ is held accountable.
-6. **Phase-locked silent read (recent-evidence).** The silent read uses the current phase $\phi_t$, giving recency-selective retrieval and a registered differential prediction. Temporal search ($\delta_j$) is a scoped follow-up, deliberately excluded here so the recency falsifier stays clean.
-7. **Frozen-downstream counterfactual benefit with a fixed calibrated target.** Benefit is the marginal value of a single silence decision, measured with downstream silence frozen and paired stochasticity; the pressure target is a fixed monotone transform of benefit in nats, not a batch-normalized scale.
-8. **Mechanism-isolating controls are part of the spec.** No-op, no-read, phase-scrambled silence, a Top-GRU adapter baseline, and a causal σ-intervention are first-class evaluation components, not optional extras.
+This document supersedes v5.3 and is written to be built from directly: architecture, training recipe, pre-registered evaluation, and tensor manifest are all here. Nothing in it is provisional.
 
 ---
 
-## 1. The Inference Condition
+## 0. What Changed from v5.3, and Why
 
-Let the input be $x_1,\dots,x_T$ with embeddings $x_t\in\mathbb{R}^d$. AUM-Ø maintains:
+Six structural corrections, found by re-deriving the mechanics rather than reviewing the prose. Each is now native to the design rather than an erratum.
 
-$$
-\chi_t = (\phi_t,\, S_t,\, \sigma_t,\, \mu_t)
-$$
+**(1) The rotation operator gains a frequency ladder.** v5.3's single-frequency $R(\phi)$ made read–write alignment *periodic* in phase distance: evidence at $\Delta\phi = 2\pi k$ re-aligned perfectly, so "recency-selective retrieval" was actually aliased retrieval, and the registered recency gradient could fail for spec reasons rather than mechanism reasons. v6 uses a geometric multi-frequency ladder (RoPE-style), under which alignment decays quasi-monotonically with phase distance. The recency falsifier is correspondingly re-registered against **accumulated phase distance**, with token-age as the secondary axis. (§4)
 
-with $\phi_t$ the resonance phase, $S_t$ the evidence state, $\sigma_t$ the hypothesis register, $\mu_t$ the precision field. Two clocks: the **token clock** advances once per token, $(x_t,\chi_{t-1})\mapsto\chi_t$; the **silence clock** advances internally, $\sigma_t^j\mapsto\sigma_t^{j+1}$. The evidence state is updated only by the token clock; the hypothesis register is revised only by the silence clock.
+**(2) Halting mixes losses, not states.** v5.3's $\bar\sigma_t=\sum_j w_j\sigma_t^j$ blended hypotheses — a convex mixture of "rule A" and "rule B" is not a hypothesis, it corrupted the σ-decode probe, and it created a train/test mismatch with hard halting. v6 trains the PonderNet-style expected loss over per-step outputs, keeps each $\sigma^j$ a coherent candidate, and carries forward a single register. (§8)
 
----
+**(3) The degenerate loss basin is closed.** In v5.3, the precision-sparsity, consistency, and compute losses jointly admitted a low-loss solution with precision off, register frozen, and silence never firing — a dead mechanism with a healthy loss curve, indistinguishable from the null-control's intended behavior. v6 detaches $\mu$ inside the consistency functional and applies precision sparsity only to the per-layer fields, never the global one. (§7, §10)
 
-## 2. Evidence and Hypothesis
+**(4) The pressure label is policy-independent.** v5.3's benefit label $\ell_0-\ell_J$ was computed under the live halting policy, whose halting head consumes $\pi_t$ — the pressure head was chasing a target that moved with its own output. v6 computes the label **always at fixed depth $K$ on the exploration subset**, breaking the circularity; the on-policy gauge measures the residual gap. (§11)
 
-$S_t$ is an associative recurrent substrate carrying traces of what has been observed. $\sigma_t$ is an interpretive state — the model's current latent explanation of the evidence: which rule is active, which branch is followed, which binding is valid, which reading of an ambiguous instruction holds, whether a correction reversed a prior assumption. The evidence state carries *what* was observed; the hypothesis register carries *how* it is interpreted. Therefore $\varnothing = \text{hypothesis revision}$ — latent reinterpretation of accumulated evidence, not further accumulation.
+**(5) The parallelism claim is stated truthfully.** The affine invariant makes the *evidence core* scan-parallel. The global block is a sequential nonlinear recurrence over tokens ($\sigma_{t-1}\to e_t \to \mu_t \to \sigma_t^0$) and does not scan. Its state is small ($d_\sigma{=}128$), so at reference scale it is a fused sequential kernel with negligible cost — but the document no longer advertises full-model scannability it does not have. (§2, §12)
 
----
+**(6) Two evaluation fixes.** The Top-GRU baseline now keeps a pooled-evidence prediction head, so the ablated factor is *precisely* the silent evidence read (not prediction quality). Full-vocabulary predictive entropy is removed from the base pressure features — it put a 49k-softmax on the critical path twice per token — and demoted to a registered optional-feature ablation. (§9, §15)
 
-## 3. Placement: A Single Global Silence Block
-
-$$
-\underbrace{\text{evidence core over } L \text{ layers}}_{\text{token clock, all layers}} \;\rightarrow\; \underbrace{\text{global hypothesis revision}}_{\text{silence clock, once}} \;\rightarrow\; \text{output}
-$$
-
-The lower stack carries no $\sigma$ and computes no $e_t$. The global block reads the **top evidence layer's** $S_t$ and $\phi_t$ (notation below refers to the top layer unless stated). There is one silent depth per token, $J_t$.
+Also folded in: the per-head silent read is defined (§8); an evidence-survival probe separates decay from addressing on old-evidence tasks (§16); a σ-relevance check guards against the prediction head learning to ignore the register (§16); the pressure-training gate is scale-free (§12); and the training recipe lives in the spec (§13, Appendix B).
 
 ---
 
-## 4. Evidence Core and Predictive Grounding
+## 1. Design Commitments
 
-The evidence core processes $x_t$ through all $L$ layers and emits a top-of-stack grounded summary:
+These forks are settled. They are the architecture's rationale, recorded so future work changes them knowingly or not at all.
 
-$$
-g_t = \operatorname{EvidenceCore}(x_t, \chi_{t-1}) \in \mathbb{R}^d
-$$
+**C1 — Top-only hypothesis register.** One global $\sigma$, one halting policy, one silent depth $J_t$ per token, attached as a single block above the evidence stack. Predictive grounding, prediction error, error-fed precision, and the register exist only there; the $L$ evidence layers run pure token-clock recurrence. The silence mechanism is ~2% of parameters, so the silence-ablated model is a nearly parameter-matched baseline and any measured benefit is the mechanism's, not capacity's.
 
-The A phase (bounded local grounding) occurs throughout the core; the global block receives only $g_t$, distinct from any layer's internal $h_t^{A,\ell}$.
+**C2 — Affine evidence recurrence (invariant).** $S_t$ is affine in $S_{t-1}$: diagonal/block-diagonal gain plus input-dependent additive write. No nonlinearity inside the state recurrence, ever; normalization applies to write inputs and readouts only. Extensions requiring nonlinear mutation route through $\sigma$, a correction patch, or the readout — never through $S$. This buys scan-parallel training *of the core* (see C7 for the honest full-model statement).
 
-**Hypothesis-conditioned predictive grounding.** Before $g_t$ is folded into the hypothesis, the global block predicts it by reading the previous evidence state *through the previous hypothesis*, under the previous phase:
+**C3 — Stable evidence addressing.** Prediction error never perturbs the write key. Surprise may modulate write strength or value; the address is sacred, because address–surprise coupling destroys associative recall.
 
-$$
-q_{t-1}^{\text{pred}} = R(\phi_{t-1})\, W_q^{\text{pred}}\, \sigma_{t-1}, \qquad r_{t-1}^{\text{pred}} = S_{t-1}\, q_{t-1}^{\text{pred}}
-$$
+**C4 — Bottlenecked register.** $d_\sigma \ll d$ (128 in the reference model). The register is squeezed toward holding a low-dimensional interpretation rather than becoming a second readout buffer. Whether 128 is too small is answered by the σ-decode probe at the gate (§15), never assumed in advance.
 
-$$
-\hat{g}_t = W_P\, \operatorname{LN}\!\left( W_R\, r_{t-1}^{\text{pred}} + W_\sigma\, \sigma_{t-1} + W_\phi\, \Phi(\phi_{t-1}) \right)
-$$
+**C5 — Hypothesis-conditioned predictive grounding.** The prediction head reads the evidence state *through the current hypothesis*, symmetric with the silent read. A wrong hypothesis reads the wrong evidence and mispredicts the next grounding — this is how $\sigma$ is held accountable by the world rather than by an auxiliary label.
 
-where $\Phi(\phi)$ is a learned or sinusoidal phase embedding. The prediction read uses a **separate** query projection $W_q^{\text{pred}}$ from the silent read's $W_q^\sigma$ (§12); the two serve different purposes — predicting the next grounding vs. revising the current hypothesis — and are not tied. The prediction error is:
+**C6 — Phase-locked silent read with a frequency ladder.** The silent read uses the current phase under the multi-frequency rotation, giving graded recency-selective retrieval and the registered differential prediction of §14. Temporal search is excluded from v6 by design.
 
-$$
-e_t = g_t - \hat{g}_t
-$$
+**C7 — Honest parallelism.** The evidence core trains as a parallel scan. The global block is a sequential nonlinear token recurrence with $O(d_\sigma+d)$ state, implemented as a fused sequential kernel; at reference scale its wall-clock cost is small, and at larger scales it is a known, stated bottleneck — not a surprise.
 
-This makes $\sigma$ accountable through evidence: a wrong hypothesis reads the wrong slot of $S$ and predicts $g_t$ poorly. The A phase answers: *What is present, and how does it differ from what the current hypothesis expected?*
+**C8 — Benefit-gated silence with a policy-independent label.** Pressure is trained to predict measured counterfactual benefit on a fixed calibrated scale, with the label computed at fixed depth on an exploration subset and downstream silence frozen in both branches. Silence is allocated by learned usefulness, not by uncertainty.
+
+**C9 — Mechanism-isolating evaluation is part of the architecture.** The no-op, no-read, phase-scrambled, and random-silence controls, the Top-GRU and evidence-core baselines, and the causal σ-intervention are first-class components. The design exists to be falsified crisply; that is its main methodological asset.
 
 ---
 
-## 5. Compact Controller (Per Evidence Layer)
+## 2. System Overview and State
 
-Each evidence layer forms $\bar{x}_t = \operatorname{LN}(x_t)$, a controller vector $c_t = W_c\bar{x}_t$, content projections $q_t=W_q\bar{x}_t,\; k_t=W_k\bar{x}_t,\; v_t=W_v\bar{x}_t$, and an output-gate projection $z_t = W_z\bar{x}_t$. The controller emits the recurrent dynamics:
+Input $x_1,\dots,x_T$, embeddings $x_t\in\mathbb{R}^d$. The inference condition is
 
 $$
-(\bar{\tau}_t,\, \bar{\lambda}_t,\, r_t,\, \theta_t,\, m_t,\, s_t) = W_p\, c_t
+\chi_t = (\phi_t,\ S_t,\ \sigma_t,\ \mu_t)
 $$
 
-with $\bar{\tau}_t$ step size, $\bar{\lambda}_t$ dissolution, $r_t$ write strength, $\theta_t$ phase velocity, $m_t$ precision drive, $s_t$ pressure drive. Only the top layer's $s_t$ is consumed (§14).
+with $\phi_t$ the per-head phase position, $S_t$ the evidence state, $\sigma_t$ the hypothesis register, $\mu_t$ the global precision field. Execution per token:
+
+$$
+\underbrace{\text{evidence core, } L \text{ layers}}_{\text{scan-parallel token clock}}
+\;\to\; g_t
+\;\to\;
+\underbrace{\text{global block: predict, err, precision, pressure, silence}}_{\text{sequential nonlinear token clock + inner silence clock}}
+\;\to\; o_t
+$$
+
+The evidence state is written only by the token clock. The register is revised only by the silence clock. The two clocks never write each other's state — that separation *is* the architecture.
 
 ---
 
-## 6. U Phase: Resonant Evidence Unfolding
+## 3. Evidence Core: Per-Layer Structure
 
-Step size, dissolution, survival:
+Each of the $L$ evidence layers contains bounded grounding (A), resonant unfolding (U), and error-free precision (M), around a standard SwiGLU MLP and pre-norms.
 
-$$
-\tau_t = \operatorname{softplus}(\bar{\tau}_t + b_\tau), \quad \lambda_t = \epsilon + f(\bar{\lambda}_t), \quad f(x)=\begin{cases}1+x,&x\geq 0\\[3pt]\tfrac{1}{1-x},&x<0\end{cases}, \quad \alpha_t = \exp(-\lambda_t\tau_t)
-$$
-
-Resonance phase and rotated, normalized factors:
+**Controller and projections.** With $\bar x_t=\operatorname{LN}(x_t)$: content projections $q_t=W_q\bar x_t$, $k_t=W_k\bar x_t$, $v_t=W_v\bar x_t$; output gate $z_t=W_z\bar x_t$; controller $c_t=W_c\bar x_t$ emitting per-head dynamics
 
 $$
-\phi_t = \left(\phi_{t-1} + \pi\tanh(\theta_t)\tau_t\right)\bmod 2\pi, \quad \tilde{q}_t=R(\phi_t)q_t,\ \tilde{k}_t=R(\phi_t)k_t,\ \hat{k}_t=\tfrac{\tilde{k}_t}{\lVert\tilde{k}_t\rVert+\epsilon},\ \hat{v}_t=\tfrac{v_t}{\lVert v_t\rVert+\epsilon}
+(\bar\tau_t,\ \bar\lambda_t,\ r_t,\ \theta_t,\ m_t,\ s_t) = W_p\, c_t
 $$
 
-Write gate $\rho_t=\sigma(r_t)$, write $W_t=\hat{v}_t\otimes\hat{k}_t$, **affine** state update:
+— step size, dissolution, write strength, phase velocity, precision drive, pressure drive. Only the top layer's $s_t$ is consumed (§9).
+
+**A — bounded grounding.** Grouped-query local attention over a sliding window $w$: $h_t^{A}=\operatorname{LocalAttn}(\bar x_t,\ x_{t-w:t})$. The A phase answers *what is present*; it is bounded by design so the recurrence, not attention, carries long range.
+
+**M — error-free precision (lower layers).** With no error signal below the top:
 
 $$
-S_t = \alpha_t\odot S_{t-1} + \rho_t\tau_t\odot W_t
+\mu_t^\ell=\sigma\!\big(W_\mu^\ell[\,h_t^{A,\ell},h_t^{U,\ell},m_t^\ell\,]\big),\quad
+\Delta h_t^\ell=U_m^\ell\operatorname{diag}(\mu_t^\ell)V_m^\ell h_t^{U,\ell},\quad
+h_t^{M,\ell}=h_t^{A,\ell}+h_t^{U,\ell}+\Delta h_t^\ell
 $$
 
-> **Standing invariant (affine evidence recurrence).** $S_t$ is affine in $S_{t-1}$: a per-step diagonal/block-diagonal gain $\alpha_t$ plus an input-dependent additive write. No nonlinearity inside the state recurrence; normalization applies to write inputs and readouts only. Any extension needing nonlinear mutation routes it through $\sigma$, the correction patch, or the readout — never through $S$.
-
-**Gated readout.** The unfolding readout is normalized after the linear read and gated by $z_t$ in the Mamba/GLA lineage:
-
-$$
-h_t^{U,(h)} = \operatorname{silu}\!\big(z_t^{(h)}\big)\odot \operatorname{RMSNorm}\!\left(S_t^{(h)}\tilde{q}_t^{(h)} + D^{(h)}v_t^{(h)}\right)
-$$
-
-where $h$ indexes heads and $D^{(h)}$ is a learned skip coefficient. The U phase answers: *What evidence has accumulated, and how does it unfold under the current phase?*
+The residual stream accumulates $h^{M,\ell}$; the top layer emits the grounded summary $g_t\in\mathbb{R}^d$.
 
 ---
 
-## 7. Stable Addressing
+## 4. U Phase: Resonant Evidence Unfolding
 
-The base write uses a stable key, $W_t=\hat{v}_t\otimes\hat{k}_t$; error never perturbs $\hat k_t$. Surprise may optionally modulate write strength or value at the top layer (where $e_t$ exists), never the key:
+**Dynamics.** Per U-head:
 
 $$
-\rho_t' = \sigma\!\left(r_t + w_e^\top\tanh(W_e e_t)\right), \qquad \hat{v}_t' = \hat{v}_t + B_v\tanh(W_e e_t)
+\tau_t=\operatorname{softplus}(\bar\tau_t+b_\tau),\qquad
+\lambda_t=\epsilon+f(\bar\lambda_t),\qquad
+f(x)=\begin{cases}1+x,&x\ge 0\\[2pt]\tfrac{1}{1-x},&x<0\end{cases},\qquad
+\alpha_t=e^{-\lambda_t\tau_t}
 $$
 
-Salience-augmented writes are a scoped follow-up (§24); the reference model uses stable, error-free writes throughout the stack.
+**Phase position.** Each U-head $h$ carries a scalar phase position advanced by data-dependent velocity:
+
+$$
+\phi_t^{(h)}=\phi_{t-1}^{(h)}+\pi\tanh\!\big(\theta_t^{(h)}\big)\,\tau_t^{(h)}
+$$
+
+$\phi$ is *not* wrapped modulo $2\pi$; it is an unbounded accumulated position, exactly as a token index is in RoPE, and the rotation below consumes it at many frequencies.
+
+**Multi-frequency rotation (the ladder).** Within each head of dimension $d_h$, partition into $B=d_h/2$ two-dimensional blocks and assign geometric frequencies
+
+$$
+\omega_b=\omega_{\max}\left(\frac{\omega_{\min}}{\omega_{\max}}\right)^{\frac{b-1}{B-1}},\qquad b=1,\dots,B,\qquad
+(\omega_{\max},\omega_{\min})=(1,\ 10^{-3})
+$$
+
+and define $R(\phi)=\operatorname{blockdiag}\big(\operatorname{Rot}(\omega_1\phi),\dots,\operatorname{Rot}(\omega_B\phi)\big)$, parameter-free. Because rotations are orthogonal and both writes and reads are rotated, the retrieval score between a read at phase $\phi_t$ and evidence written at phase $\phi_s$ depends only on the **relative phase** $\Delta\phi=\phi_t-\phi_s$ — this is data-dependent relative position. Under the ladder, alignment across the $B$ frequencies interferes destructively as $|\Delta\phi|$ grows, so retrieval decays quasi-monotonically with phase distance instead of ringing with period $2\pi$. This monotonicity is what makes "recency-selective" a real, testable property (§14) rather than an aliased accident.
+
+**Write.** Rotate and normalize:
+
+$$
+\tilde q_t=R(\phi_t)q_t,\quad \tilde k_t=R(\phi_t)k_t,\quad
+\hat k_t=\frac{\tilde k_t}{\lVert\tilde k_t\rVert+\epsilon},\quad
+\hat v_t=\frac{v_t}{\lVert v_t\rVert+\epsilon}
+$$
+
+Write gate $\rho_t=\sigma(r_t)$, write $W_t=\hat v_t\otimes\hat k_t$, and the **affine** update (invariant C2):
+
+$$
+S_t=\alpha_t\odot S_{t-1}+\rho_t\tau_t\odot W_t
+$$
+
+**Gated readout.** Per head:
+
+$$
+h_t^{U,(h)}=\operatorname{silu}\!\big(z_t^{(h)}\big)\odot\operatorname{RMSNorm}\!\big(S_t^{(h)}\tilde q_t^{(h)}+D^{(h)}v_t^{(h)}\big)
+$$
+
+with learned skip $D^{(h)}$. The U phase answers *what evidence has accumulated, and how it reads under the current phase*.
+
+**Stable addressing (C3).** The base write key is never a function of prediction error. At the top layer, where $e_t$ exists, surprise may optionally modulate $\rho_t$ or $\hat v_t$ — never $\hat k_t$ — and that variant is evaluated separately, not in the reference model.
 
 ---
 
-## 8. M Phase: Precision Modulation
+## 5. Global Block: Hypothesis-Conditioned Predictive Grounding
 
-**Lower-layer precision (error-free), every evidence layer:**
-
-$$
-\mu_t^\ell = \sigma\!\left(W_\mu^\ell[\,h_t^{A,\ell},\,h_t^{U,\ell},\,m_t^\ell\,]\right), \quad \Delta h_t^\ell = U_m^\ell\operatorname{diag}(\mu_t^\ell)V_m^\ell h_t^{U,\ell}, \quad h_t^{M,\ell}=h_t^{A,\ell}+h_t^{U,\ell}+\Delta h_t^\ell
-$$
-
-The residual stream accumulates $h_t^{M,\ell}$; the top layer emits $g_t$.
-
-**Global precision (error-fed), once in the silence block — precision only, no readout adapter:**
+Before folding $g_t$ into the register, the block predicts it by reading the *previous* evidence through the *previous* hypothesis at the *previous* phase:
 
 $$
-\mu_t = \sigma\!\left(W_\mu[\,g_t,\,e_t,\,\sigma_{t-1},\,m_t\,]\right)\in[0,1]^k, \qquad \tilde{e}_t = \mu_t\odot W_e e_t
+q_{t-1}^{\text{pred}}=R(\phi_{t-1})\,W_q^{\text{pred}}\,\sigma_{t-1},\qquad
+r_{t-1}^{\text{pred}}=S_{t-1}\,q_{t-1}^{\text{pred}}
 $$
 
-The global $\mu_t$ weights how evidence and error drive revision and consistency. It does **not** carry an up/down readout modulation; $g_t$ enters the output and hypothesis paths directly. M is a precision field, not a second recurrence and not an output adapter.
+$$
+\hat g_t=W_P\,\operatorname{LN}\!\big(W_R\,r_{t-1}^{\text{pred}}+W_\sigma^{P}\,\sigma_{t-1}+W_\phi\,\Phi(\phi_{t-1})\big),
+\qquad e_t=g_t-\hat g_t
+$$
+
+$\Phi$ is a sinusoidal phase embedding; $W_q^{\text{pred}}$ is separate from the silent read's $W_q^\sigma$ (different jobs: predicting the next grounding vs. revising the current hypothesis). Accountability is structural: a register holding the wrong hypothesis addresses the wrong evidence and mispredicts $g_t$, raising $e_t$ — the world corrects $\sigma$, not a label. §16 registers the check that the head has not learned to bypass $\sigma$ ($W_q^{\text{pred}}\!\to\!0$ is a silent failure this design permits and must therefore be monitored).
 
 ---
 
-## 9. The Hypothesis Register
-
-Initialized before silence:
+## 6. Global Block: Error-Fed Precision
 
 $$
-\sigma_t^0 = \operatorname{LN}\!\left(W_{\sigma0}[\,\sigma_{t-1},\,g_t,\,\tilde{e}_t,\,\mu_t\,]\right)
+\mu_t=\sigma\!\big(W_\mu[\,g_t,\ e_t,\ \sigma_{t-1},\ m_t\,]\big)\in[0,1]^{k},\qquad
+\tilde e_t=\mu_t\odot W_e e_t
 $$
 
-It conditions future prediction (§4) and output (§16). Its width is bottlenecked, $d_\sigma=128$.
+The global $\mu_t$ is precision only: it weights how error and evidence drive revision and consistency. It carries no readout adapter, and — closing the degenerate basin — it receives **no sparsity penalty** (§10) and enters the consistency functional **detached** (§7). $g_t$ flows to the output and register paths directly.
 
 ---
 
-## 10. Ø Phase: Silence as Hypothesis Revision
+## 7. Global Block: Register, Consistency
 
-The Ø phase revises $\sigma$ while keeping $S_t$ fixed — read, not rewritten. The read is **phase-aligned** to the current token:
-
-$$
-q_{\sigma,t}^j = R(\phi_t)\,W_q^\sigma\sigma_t^j, \qquad r_t^j = S_t\,q_{\sigma,t}^j
-$$
-
-With $z_t^{\varnothing,j}=[\,\sigma_t^j,\,g_t,\,\tilde{e}_t,\,\mu_t,\,r_t^j\,]$, the update is a nonlinear gated residual:
+**Register initialization** (once per token, before any silent step):
 
 $$
-\sigma_t^{j+1} = \operatorname{RMSNorm}\!\left(\sigma_t^j + \sigma(W_g z_t^{\varnothing,j})\odot\tanh(W_n z_t^{\varnothing,j})\right)
+\sigma_t^{0}=\operatorname{LN}\!\big(W_{\sigma 0}[\,\sigma_{t-1},\ g_t,\ \tilde e_t,\ \mu_t\,]\big)
 $$
 
-The Ø phase answers: *How should the hypothesis be revised in light of the evidence?*
+**Precision-weighted consistency** (a measurable feature, not a solved objective), with $\bar\mu=\operatorname{stopgrad}(\mu_t)$:
 
-> **Recency property (registered, §22).** The read uses the current phase $\phi_t$, aligning with recently written evidence — right for recent triggers (branch reversal, binding swap), weaker for old evidence (long-range recall, delayed correction). This yields the registered differential prediction $\operatorname{corr}(b_t,\text{evidence-age})<0$, tested against the phase-scrambled control to confirm phase addressing — not mere $\alpha_t$ decay — is the cause.
+$$
+d_G(\sigma)=P_G g_t-Q_G\sigma,\qquad
+d_R(\sigma)=P_R\,r^{\sigma}-Q_R\sigma,\qquad
+r^{\sigma}=S_t R(\phi_t)W_q^\sigma\sigma
+$$
+
+$$
+\mathcal{E}_t(\sigma)=\lVert W_G^\mu\bar\mu\odot d_G(\sigma)\rVert^2+\lVert W_R^\mu\bar\mu\odot d_R(\sigma)\rVert^2+\kappa\lVert\sigma-\sigma_{t-1}\rVert^2
+$$
+
+The stopgrad means precision *weights* the diagnostic but gradient descent cannot shrink $\mathcal{E}$ by turning precision off — the escape hatch that made v5.3's consistency loss an anti-revision penalty is welded shut.
 
 ---
 
-## 11. Precision-Weighted Consistency
+## 8. Ø Phase: Silence as Hypothesis Revision
+
+During silence, $S_t$ is **read, never written**. The read is phase-aligned and per-head: the query projection $W_q^\sigma:\mathbb{R}^{d_\sigma}\to\mathbb{R}^{d}$ produces a vector split across the $H_U$ heads; each head-slice is rotated by that head's ladder and applied to that head's state; the reads concatenate:
 
 $$
-d_G(\sigma)=P_G g_t - Q_G\sigma, \qquad d_R(\sigma)=P_R r_t^\sigma - Q_R\sigma, \qquad r_t^\sigma = S_t\,R(\phi_t)\,W_q^\sigma\sigma
+q_{\sigma,t}^{j,(h)}=R\big(\phi_t^{(h)}\big)\big[W_q^\sigma\sigma_t^j\big]^{(h)},\qquad
+r_t^{j}=\big\Vert_{h}\ S_t^{(h)}q_{\sigma,t}^{j,(h)}
 $$
 
-With $\mu_G=W_G^\mu\mu_t,\ \mu_R=W_R^\mu\mu_t$:
+With $z_t^{\varnothing,j}=[\,\sigma_t^j,\ g_t,\ \tilde e_t,\ \mu_t,\ r_t^j\,]$, the revision is a nonlinear gated residual:
 
 $$
-\mathcal{E}_t(\sigma) = \lVert\mu_G\odot d_G(\sigma)\rVert^2 + \lVert\mu_R\odot d_R(\sigma)\rVert^2 + \kappa\lVert\sigma-\sigma_{t-1}\rVert^2
+\sigma_t^{j+1}=\operatorname{RMSNorm}\!\big(\sigma_t^j+\sigma(W_g z_t^{\varnothing,j})\odot\tanh(W_n z_t^{\varnothing,j})\big)
 $$
 
-A trainable, measurable consistency feature and regularizer; the silent transition stays nonlinear.
+**Halting: mix losses, never states.** At each step a halting probability
+
+$$
+p_j=H_\theta\big(\sigma_t^j,\ g_t,\ \pi_t,\ \mathcal{E}_t(\sigma_t^j)\big),\qquad p_{J_{\max}}\equiv 1,\qquad
+w_j=p_j\prod_{i<j}(1-p_i),\qquad \textstyle\sum_j w_j=1
+$$
+
+Each candidate register produces its **own coherent output**:
+
+$$
+o_t^{(j)}=W_o\operatorname{LN}\!\big(g_t+W_\sigma\,\sigma_t^{j}\big),\qquad
+p^{(j)}(x_{t+1})=\operatorname{softmax}\!\big(E^\top o_t^{(j)}\big)
+$$
+
+Training minimizes the expected loss over the halting distribution,
+
+$$
+\mathcal{L}_{\text{LM}}=\sum_{j=0}^{J_{\max}} w_j\,\big[-\log p^{(j)}(x_{t+1})\big],
+\qquad \mathbb{E}[J_t]=\sum_j j\,w_j
+$$
+
+and the register **carried into $t{+}1$ is a single candidate**, $\sigma_t=\sigma_t^{j^*}$: during training $j^*\!\sim\!\operatorname{Categorical}(w)$ (the halting head receives gradient through the loss mixture, so no straight-through estimator is needed); at inference $j^*=\min\{j:p_j\ge\delta\}$ or $j^*=\mathcal{J}(\pi_t)$. No convex blend of hypotheses ever exists in the state: every $\sigma^j$ the probe sees, the intervention edits, or the next token inherits is a coherent interpretation. This is what makes the σ-diagnostics of §16 mean what they claim to mean, and it removes the soft-train/hard-infer mismatch. With $J_{\max}=2$, the cost is at most three output-head evaluations on tokens where silence fires — cheap at reference scale and payable only where $\pi$ spends it.
 
 ---
 
-## 12. Integration Pressure
+## 9. Global Block: Integration Pressure
+
+Disagreement features (all cheap — no full-vocabulary softmax on the critical path):
 
 $$
-o_t^0 = W_o\operatorname{LN}\!\left(g_t + W_\sigma\sigma_t^0\right), \quad p_0(x_{t+1})=\operatorname{softmax}(E^\top o_t^0), \quad H_t = -\sum_x p_0(x)\log p_0(x)
+\Delta_t^{e}=\lVert\tilde e_t\rVert,\qquad
+\Delta_t^{\sigma R}=\lVert P_R r_t^{0}-Q_R\sigma_t^{0}\rVert,\qquad
+r_t^0=S_tR(\phi_t)W_q^\sigma\sigma_t^0
 $$
 
-$$
-\Delta_t^e = \lVert\tilde{e}_t\rVert, \qquad \Delta_t^{\sigma R} = \lVert P_R r_t^0 - Q_R\sigma_t^0\rVert, \qquad r_t^0 = S_t\,R(\phi_t)\,W_q^\sigma\sigma_t^0
-$$
-
-With $\zeta_t=\operatorname{Pool}_\zeta(g_t,\sigma_t^0,\tilde{e}_t,\mu_t)\in\mathbb{R}^d$ and the top-layer pressure drive $s_t$:
+Summary $\zeta_t=\operatorname{Pool}_\zeta(g_t,\sigma_t^0,\tilde e_t,\mu_t)\in\mathbb{R}^d$; with the top layer's pressure drive $s_t$:
 
 $$
-\pi_t = \operatorname{softplus}\!\left(w_\pi^\top\tanh\!\left(W_\pi[\,\zeta_t,\,H_t,\,\Delta_t^e,\,\Delta_t^{\sigma R},\,s_t\,]\right)\right)
+\pi_t=\operatorname{softplus}\!\Big(w_\pi^\top\tanh\!\big(W_\pi[\,\zeta_t,\ \Delta_t^{e},\ \Delta_t^{\sigma R},\ s_t\,]\big)\Big)
 $$
 
-$\pi_t$ estimates expected benefit of revision, trained against realized counterfactual benefit (§17).
+Full predictive entropy $H_t$ is **not** a base feature: it costs a 49k softmax before every halting decision. A registered week-one ablation (§15) tests whether adding an entropy signal (true $H_t$, or a small proxy head regressed onto it) improves $\operatorname{corr}(\pi,b)$ enough to pay for itself; the default assumption is that $\Delta^e$ and $\Delta^{\sigma R}$ carry the signal.
 
 ---
 
-## 13. Soft Halting
+## 10. Training Objective
 
 $$
-p_j = H_\theta\!\left(\sigma_t^j,\,g_t,\,\pi_t,\,\mathcal{E}_t(\sigma_t^j)\right)\in[0,1], \qquad \boxed{p_{J_{\max}}=1}
+\mathcal{L}=\mathcal{L}_{\text{LM}}+\mathcal{L}_{\text{pressure}}+\mathcal{L}_{\text{pred}}+\lambda_C\,\mathbb{E}[J_t]+\mathcal{L}_{\text{consistency}}+\lambda_\mu\textstyle\sum_\ell\lVert\mu_t^\ell\rVert_1+\lambda_S\lVert S_t\rVert^2
 $$
 
-The forced final halt makes the weights a proper distribution:
+with
 
 $$
-w_j = p_j\prod_{i<j}(1-p_i), \quad w_{J_{\max}}=\prod_{i<J_{\max}}(1-p_i), \quad \sum_{j=0}^{J_{\max}} w_j = 1
+\mathcal{L}_{\text{pred}}=\lambda_P\big\lVert\hat g_t-\operatorname{stopgrad}(g_t)\big\rVert^2,
+\qquad
+\mathcal{L}_{\text{consistency}}=\lambda_E\sum_j\max\!\big(0,\ \mathcal{E}_t(\sigma_t^{j+1})-\mathcal{E}_t(\sigma_t^j)\big)
 $$
 
-$$
-\bar{\sigma}_t = \sum_{j=0}^{J_{\max}} w_j\sigma_t^j, \qquad \mathbb{E}[J_t] = \sum_{j=0}^{J_{\max}} j\,w_j
-$$
-
-At inference, hard halting $J_t=\min\{j:p_j\geq\delta\}$ or pressure-triggered $J_t=\mathcal{J}(\pi_t)$.
+Two deliberate asymmetries, both anti-degeneracy: the $\ell_1$ sparsity applies to **per-layer precision only** (the global $\mu$ may not be starved to zero to satisfy a regularizer), and $\mathcal{E}$ consumes **detached** precision (§7). Together with the fixed-$K$ pressure label below, the "precision off / register frozen / silence never fires" basin of v5.3 is no longer a low-loss solution.
 
 ---
 
-## 14. Output
+## 11. Counterfactual Silence Benefit
+
+For a token in the supervision set, run both branches with **paired determinism** — same batch, same teacher-forced continuation, shared dropout masks (or dropout disabled for the measurement), same precision path — differing *only* in whether silence fired at $t$:
 
 $$
-o_t = W_o\operatorname{LN}\!\left(g_t + W_\sigma\bar{\sigma}_t\right), \qquad p(x_{t+1}\mid x_{\leq t})=\operatorname{softmax}(E^\top o_t)
+\ell_0=-\log p^{(0)}(x_{t+1}),\qquad \ell_K=-\log p^{(K)}(x_{t+1}),\qquad b_t=\ell_0-\ell_K
 $$
 
-Updated condition $\chi_t=(\phi_t,S_t,\bar{\sigma}_t,\mu_t)$.
+Short-horizon variant for tasks whose payoff is downstream: $b_t^{(K,H)}=\sum_{r=1}^{H}\omega_r(\ell_{0,t+r}-\ell_{K,t+r})$, with **downstream silence frozen off in both branches** over the window — the label is the marginal causal value of the single decision at $t$, uncontaminated by cascades.
+
+> **Policy-independent label (committed).** The with-silence branch always runs **fixed depth $K$** (the forced-exploration depth), never the live halting policy. The halting head consumes $\pi_t$; if the label were computed under the policy, $\pi$ would be regressed onto a target that moves with $\pi$. Fixing $K$ makes the target a property of the *mechanism*, not the *policy*. The residual policy-gap is measured, not ignored: after training, report $\operatorname{corr}(\pi_t,\ b_t^{\text{on-policy}})$ beside the fixed-$K$ correlation.
+
+**Fixed calibrated target.** No batch normalization of the label — that destroys the scale that makes $\delta$ and $\lambda_C$ interpretable. Instead a fixed monotone squash in nats, $\beta=0.02$:
+
+$$
+y_t=\log\!\Big(1+\frac{\max(b_t,0)}{\beta}\Big),\qquad
+\mathcal{L}_{\text{pressure}}=\big(\pi_t-\operatorname{stopgrad}(y_t)\big)^2
+$$
+
+(Honest caveat: $b_t$ in nats shrinks as the model improves, so $\pi$ tracks a slowly drifting target even under a fixed transform. The transform reduces the drift; it cannot remove it.)
+
+**Forced exploration.** Sample $z_t\sim\operatorname{Bernoulli}(p_{\text{explore}})$; if $z_t=1$, run $J=K$ regardless of $\pi_t$ and record the label. Anneal $p_{\text{explore}}\downarrow 0$ as calibration improves. Exploration is what lets the pressure head observe benefit on tokens its current policy would skip.
 
 ---
 
-## 15. Compact Reference (token + silence step)
+## 12. Training Schedule and Guards
 
-$$
-g_t=\operatorname{EvidenceCore}(x_t,\chi_{t-1}),\quad \hat{g}_t=W_P\operatorname{LN}(W_R S_{t-1}R(\phi_{t-1})W_q^{\text{pred}}\sigma_{t-1}+W_\sigma\sigma_{t-1}+W_\phi\Phi(\phi_{t-1})),\quad e_t=g_t-\hat{g}_t
-$$
+**Stage 1 — evidence core** ($J_t=0$): train A/U/M and the prediction head with $\mathcal{L}_{\text{LM}}+\mathcal{L}_{\text{pred}}+\lambda_\mu\sum_\ell\lVert\mu^\ell\rVert_1+\lambda_S\lVert S\rVert^2$.
 
-$$
-S_t=\alpha_t S_{t-1}+\rho_t\tau_t(\hat{v}_t\otimes\hat{k}_t),\quad h_t^U=\operatorname{silu}(z_t)\odot\operatorname{RMSNorm}(S_t\tilde{q}_t+Dv_t)
-$$
+> **Scale-free pressure gate.** Enable $\mathcal{L}_{\text{pressure}}$ only when the prediction head beats the trivial predictor by a margin on held-out data:
+> $$1-\frac{\lVert e_t\rVert^2}{\lVert g_t-\bar g\rVert^2} > \eta_{R^2}\qquad(\bar g=\text{running mean};\ \ \eta_{R^2}=0.15\ \text{reference})$$
+> Before this, $b_t$ is computed through an untrained $\hat g$ and is noise; a pressure head trained on noise labels miscalibrates stickily. An $R^2$-style gate is scale-free across tasks and training stages, unlike an absolute loss threshold.
 
-$$
-\mu_t=\sigma(W_\mu[g_t,e_t,\sigma_{t-1},m_t]),\quad \tilde{e}_t=\mu_t\odot W_e e_t,\quad \sigma_t^0=\operatorname{LN}(W_{\sigma0}[\sigma_{t-1},g_t,\tilde{e}_t,\mu_t])
-$$
+**Stage 2 — forced revision:** silence forced on a sparse subset at $J{=}K\in\{1,2\}$; add $\mathcal{L}_{\text{pressure}}$ (fixed-$K$ labels) and $\mathcal{L}_{\text{consistency}}$.
 
-$$
-r_t^j=S_t R(\phi_t)W_q^\sigma\sigma_t^j,\quad \sigma_t^{j+1}=\operatorname{RMSNorm}(\sigma_t^j+\sigma(W_g z_t^{\varnothing,j})\odot\tanh(W_n z_t^{\varnothing,j})),\quad o_t=W_o\operatorname{LN}(g_t+W_\sigma\bar{\sigma}_t)
-$$
+**Stage 3 — soft halting:** enable the loss-mixture halting of §8 with $p_{J_{\max}}{=}1$; add $\lambda_C\mathbb{E}[J_t]$ (from near zero — the compute penalty is the collapse knob and is watched jointly with $\operatorname{corr}(\pi,b)$); anneal $p_{\text{explore}}\to 0$ while keeping a small floor so fixed-$K$ labels never fully vanish.
 
-with $J_{\max}=2$.
+**Stage 4 — event-triggered inference:** hard or pressure-triggered halting; silence fires only at high expected benefit.
+
+**Parallelism profile (C7, stated once, honestly).** Stage-1 training of the core is a chunked parallel scan. From Stage 2 on, the global block introduces a strict sequential dependency across tokens ($\sigma_{t-1}\!\to\!\hat g_t\!\to\!e_t\!\to\!\mu_t\!\to\!\sigma_t^0\!\to\!\sigma_t$). Its state is $[B,d_\sigma{+}d]$-small; implement it as one fused sequential kernel over the sequence after the core's scan completes. At $d_\sigma{=}128$, seq 2048, this is minutes-per-epoch overhead at Tiny scale — acceptable, measured, and *declared*, rather than an undisclosed violation of a scannability claim.
 
 ---
 
-## 16. Prediction-Head Objective
+## 13. Reference Configuration and Training Recipe: AUM-Ø-Tiny v6
 
-$$
-\mathcal{L}_{\text{pred}} = \lambda_P\left\lVert\hat{g}_t - \operatorname{stopgrad}(g_t)\right\rVert^2
-$$
+| Field | Value |
+|---|---|
+| $d_{\text{model}}$ / layers $L$ | 512 / 12 evidence + 1 global block |
+| Vocab (tied) | 49 152 |
+| MLP $d_{\text{ff}}$ (SwiGLU) | 1408 |
+| A: heads / kv / head-dim / window | 8 / 2 / 64 / 256 |
+| U: heads $H_U$ / head-dim $d_h$ / ladder | 4 / 128 / $B{=}64$, $\omega\in[10^{-3},1]$ geometric |
+| Controller $d_c$ / precision $k_\mu$ / register $d_\sigma$ / phase-embed $d_\phi$ | 128 / 32 / 128 / 32 |
+| $J_{\max}$ / seq len | 2 / 2048 |
+| Params: total / silence block / ablated baseline | ≈ 78 M / ≈ 1.8 M / ≈ 76.5 M |
 
-or contrastively with $\operatorname{sim}(\hat g_t,g_t)/\tau_c$ against negatives. $e_t$ is informative only once $\hat g_t$ predicts.
+**Data.** ~20 B tokens: filtered web/edu mix, ~10 % code, and **5 % synthetic structured tasks** generated programmatically with known latent hypotheses (branch reversal, binding swap, delayed correction, flat null — §14), with *held-out generators* so probe and calibration numbers are measured on unseen task structure. The synthetic fraction is not optional garnish; the σ-decode probe and the recency falsifier are computed on it.
 
----
+**Optimization.** AdamW $\beta{=}(0.9,0.95)$, wd 0.1 (none on norms/`A_log`/`dt_bias`/$D$/biases); peak LR $6\times10^{-4}$, 1500-step warmup, cosine to 10 %; grad-clip 1.0; batch ≈ 0.5 M tokens; BF16 with FP32 optimizer states, `A_log`, and state-norm accumulators; init $\mathcal{N}(0,0.02)$ with `A_log`, `dt_bias` set for $\alpha\approx0.99$, $\tau\approx1$ at init. Stage split over the 20 B: 60 / 20 / 15 / 5 %. Loss weights (reference): $\lambda_P{=}0.5$, $\lambda_E{=}0.1$, $\lambda_\mu{=}10^{-3}$, $\lambda_S{=}10^{-4}$, $\lambda_C: 0\!\to\!5\times10^{-3}$ ramped in Stage 3; $\beta{=}0.02$, $\eta_{R^2}{=}0.15$, $K{\in}\{1,2\}$, $p_{\text{explore}}:0.2\!\to\!0.02$ floor, $\delta{=}0.5$.
 
-## 17. Counterfactual Silence Benefit
-
-No-silence and with-silence losses give one-step benefit $b_t^{(1)}=\ell_0-\ell_J$, with short-horizon $b_t^{(K)}=\sum_{r=1}^K\omega_r(\ell_{0,t+r}-\ell_{J,t+r})$, $\sum_r\omega_r=1$.
-
-> **Rollout policy.** Silence is frozen off in $t{+}1,\dots,t{+}K$ for both branches; the only difference is whether silence fired once, at $t$. $\pi_t$ thus learns the marginal causal value of the single decision.
-
-> **Paired determinism.** Both branches share batch, teacher-forced continuation, dropout masks (or run dropout-disabled), and numerical-precision path; the benefit label is stop-gradient. Otherwise $b_t$ is noisy for reasons unrelated to silence.
-
-**Fixed calibrated target.** Instead of batch normalization, map benefit through a fixed monotone transform in nats with constant $\beta$ (reference: $\beta=0.02$):
-
-$$
-y_t = \log\!\left(1 + \frac{\max(b_t,0)}{\beta}\right), \qquad \mathcal{L}_{\text{pressure}} = \left(\pi_t - \operatorname{stopgrad}(y_t)\right)^2
-$$
-
-This keeps $\pi_t$ on a stable, task-comparable scale so the halting threshold $\delta$ and compute penalty $\lambda_C$ remain interpretable. ($b_t$ in nats still drifts as the model improves across training; $\pi_t$ tracks a moving target by construction — the fixed transform reduces, not removes, that drift.)
-
-> **On-policy gauge (reported).** After training, recompute realized benefit *with* the full downstream cascade and report $\operatorname{corr}(\pi_t,b_t^{\text{on-policy}})$ beside the frozen-target correlation, to quantify the train/test mismatch.
+Wall-clock at 8×H100, ~40 % MFU: order of a day, dominated by the core scan; the global block's sequential kernel and the ≤3 output-head passes on silence-fired tokens are second-order.
 
 ---
 
-## 18. Training Objective
+## 14. Pre-Registered Evaluation
+
+**Primary claim.** Benefit-gated hypothesis revision improves continuation at sparse interpretive events, and pressure allocates that revision where it pays.
+
+**Task families** (synthetic, latent hypothesis known, evidence-age controlled): **branch reversal** (a rule holds; a reversal token flips it); **latent binding swap** (`A=red … Correction: A and C were swapped. What color is A?` — same structure, different surface, so a "reversal-token detector" cannot pass); **delayed correction / long-range recall** (old evidence must be reinterpreted — the *evidence-age axis*, measured, not gated); **flat null** (no interpretive events).
+
+**Registered differential prediction — recency in phase distance.** For each instance, compute the accumulated phase distance $\Delta\phi=\phi_{t_{\text{reinterpret}}}-\phi_{t_{\text{evidence}}}$ between the evidence and the point of reinterpretation (per head, summarized by the mean over heads), and predict
 
 $$
-\mathcal{L}_{\text{LM}}=-\log p(x_{t+1}\mid x_{\leq t}),\ \ \mathcal{L}_{\text{compute}}=\lambda_C\mathbb{E}[J_t],\ \ \mathcal{L}_{\text{precision}}=\lambda_\mu\lVert\mu_t\rVert_1,\ \ \mathcal{L}_{\text{state}}=\lambda_S\lVert S_t\rVert^2
+\operatorname{corr}\!\big(b_t,\ \Delta\phi\big)<0
 $$
 
-$$
-\mathcal{L}_{\text{consistency}}=\lambda_E\sum_j\max\!\left(0,\ \mathcal{E}_t(\sigma_t^{j+1})-\mathcal{E}_t(\sigma_t^j)\right)
-$$
+with token-age as the secondary covariate. Under the frequency ladder, retrieval decays with phase distance; if learned phase velocities are roughly constant the two axes coincide, and if they are not, phase distance is the mechanistically correct one — report the phase-velocity distribution alongside. Confirming the *gradient* is stronger than confirming benefit exists: it confirms retrieval works the way the architecture says.
 
-$$
-\mathcal{L} = \mathcal{L}_{\text{LM}}+\mathcal{L}_{\text{pressure}}+\mathcal{L}_{\text{pred}}+\mathcal{L}_{\text{compute}}+\mathcal{L}_{\text{consistency}}+\mathcal{L}_{\text{precision}}+\mathcal{L}_{\text{state}}
-$$
+**Registered null prediction.** On the flat task: $\pi_t\approx0$ and $\mathbb{E}[J_t]\to0$. Firing on the null means pressure learned surface uncertainty, not integration benefit.
 
----
+**Named baselines** (parameter- and compute-matched):
+**Evidence-core** (~76.5 M): silence ablated, $g_t$-only output — the capacity floor.
+**Top-GRU adapter** (~1.8 M top block): identical access to $g_t,e_t,\mu_t$, identical halting machinery, **no evidence read** — $\sigma^{j+1}=\operatorname{GRU}(\sigma^j,[g_t,e_t,\mu_t])$ — and, critically, a **pooled-evidence prediction head** $\hat g_t = W_P\operatorname{LN}(W_S\operatorname{Pool}(S_{t-1})+W_\sigma\sigma_{t-1}+W_\phi\Phi(\phi_{t-1}))$, so its $e_t$ is not handicapped and the single ablated factor is the silent read of $S$ through $\sigma$. If full AUM-Ø does not beat this per compute, the evidence-read mechanism has not earned its complexity.
 
-## 19. Forced Silence Exploration
-
-Sample $z_t\sim\operatorname{Bernoulli}(p_{\text{explore}})$; if $z_t=1$, run $J=K$ silent steps regardless of $\pi_t$, so benefit is observed on tokens the policy would skip. Anneal $p_{\text{explore}}\downarrow 0$.
-
----
-
-## 20. Training Schedule
-
-**Stage 1 — Evidence core.** $J_t=0$. Train $A,U,M$, prediction head with $\mathcal{L}_{\text{LM}}+\mathcal{L}_{\text{pred}}+\mathcal{L}_{\text{precision}}+\mathcal{L}_{\text{state}}$.
-
-> **Pressure-training gate.** Do not enable $\mathcal{L}_{\text{pressure}}$ until held-out $\mathcal{L}_{\text{pred}}^{\text{val}}<\eta$. Before that, $b_t$ is computed from an untrained $\hat g_t$ and is noise; training $\pi_t$ on noise labels causes sticky miscalibration.
-
-**Stage 2 — Forced hypothesis revision.** Once the gate clears, force silence on a sparse subset, $K\in\{1,2\}$; add $\mathcal{L}_{\text{pressure}}+\mathcal{L}_{\text{consistency}}$.
-
-**Stage 3 — Soft halting.** Enable $w_j$ with $p_{J_{\max}}=1$; add $\mathcal{L}_{\text{compute}}$; anneal $p_{\text{explore}}\to 0$.
-
-**Stage 4 — Event-triggered inference.** Fire silence only at high $\pi_t$.
-
----
-
-## 21. Diagnostics
-
-Track $\phi_t,\alpha_t,\rho_t,\lVert e_t\rVert,\lVert\mu_t\rVert,\pi_t,J_t$; benefit $b_t$; calibration $\operatorname{corr}(\pi_t,b_t)$ held-out; consistency improvement $\mathcal{E}_t(\sigma_t^0)-\mathcal{E}_t(\bar\sigma_t)$.
-
-**Hypothesis inertia.** $\Delta\sigma_t^{\text{silent}}=\lVert\bar\sigma_t-\sigma_t^0\rVert$, $\Delta\sigma_t=\lVert\bar\sigma_t-\sigma_{t-1}\rVert$. Register the co-firing quartet at events, flat on null: $\pi_t\uparrow,J_t\uparrow,\Delta\sigma_t^{\text{silent}}\uparrow,b_t\uparrow$. Separates "silence ran but didn't change $\sigma$" from "changed $\sigma$ without benefit."
-
-**Efficiency (reported).** $\text{efficiency}_t=b_t/(1+\mathbb{E}[J_t])$.
-
-**Per-step decomposition.** Attribute the gain to $\sigma^0\!\to\!\sigma^1$ vs $\sigma^1\!\to\!\sigma^2$; if all value is in step 1, $J_{\max}=1$ is the honest setting.
-
-**On-policy gauge.** $\operatorname{corr}(\pi_t,b_t^{\text{on-policy}})$ vs frozen-target (§17).
-
-**σ-decode probe.** On synthetic tasks with known latent rule, linearly decode the active rule from $\sigma_t$; report held-out accuracy. Primary instrument for interpreting a gate failure (§23).
-
-**σ-intervention (causal).** Train a classifier $c(\sigma_t)\to\text{rule}$, then overwrite $\sigma_t \leftarrow \sigma_t^{\text{other}}$ with a stored/averaged register from a different-rule example and continue. Predict: output shifts toward the injected rule; next-step prediction error rises if the injected rule is wrong; reversal answers flip or degrade. A probe shows $\sigma$ is *decodable*; the intervention shows $\sigma$ is *causally used as* the hypothesis.
-
----
-
-## 22. Evaluation: Claims, Tasks, Controls
-
-**Primary claim.** Benefit-gated hypothesis revision improves continuation at sparse interpretive events, and silence is allocated where it pays.
-
-**Task families.** Synthetic, with known latent hypotheses and controlled evidence-age:
-1. **Branch reversal** — a rule holds, a reversal token flips it.
-2. **Latent binding swap** — e.g. `A=red, B=blue, C=green … Correction: A and C were swapped. What color is A?` Same evidence/hypothesis structure, different surface form, so the register cannot pass by detecting a "reversal" token.
-3. **Delayed correction / long-range recall** — old evidence must be reinterpreted; the evidence-age axis along which the recency gradient is measured.
-4. **Flat null** — no interpretive events.
-
-**Registered differential prediction (recency).** Sort instances by evidence-age and predict $\operatorname{corr}(b_t,\text{evidence-age})<0$. Confirming the *gradient* is stronger than confirming silence merely helps.
-
-**Registered null prediction.** On the flat task, $\pi_t\approx 0$, $\mathbb{E}[J_t]\to 0$.
-
-**Named baselines** (each parameter- and compute-comparable):
-- **Evidence-core baseline** (~76.5 M): silence ablated, $g_t$-only output. The capacity-matched floor.
-- **Top-GRU adapter** (~1.8 M top block): same $g_t$/$e_t$/$\mu_t$ access and adaptive halting, but **no $S$ read** — $\sigma_t^{j+1}=\operatorname{GRU}(\sigma_t^j,[g_t,e_t,\mu_t])$. Tests whether the evidence-read mechanism earns its complexity vs. a generic top-level recurrent adapter.
-
-**Mechanism-isolating controls:**
-- **No-op silence** — run the loop, freeze $\bar\sigma_t=\sigma_t^0$. Tests whether *revision* (not compute) helps.
-- **No-read silence** — set $r_t^j=0$. Tests whether *reading $S$* is necessary.
-- **Phase-scrambled silence** — $q_{\sigma,t}^j=R(\phi_t+\epsilon_t)W_q^\sigma\sigma_t^j$ with $\epsilon_t$ shuffled across tokens, compute unchanged. Tests whether *phase-aligned* reading (not $\alpha_t$ decay) drives the recency benefit.
-- **Random silence** — same $\mathbb{E}[J_t]$, fired at random tokens. Tests whether *pressure allocation* helps.
+**Mechanism-isolating controls** (on the full model): **no-op silence** (loop runs, register frozen at $\sigma^0$ — is it *revision* or compute?); **no-read silence** ($r^j{=}0$ — is *reading $S$* necessary?); **phase-scrambled silence** ($q^j_\sigma=R(\phi_t+\epsilon_t)W_q^\sigma\sigma^j$, $\epsilon_t$ shuffled across tokens — is *phase-aligned* reading, not $\alpha$-decay, the cause?); **random silence** (matched $\mathbb{E}[J]$, random tokens — does *allocation* matter?).
 
 ### Minimum-viable-proof table
 
 | Test | Type | Expected | Proves | Gate |
 |---|---|---|---|---|
-| Full AUM-Ø v5.3 | reference | improves reversal **and** swap | mechanism can help | — |
+| Full AUM-Ø v6 | reference | improves reversal **and** swap | mechanism can help | — |
 | Evidence-core baseline | baseline | worse than full | silence adds value | ✅ |
 | Top-GRU adapter | baseline | full beats it per compute | evidence read earns complexity | ✅ |
-| No Ø | ablation | worse than full | silence matters | — |
-| No-op Ø (frozen $\bar\sigma$) | ablation | no gain | revision, not compute, matters | ✅ |
-| No-read Ø ($r{=}0$) | ablation | reduced gain | reading $S$ matters | — |
-| Phase-scrambled Ø | ablation | reduced gain | phase addressing matters | ✅ |
-| Random silence | ablation | worse efficiency | pressure allocation matters | — |
-| No $\mathcal{L}_{\text{pressure}}$ | ablation | misallocated silence | benefit supervision matters | — |
+| No-op Ø | control | no gain | revision, not compute | ✅ |
+| No-read Ø | control | reduced gain | reading $S$ matters | — |
+| Phase-scrambled Ø | control | reduced gain | phase addressing matters | ✅ |
+| Random silence | control | worse efficiency | allocation matters | — |
+| No $\mathcal{L}_{\text{pressure}}$ | ablation | misallocation | benefit supervision matters | — |
 | No $\mathcal{L}_{\text{pred}}$ | ablation | weak $\operatorname{corr}(\pi,b)$ | prediction error matters | — |
-| Flat null | control | $\pi\approx 0$, $\mathbb{E}[J]\to 0$ | not generic-uncertainty firing | ✅ |
-| σ-decode probe | diagnostic | above chance, held-out | register tracks hypothesis | ✅ |
+| Entropy feature on/off | ablation | little change expected | $H_t$ not worth its softmax | — |
+| Flat null | control | $\pi\!\approx\!0$, $\mathbb{E}[J]\!\to\!0$ | not uncertainty-firing | ✅ |
+| σ-decode probe (held-out) | diagnostic | above chance | register tracks hypothesis | ✅ |
 | σ-intervention | diagnostic | causal output shift | register is *used* | — |
-| Recency gradient | prediction | $\operatorname{corr}(b,\text{age})<0$ | phase-addressed retrieval is the cause | ✅ |
-
-The defining experiment: *Can AUM-Ø revise hypothesis by reading $S$ without corrupting it, and does $\pi$ spend that revision only where it pays?*
+| Recency gradient (phase distance) | prediction | $\operatorname{corr}(b,\Delta\phi)<0$ | phase-addressed retrieval is the cause | ✅ |
 
 ---
 
-## 23. Training Gate Before Scaling
+## 15. Gate Before Scaling
 
-**Binary gates** (all must pass, on held-out branch-reversal **and** binding-swap): evidence-core baseline beaten; Top-GRU adapter beaten per compute; no-op silence recovers no gain; phase-scrambled silence underperforms real; null control passes; σ-decode above chance; recency gradient $\operatorname{corr}(b_t,\text{evidence-age})<0$.
+All ✅ rows must pass on held-out branch-reversal **and** binding-swap generators. Delayed correction and long-range recall are **measured along the evidence-age axis, not gated** — base v6 is *predicted* to help them less; a weak number there is the design speaking, not failing.
 
-Delayed-correction / long-range recall are **measured, not gated** — they are the evidence-age axis, and base v5.3 is expected to help them *less* (the recency property). A weak delayed-correction result is consistent with the design, not a failure.
-
-**If a gate fails, read the σ-decode probe first:**
-- Probe **fails** → the register is genuinely under-capacity. Only now widen $d_\sigma$, or move to slots / layer-local registers (§24).
-- Probe **passes**, no benefit → σ holds the hypothesis but revision isn't helping. Inspect the no-op / no-read / phase-scrambled controls, the prediction head, and the silent update — not $d_\sigma$.
-- No-op control **recovers** the gain → apparent benefit was compute; mechanism not validated.
-- Recency gradient **absent** → headline benefit may be real but phase-addressed retrieval isn't the cause; investigate before claiming the mechanism.
+**Failure triage — read the σ-decode probe first.** Probe fails → the register genuinely cannot represent the hypothesis; only now consider widening $d_\sigma$ or slots (§17). Probe passes, no benefit → σ holds the hypothesis but revision isn't landing; inspect no-op / no-read / phase-scrambled results, the prediction head, the silent update — not $d_\sigma$. No-op recovers the gain → the "benefit" was compute; mechanism unvalidated regardless of headline numbers. Recency gradient absent (with phase-scrambled *also* showing no gap) → retrieval is not phase-addressed; the benefit, if real, has a different cause and the mechanism claim must be withdrawn or reworked. Null fires → pressure is uncertainty-triggered; re-examine the label pipeline (paired determinism, fixed-$K$) before anything else.
 
 ---
 
-## 24. Future Extensions (out of scope for v5.3)
+## 16. Diagnostics
 
-Explicitly **not** part of this specification. Scoped follow-ups, ordered; each is taken only after the gate (§23) is cleared.
+Continuous: $\phi$ per head and the **phase-velocity distribution** (needed to interpret the recency axis), $\alpha_t$, $\rho_t$, $\lVert e_t\rVert$, $\lVert\mu_t\rVert$, $\pi_t$, $J_t$, $b_t$, held-out $\operatorname{corr}(\pi,b)$ at fixed $K$, the on-policy correlation gauge, $\mathcal{E}(\sigma^0)-\mathcal{E}(\sigma^{j^*})$, and efficiency $b_t/(1+\mathbb{E}[J_t])$ (reported, never trained against in v6).
 
-1. **Temporal hypothesis search.** Learnable read-phase offset $q_{\sigma,t}^j=R(\phi_t+\delta_t^j)W_q^\sigma\sigma_t^j$, $\delta_t^j=\psi_\theta(\sigma_t^j)$, regularized for *spread* across silent steps (penalize $\delta^1\approx\delta^2$) so it does not collapse to a fixed small backward look. Turns silence into a temporal scan; the registered fix for the old-evidence case.
-2. **Hypothesis-conditioned evidence read in the core.** Let $\bar\sigma_t$ modulate the next token's read query, $\tilde q_{t+1}\leftarrow\tilde q_{t+1}\odot(1+W_h\bar\sigma_t)$, on the readout path only — downstream reach without touching $S$ or violating the affine invariant.
-3. **Pooled cross-layer evidence read.** Read a weighted sum of $S_t^\ell$ over the final layers if top-layer retrieval is detail-poor.
-4. **Slot-based register.** $\sigma_t\in\mathbb{R}^{n_\sigma\times d_{\sigma s}}$ for competing hypotheses or bindings.
-5. **Correction patch.** Bounded $C_t$, $\tilde S_t=S_t+C_t$, routing correction outside $S$.
-6. **Layer-local registers.** Per-integration-layer $\sigma^\ell$.
-7. **Salience-augmented writes; multi-token-prediction head.**
-8. **Variational framing.** Interpret $\sigma_t$ as an amortized posterior $q_\theta(z_t\mid S_t,g_t)$ with a KL/information-bottleneck term, making "hypothesis register" mathematically literal. A theory direction, not an implementation change.
+**Hypothesis inertia and the quartet.** $\Delta\sigma_t^{\text{silent}}=\lVert\sigma_t^{j^*}-\sigma_t^0\rVert$; register the co-firing $\pi\!\uparrow,J\!\uparrow,\Delta\sigma\!\uparrow,b\!\uparrow$ at interpretive events and its joint flatness on null — this separates "ran but didn't revise" from "revised without benefit."
 
----
+**Per-step decomposition.** Attribute gains to $\sigma^0\!\to\!\sigma^1$ vs $\sigma^1\!\to\!\sigma^2$; if step 2 adds nothing, $J_{\max}{=}1$ is the honest setting and the spec says so in the paper.
 
-## 25. Interpretation of the Four Phases
+**σ-decode probe** (held-out generators): linear decode of the active latent rule from $\sigma_t$.
 
-- **A — Attentive Grounding**: bounded grounding throughout the core; hypothesis-conditioned prediction error once, at the top.
-- **U — Latent Evidence Unfolding**: observations written into a resonant **affine** recurrent state, read out through a phase rotation and an output gate.
-- **M — Precision Modulation**: error-free below, error-fed precision at the top; weights what matters for revision.
-- **Ø — Silence**: phase-aligned reading of $S$ and nonlinear revision of the register when expected benefit is high.
+**σ-intervention (causal).** Overwrite $\sigma_t$ with a stored register from a different-rule example and continue: predict the output shifts toward the injected rule, next-step $e$ rises when the injected rule is wrong, and reversal answers flip or degrade. Decodability shows correlation; intervention shows the register is *used as* the hypothesis.
+
+**σ-relevance of the prediction head.** Measure $\hat g$'s degradation when the $\sigma$ input to $P_\theta$ is zeroed or shuffled across the batch. If degradation is negligible, the head has learned to predict from phase/state alone ($W_q^{\text{pred}}\!\to\!0$) and the accountability loop of C5 is silently severed — a failure no other diagnostic detects.
+
+**Evidence-survival probe.** On old-evidence tasks, before blaming addressing: check whether the target association is still linearly recoverable from $S_t$ at query time. Not recoverable → the evidence *decayed* ($\alpha$ story) and no read policy — including future temporal search — can retrieve it; the remedy is retention (dissolution priors, or the correction patch), not search. Recoverable but unread → the addressing story stands and temporal search is the right extension. This probe is what keeps the recency result interpretable.
 
 ---
 
-## 26. Core Definition
+## 17. Out of Scope (ordered follow-ups, each contingent on the gate)
 
-AUM-Ø v5.3 is a predictive recurrent architecture that separates evidence accumulation from hypothesis revision. It maintains $\chi_t=(\phi_t,S_t,\sigma_t,\mu_t)$ with $S_t$ a resonant **affine** evidence state, $\sigma_t$ a single global hypothesis register read and revised through the current phase, $\mu_t$ a precision field, $\phi_t$ a dynamic resonance phase. The token clock updates evidence across all layers; the silence clock revises hypothesis once, on top, by reading $S$ through the hypothesis. Integration pressure is trained against frozen-downstream counterfactual benefit on a fixed calibrated scale, so silence is allocated where revision improves continuation.
+**Temporal hypothesis search** — learnable read-phase offset $q^j_\sigma=R(\phi_t+\delta^j)W_q^\sigma\sigma^j$, $\delta^j=\psi_\theta(\sigma^j)$, regularized for *spread across silent steps* (penalize $\delta^1\!\approx\!\delta^2$) so it cannot collapse to a fixed backward glance; turns silence into a temporal scan of $S$. Pursued only if the evidence-survival probe shows old evidence *survives but goes unread*. **Hypothesis-conditioned core read** — $\tilde q_{t+1}\leftarrow\tilde q_{t+1}\odot(1+W_h\sigma_t)$ on the readout path only; downstream reach without touching $S$. **Pooled cross-layer evidence read**, **slot register** $\sigma\in\mathbb{R}^{n_\sigma\times d_{\sigma s}}$, **correction patch** $\tilde S=S+C$ (nonlinear correction routed outside $S$, honoring C2), **layer-local registers**, **salience writes / MTP head**, and a **variational reading** of $\sigma$ as an amortized posterior $q_\theta(z\mid S,g)$ with a KL bottleneck — a theory direction that would make "hypothesis register" mathematically literal, not a Tiny change.
 
-The defining transition is $A\rightarrow U\rightarrow M\rightarrow\varnothing$; the defining structure is
+---
+
+## 18. Relationship to Prior Work (positioning, to be cited properly at write-up)
+
+The evidence core is a gated linear-attention / selective-SSM recurrence in the Mamba-2 / GLA family; the frequency-ladder rotation is RoPE generalized to a *data-dependent* position (accumulated phase); adaptive silent depth descends from ACT and PonderNet; per-token latent iteration relates to recurrent-depth latent reasoning; the error/precision vocabulary is predictive coding made architectural; test-time memory writes invite comparison with Titans, from which C3 (stable addressing) is a deliberate departure. The claimed delta over all neighbors is singular and testable: **counterfactual-benefit-supervised allocation of latent revision over an explicitly separated evidence store** — which is exactly what the Top-GRU baseline and the control set exist to isolate. Verify exact mechanisms against the literature before citing; the family resemblances are stated from memory.
+
+---
+
+## 19. Core Definition
+
+AUM-Ø v6 maintains $\chi_t=(\phi_t,S_t,\sigma_t,\mu_t)$: a multi-frequency phase position, an **affine** phase-addressed evidence state written once per token, a small nonlinear hypothesis register revised only by benefit-gated silence, and a precision field weighting how error and evidence drive revision. Prediction reads evidence through the hypothesis; error funds precision and pressure; pressure — trained on fixed-depth, paired-deterministic, frozen-downstream counterfactual benefit on a fixed calibrated scale — decides when the register earns another revision step; halting mixes losses over coherent candidates and carries exactly one hypothesis forward.
 
 $$
-\text{affine resonant evidence core} + \text{benefit-gated global hypothesis register};
+A \rightarrow U \rightarrow M \rightarrow \varnothing:\qquad
+\text{observe}\ \rightarrow\ \text{accumulate}\ \rightarrow\ \text{weigh}\ \rightarrow\ \text{revise when it pays.}
 $$
 
-the defining principle is
+$$
+\text{affine resonant evidence core}\ +\ \text{benefit-gated global hypothesis register}
+$$
 
 $$
 \text{Continuation arises from temporary configuration.}
@@ -476,14 +463,14 @@ $$
 
 ---
 
-## Appendix A. Physical Layout — AUM-Ø-Tiny v5.3 (≈ 78 M)
+## Appendix A. Physical Layout — AUM-Ø-Tiny v6 (≈ 78 M)
 
-Format: `name,[shape],dtype`. Evidence layers `[0-11]`; silence subsystem is a single top-level block. Total ≈ 78 M; silence block ≈ 1.8 M; silence-ablated baseline ≈ 76.5 M.
+Format: `name,[shape],dtype`. Evidence layers `[0-11]`; silence subsystem a single top-level block. The ladder $R(\phi)$ and $\Phi$ frequencies are fixed buffers, not parameters.
 
 ```
 model.embed_tokens.weight,[49152,512],BF16
 
-# ---- A phase: bounded local GQA grounding (all evidence layers) ----
+# ---- A: bounded local GQA grounding (all evidence layers) ----
 model.layers.[0-11].ground_attn.q_proj.weight,[512,512],BF16
 model.layers.[0-11].ground_attn.k_proj.weight,[128,512],BF16
 model.layers.[0-11].ground_attn.v_proj.weight,[128,512],BF16
@@ -491,7 +478,7 @@ model.layers.[0-11].ground_attn.o_proj.weight,[512,512],BF16
 model.layers.[0-11].ground_attn.q_norm.weight,[64],BF16
 model.layers.[0-11].ground_attn.k_norm.weight,[64],BF16
 
-# ---- U phase: resonant AFFINE evidence recurrence + output gate (all layers) ----
+# ---- U: resonant AFFINE evidence recurrence + output gate (all layers) ----
 model.layers.[0-11].unfold.controller.weight,[128,512],BF16
 model.layers.[0-11].unfold.in_proj_qkv.weight,[1536,512],BF16
 model.layers.[0-11].unfold.in_proj_z.weight,[512,512],BF16
@@ -502,41 +489,40 @@ model.layers.[0-11].unfold.dt_bias,[4],BF16
 model.layers.[0-11].unfold.D,[512],BF16
 model.layers.[0-11].unfold.norm.weight,[128],F32
 model.layers.[0-11].unfold.out_proj.weight,[512,512],BF16
+model.layers.[0-11].unfold.rope_freqs,[64],F32          # buffer, non-trainable ladder
 
-# ---- M phase: error-free precision (all evidence layers) ----
+# ---- M: error-free precision (all evidence layers) ----
 model.layers.[0-11].modulate.in_proj_mu.weight,[32,1056],BF16
 model.layers.[0-11].modulate.up.weight,[512,32],BF16
 model.layers.[0-11].modulate.down.weight,[32,512],BF16
 
-# ---- MLP (SwiGLU, all evidence layers) ----
+# ---- MLP + norms (all evidence layers) ----
 model.layers.[0-11].mlp.gate_proj.weight,[1408,512],BF16
 model.layers.[0-11].mlp.up_proj.weight,[1408,512],BF16
 model.layers.[0-11].mlp.down_proj.weight,[512,1408],BF16
-
-# ---- Layer norms (all evidence layers) ----
 model.layers.[0-11].input_layernorm.weight,[512],BF16
 model.layers.[0-11].post_attention_layernorm.weight,[512],BF16
 
-# ---- Global silence block: hypothesis-conditioned predictive grounding ----
-model.silence.predict.query_proj.weight,[512,128],BF16
-model.silence.predict.read_proj.weight,[512,512],BF16
-model.silence.predict.hyp_proj.weight,[512,128],BF16
-model.silence.predict.phase_proj.weight,[512,32],BF16
-model.silence.predict.out_proj.weight,[512,512],BF16
+# ---- Global block: hypothesis-conditioned predictive grounding ----
+model.silence.predict.query_proj.weight,[512,128],BF16   # W_q^pred: sigma -> state-key
+model.silence.predict.read_proj.weight,[512,512],BF16    # W_R
+model.silence.predict.hyp_proj.weight,[512,128],BF16     # W_sigma^P
+model.silence.predict.phase_proj.weight,[512,32],BF16    # W_phi
+model.silence.predict.out_proj.weight,[512,512],BF16     # W_P
 model.silence.predict.norm.weight,[512],BF16
 
-# ---- Global silence block: error-fed precision (precision only) ----
-model.silence.modulate.err_proj.weight,[32,512],BF16
-model.silence.modulate.in_proj_mu.weight,[32,1184],BF16
+# ---- Global block: error-fed precision (precision only; no adapter, no L1) ----
+model.silence.modulate.err_proj.weight,[32,512],BF16     # W_e
+model.silence.modulate.in_proj_mu.weight,[32,1184],BF16  # W_mu
 
-# ---- Global silence block: hypothesis register + revision ----
+# ---- Global block: register + revision ----
 model.silence.init_proj.weight,[128,704],BF16
-model.silence.read_proj.weight,[512,128],BF16
+model.silence.read_proj.weight,[512,128],BF16            # W_q^sigma (split per U-head)
 model.silence.update_gate.weight,[128,1216],BF16
 model.silence.update_cand.weight,[128,1216],BF16
 model.silence.norm.weight,[128],BF16
 
-# ---- Global silence block: consistency functional ----
+# ---- Global block: consistency ----
 model.silence.consistency.P_G.weight,[128,512],BF16
 model.silence.consistency.Q_G.weight,[128,128],BF16
 model.silence.consistency.P_R.weight,[128,512],BF16
@@ -544,21 +530,21 @@ model.silence.consistency.Q_R.weight,[128,128],BF16
 model.silence.consistency.prec_G.weight,[128,32],BF16
 model.silence.consistency.prec_R.weight,[128,32],BF16
 
-# ---- Global silence block: pressure + halting ----
-model.silence.pressure_in.weight,[128,516],BF16
+# ---- Global block: pressure + halting ----
+model.silence.pressure_in.weight,[128,515],BF16          # zeta(512)+d_e+d_sigmaR+s_t
 model.silence.pressure_out.weight,[128],BF16
-model.silence.halt_1.weight,[64,130],BF16
+model.silence.halt_1.weight,[64,130],BF16                # sigma(128)+pi+E
 model.silence.halt_2.weight,[1,64],BF16
 
-# ---- Global silence block: output / condition projection ----
-model.silence.condition_out.weight,[512,512],BF16
-model.silence.condition_out.sigma_proj.weight,[512,128],BF16
+# ---- Global block: output / condition projection ----
+model.silence.condition_out.weight,[512,512],BF16        # W_o
+model.silence.condition_out.sigma_proj.weight,[512,128],BF16  # W_sigma
 
 model.norm.weight,[512],BF16
 ```
 
-**Shape notes.** `unfold.in_proj_z,[512,512]` is the output gate $W_z$; the readout is $\operatorname{silu}(z_t)\odot\operatorname{RMSNorm}(S_t\tilde q_t+Dv_t)$. `in_proj_dyn,[49,128]` packs $(\bar\tau,\bar\lambda,r,\theta)$ per U-head $(4\times4)$ plus $m(32)$ and $s(1)$; rotation $R(\phi)$ is parameter-free. **Predictive grounding** reads $S$ through the hypothesis: `predict.query_proj` is $W_q^{\text{pred}}:\sigma(128)\to$ state-key space $(512)$, `predict.read_proj` is $W_R:r^{\text{pred}}(512)\to d(512)$ — separate from the silent read's `read_proj` $W_q^\sigma:\sigma(128)\to512$. Global `modulate` carries **only** `err_proj` $(W_e)$ and `in_proj_mu` $(W_\mu)$; there is no global up/down readout adapter. `init_proj` input $704=\sigma(128)+g(512)+\tilde e(32)+\mu(32)$. `update_*` input $1216=\sigma(128)+g(512)+\tilde e(32)+\mu(32)+r^j(512)$. `modulate.in_proj_mu` input $1184=g(512)+e(512)+\sigma(128)+m(32)$. `pressure_in` input $516=\zeta(512)+H_t+\Delta^e+\Delta^{\sigma R}+s_t$. `halt_1` input $130=\sigma(128)+\pi_t+\mathcal{E}$. Embeddings tied to the output classifier.
+**Shape notes.** `rope_freqs,[64]` is the per-head geometric ladder ($B{=}64$ blocks of 2 over $d_h{=}128$), fixed. `in_proj_z` is the U output gate ($\operatorname{silu}(z)\odot\cdot$). `in_proj_dyn,[49,128]` packs $(\bar\tau,\bar\lambda,r,\theta)$ per U-head $(4{\times}4)$ + $m(32)$ + $s(1)$. `read_proj` output (512) splits into 4 head-slices of 128, each rotated by that head's ladder at that head's $\phi$. `init_proj` in: $704=\sigma(128){+}g(512){+}\tilde e(32){+}\mu(32)$; `update_*` in: $1216=704{+}r^j(512)$; `modulate.in_proj_mu` in: $1184=g(512){+}e(512){+}\sigma(128){+}m(32)$; `pressure_in` in: $515=\zeta(512){+}\Delta^e{+}\Delta^{\sigma R}{+}s_t$ (add 1 if the optional entropy feature is enabled for its ablation); `halt_1` in: $130=\sigma(128){+}\pi{+}\mathcal{E}$. Embeddings tied to the classifier. Loss-mixture halting adds no parameters — only up to $J_{\max}{+}1$ output-head evaluations on silence-fired tokens.
 
-## Appendix B. Baselines and Ablations (one place)
+## Appendix B. Run Checklist
 
-Run all comparisons parameter- and compute-matched. **Baselines:** evidence-core (~76.5 M, silence ablated); Top-GRU adapter (~1.8 M top block, no $S$ read). **Ablations on the full model:** no-Ø; no-op Ø ($\bar\sigma=\sigma^0$); no-read Ø ($r=0$); phase-scrambled Ø; random silence (matched $\mathbb{E}[J]$); no $\mathcal{L}_{\text{pressure}}$; no $\mathcal{L}_{\text{pred}}$. **Diagnostics:** σ-decode probe; causal σ-intervention; Δσ quartet; per-step benefit decomposition; on-policy correlation gauge. The gate (§23) is the subset marked ✅ in §22.
+**Baselines:** evidence-core (~76.5 M); Top-GRU adapter (~1.8 M top block, pooled-S prediction head, no evidence read). **Controls (full model):** no-op Ø; no-read Ø; phase-scrambled Ø; random silence (matched $\mathbb{E}[J]$). **Ablations:** no $\mathcal{L}_{\text{pressure}}$; no $\mathcal{L}_{\text{pred}}$; entropy feature on/off. **Diagnostics:** σ-decode (held-out generators); σ-intervention; σ-relevance of the prediction head; evidence-survival probe; Δσ quartet; per-step decomposition; phase-velocity distribution; on-policy correlation gauge. **Guards:** scale-free $R^2$ pressure gate before Stage 2; $\lambda_C$ ramped from ~0 in Stage 3, watched jointly with $\operatorname{corr}(\pi,b)$; $p_{\text{explore}}$ annealed to a floor, never zero, so fixed-$K$ labels persist. **The gate** is the ✅ subset of §14's table, evaluated on held-out branch-reversal and binding-swap; delayed correction is measured on the evidence-age axis, not gated.
