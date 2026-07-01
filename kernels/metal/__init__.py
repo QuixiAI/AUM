@@ -20,7 +20,8 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _INCLUDE = os.path.join(_HERE, "include")
 _SRC = os.path.join(_HERE, "src")
 _METALLIB = os.path.join(_HERE, "aum.metallib")
-_METAL_SOURCES = [os.path.join(_SRC, "mamba2.metal"), os.path.join(_SRC, "mamba2_bwd.metal")]
+_METAL_SOURCES = [os.path.join(_SRC, "mamba2.metal"), os.path.join(_SRC, "mamba2_bwd.metal"),
+                  os.path.join(_SRC, "aum_decode.metal")]
 
 
 def build_metallib(force: bool = False) -> str:
@@ -54,3 +55,12 @@ def mamba2_bwd(C, B, X, cumlog, dY):
     """SSD backward -> (dC, dB, dX). C,B,X,dY bf16 (B,H,N,D); cumlog fp32 (B,H,N). MPS; D in {64,128}.
     dcumlog = <dY,Y> − <dX,X> is computed on the host by the caller (not returned)."""
     return _ext.mamba2_bwd(C, B, X, cumlog, dY)
+
+
+def aum_decode(S, alpha, x, k_rot, q_rot):
+    """Single-token U-phase decode step (§6): S <- alpha*S + x⊗k_rot ; out = S·q_rot.
+
+    S (B,H,D,D) fp32 is updated in place; alpha (B,H), x/k_rot/q_rot (B,H,D) all fp32. MPS; D in
+    {64,128}. x = rho*tau*v_hat (per p), k_rot/q_rot the rotated key/query (per n). Returns
+    (out (B,H,D), S) — the D-skip and gated-RMSNorm are applied by the caller."""
+    return _ext.aum_decode(S, alpha, x, k_rot, q_rot)

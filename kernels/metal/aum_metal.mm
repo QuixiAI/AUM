@@ -139,8 +139,34 @@ static std::tuple<at::Tensor, at::Tensor, at::Tensor> mamba2_bwd_mps(
   return {dC, dB, dX};
 }
 
+// ---- aum_decode: single-token U-phase step  S <- a*S + x⊗k_rot ; out = S·q_rot ----
+// S (B,H,D,D) is updated in place and returned; out (B,H,D) is fresh. All fp32.
+static std::tuple<at::Tensor, at::Tensor> aum_decode_mps(
+    const at::Tensor& S_in, const at::Tensor& a_in, const at::Tensor& x_in,
+    const at::Tensor& k_in, const at::Tensor& q_in) {
+  TORCH_CHECK(S_in.device().is_mps(), "aum_decode: tensors must be MPS");
+  TORCH_CHECK(S_in.scalar_type() == at::kFloat && a_in.scalar_type() == at::kFloat &&
+              x_in.scalar_type() == at::kFloat && k_in.scalar_type() == at::kFloat &&
+              q_in.scalar_type() == at::kFloat, "aum_decode: all inputs must be float32");
+  auto S = S_in.contiguous(), a = a_in.contiguous(), x = x_in.contiguous(),
+       k = k_in.contiguous(), q = q_in.contiguous();
+  TORCH_CHECK(S.dim() == 4, "aum_decode: S expects (B,H,D,D)");
+  const int Bsz = S.size(0), H = S.size(1), D = S.size(2);
+  TORCH_CHECK(S.size(3) == D, "aum_decode: S must be square (Dv==Dqk)");
+  TORCH_CHECK(D == 64 || D == 128, "aum_decode: D must be 64 or 128");
+  auto out = at::empty({Bsz, H, D}, S.options());
+  encode([&](Encoder& e) {
+    e.pipeline("aum_decode_" + std::to_string(D));
+    e.in(S, 0); e.in(a, 1); e.in(x, 2); e.in(k, 3); e.in(q, 4); e.out(out, 5);
+    e.bytes((unsigned)H, 6);
+    e.dispatch(1, H, Bsz, D, 1, 1);            // one threadgroup per (b,h); D threads (one per row)
+  });
+  return {out, S};
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("_set_library", &aum_set_library, "set the metallib path");
   m.def("mamba2", &mamba2_mps, "AUM-Ø SSD forward (MPS)");
   m.def("mamba2_bwd", &mamba2_bwd_mps, "AUM-Ø SSD backward dC,dB,dX (MPS)");
+  m.def("aum_decode", &aum_decode_mps, "AUM-Ø single-token U-phase decode step (MPS)");
 }

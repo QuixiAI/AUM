@@ -91,3 +91,42 @@ def unfold_metal_chunk(q, k, v, tau_bar, lam_bar, r, theta, z=None, D=None,
     if z is not None:
         Y = _gated_rmsnorm(Y, z, norm_weight)
     return Y
+
+
+def aum_unfold_step_metal(q, k, v, tau_bar, lam_bar, r, theta, z=None, D=None,
+                          dt_bias=0.0, eps=1e-4, S0=None, phi0=None, norm_weight=None):
+    """Metal single-token decode step (§6) — a drop-in for `aum_unfold_step_ref`.
+
+    The `aum_decode` kernel does the D×D state update + readout (S <- alpha*S + x⊗k_rot; out =
+    S·q_rot); the dynamics, rotary, k/v L2-norm, D-skip and gated-RMSNorm are PyTorch, exactly as
+    the chunk path splits the work around `mamba2`. q,k,v: (B,1,H,D). Returns h_U (B,1,H,D) and the
+    updated (S (B,H,Dv,Dqk) fp32, phi (B,H))."""
+    km = _metal()
+    B, L, H, Dqk = q.shape
+    assert L == 1, "aum_unfold_step_metal is a single-token step"
+    assert Dqk in (64, 128), "aum_decode supports headdim D=64 or D=128"
+    Dv = v.shape[-1]
+    device, dtype = q.device, q.dtype
+    S = (torch.zeros(B, H, Dv, Dqk, dtype=torch.float32, device=device)
+         if S0 is None else S0.clone().to(torch.float32))
+    phi_prev = (torch.zeros(B, H, dtype=torch.float32, device=device)
+                if phi0 is None else phi0.to(torch.float32))
+
+    tau, alpha_log, rho, dphi = aum_dynamics(
+        tau_bar[:, 0], lam_bar[:, 0], r[:, 0], theta[:, 0], dt_bias, eps)
+    phi = phi_prev + dphi                                   # (B,H)
+    q_rot = _rotate_single_phase(q[:, 0], phi)              # (B,H,Dqk)
+    k_rot = _rotate_single_phase(_l2norm(k[:, 0]), phi)     # (B,H,Dqk)
+    x = (rho * tau).unsqueeze(-1) * _l2norm(v[:, 0])        # (B,H,Dv)  = rho*tau*v_hat
+    alpha = torch.exp(alpha_log)                            # (B,H)
+
+    f = lambda t: t.float().contiguous()
+    out_core, S_new = km.aum_decode(S.contiguous(), f(alpha), f(x), f(k_rot), f(q_rot))
+
+    out = out_core.to(dtype)                                # (B,H,Dv)
+    if D is not None:
+        out = out + (D if D.dim() == 2 else D.unsqueeze(-1)) * v[:, 0]
+    h = out.unsqueeze(1)                                    # (B,1,H,Dv)
+    if z is not None:
+        h = _gated_rmsnorm(h, z, norm_weight)
+    return h, (S_new, phi)

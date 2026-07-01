@@ -85,6 +85,77 @@ def test_mamba2_bwd_kernel_matches_autograd(D):
     assert rel(dcl, clr.grad) < 0.02, ("dcumlog", rel(dcl, clr.grad))
 
 
+@pytest.mark.parametrize("D", [64, 128])
+def test_aum_decode_kernel_matches_math(D):
+    # the fused single-token step S <- a*S + x⊗k_rot ; out = S·q_rot, directly vs the fp32 math
+    torch.manual_seed(0)
+    B, H = 2, 4
+    S = torch.randn(B, H, D, D, device="mps")
+    a = torch.rand(B, H, device="mps") * 0.5 + 0.5
+    x = torch.randn(B, H, D, device="mps")
+    k = torch.randn(B, H, D, device="mps")
+    q = torch.randn(B, H, D, device="mps")
+    S_ref = a[..., None, None] * S + x[..., :, None] * k[..., None, :]
+    out_ref = torch.einsum("bhpn,bhn->bhp", S_ref, q)
+    out, S_new = km.aum_decode(S.clone(), a, x, k, q)
+    torch.mps.synchronize()
+    assert float((S_new - S_ref).abs().max() / (S_ref.abs().max() + 1e-6)) < 1e-4
+    assert float((out - out_ref).abs().max() / (out_ref.abs().max() + 1e-6)) < 1e-4
+
+
+@pytest.mark.parametrize("H,D", [(8, 64), (4, 128)])
+def test_metal_decode_step_matches_reference(H, D):
+    # aum_unfold_step_metal (kernel core + PyTorch preamble) vs the pure-PyTorch step, carrying
+    # (S, phi) across several tokens — the recurrent decode contract.
+    from aum_ssm.ops.metal.unfold_metal import aum_unfold_step_metal
+    from aum_ssm.modules.ssd_reference import aum_unfold_step_ref
+    torch.manual_seed(0)
+    B = 2
+    mk = lambda *s: torch.randn(*s, device="mps")
+    dt_bias, Dskip, nw = mk(H), mk(H, D), mk(D)
+    Sm = torch.zeros(B, H, D, D, device="mps"); pm = torch.zeros(B, H, device="mps")
+    Sr = torch.zeros(B, H, D, D, device="mps"); pr = torch.zeros(B, H, device="mps")
+    for t in range(5):
+        q, k, v, z = mk(B, 1, H, D), mk(B, 1, H, D), mk(B, 1, H, D), mk(B, 1, H, D)
+        tb, lb, rr, th = mk(B, 1, H), mk(B, 1, H), mk(B, 1, H), mk(B, 1, H)
+        kw = dict(z=z, D=Dskip, dt_bias=dt_bias, norm_weight=nw)
+        hm, (Sm, pm) = aum_unfold_step_metal(q, k, v, tb, lb, rr, th, S0=Sm, phi0=pm, **kw)
+        hr, (Sr, pr) = aum_unfold_step_ref(q, k, v, tb, lb, rr, th, S0=Sr, phi0=pr, **kw)
+        torch.mps.synchronize()
+        assert float((hm - hr).abs().max() / (hr.abs().max() + 1e-6)) < 1e-3, t
+
+
+@pytest.mark.parametrize("silence", [False, True])
+def test_metal_decode_matches_forward(silence):
+    # end-to-end: decode with the metal step wired through the real model must reproduce the full
+    # forward (the B1 decode oracle). Forward runs the fp32 reference so this isolates the step.
+    # silence=True also exercises the metal step's swapped-query read_fn (the two-pass sigma carry).
+    from aum_ssm.models.config_aum import AumConfig
+    from aum_ssm.models.aum_lm import AumLMHeadModel
+    from aum_ssm.utils.generation import InferenceParams
+    torch.manual_seed(0)
+    cfg = AumConfig(n_layer=2, vocab_size=128, d_intermediate=128, silence_enabled=silence)
+    model = AumLMHeadModel(cfg).to("mps").eval()
+    T, B, prompt = 16, 2, 8
+    x = torch.randint(0, 128, (B, T), device="mps")
+    for layer in model.backbone.layers:
+        layer.unfold.kernel_backend = "reference"
+    with torch.no_grad():
+        ref = model(x).logits
+        for layer in model.backbone.layers:
+            layer.unfold.kernel_backend = "metal"
+        ip = InferenceParams(max_seqlen=T, max_batch_size=B)
+        ip.key_value_memory_dict = model.allocate_inference_cache(B, T)
+        parts = [model(x[:, :prompt], inference_params=ip, num_last_tokens=1).logits]
+        ip.seqlen_offset = prompt
+        for t in range(prompt, T - 1):
+            parts.append(model(x[:, t:t + 1], inference_params=ip, num_last_tokens=1).logits)
+            ip.seqlen_offset += 1
+        dec = torch.cat(parts, dim=1)
+    torch.mps.synchronize()
+    assert float((dec.float() - ref[:, prompt - 1:T - 1].float()).abs().max()) < 5e-3
+
+
 def test_full_model_on_metal_backend():
     # the Appendix-A reference config (4 heads x 128) running on the metal kernel end-to-end
     from aum_ssm.models.config_aum import AumConfig
@@ -112,5 +183,9 @@ if __name__ == "__main__":
     for H, D in [(8, 64), (4, 128)]:
         test_metal_forward_matches_reference(H, D)
         test_metal_grad_matches_reference(H, D)
+        test_metal_decode_step_matches_reference(H, D)
+    for D in (64, 128):
+        test_aum_decode_kernel_matches_math(D)
+    test_metal_decode_matches_forward()
     test_full_model_on_metal_backend()
-    print("metal backend (D=64 + D=128 + full model) OK")
+    print("metal backend (fwd + bwd + decode, D=64 + D=128 + full model) OK")

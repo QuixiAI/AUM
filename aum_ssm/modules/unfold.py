@@ -148,7 +148,11 @@ class Unfold(nn.Module):
         # ---- recurrence ----
         if decoding:
             S_pre = S_cache.clone()                                # S_{t-1} for the predictive read
-            h, (S_new, phi_new) = aum_unfold_step_ref(
+            step = aum_unfold_step_ref
+            if self.kernel_backend == "metal":                     # fused D×D core on the Metal GPU
+                from aum_ssm.ops.metal.unfold_metal import aum_unfold_step_metal
+                step = aum_unfold_step_metal
+            h, (S_new, phi_new) = step(
                 q, k, v, tau_bar, lam_bar, r, theta, z=z, D=D_hd, dt_bias=self.dt_bias,
                 eps=self.eps, S0=S_cache, phi0=phi_cache, norm_weight=nw)
             S_cache.copy_(S_new); phi_cache.copy_(phi_new)
