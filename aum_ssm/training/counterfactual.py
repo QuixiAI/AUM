@@ -29,7 +29,7 @@ def one_step_benefit(loss_no_silence, loss_with_silence):
     return (loss_no_silence - loss_with_silence).detach()
 
 
-def rollout_benefit(model, input_ids, beta=0.02):
+def rollout_benefit(model, input_ids, beta=0.02, ablation=None):
     """Per-position counterfactual silence benefit b_t and calibrated target y_t (§17).
 
     Paired: the two branches share the same inputs and (dropout-free) numerical path, so the
@@ -40,7 +40,7 @@ def rollout_benefit(model, input_ids, beta=0.02):
     NOTE: this is the practical all-on-vs-all-off, per-position benefit. The exact §17 policy
     fires silence ONCE at t with downstream frozen off; that per-t rollout is a later refinement.
     """
-    result_J, aux = model(input_ids, return_aux=True)
+    result_J, aux = model(input_ids, return_aux=True, ablation=ablation)
     l_J = per_token_ce(result_J.logits, input_ids)
     was_on = model.backbone.silence_enabled
     model.backbone.silence_enabled = False

@@ -34,6 +34,7 @@ class AumConfig:
 
     # ---- Global silence block (§3-§14) ----
     silence_enabled: bool = False     # False -> evidence-core baseline (g_t output, §22)
+    baseline: Optional[str] = None    # None (reference) | "top_gru" (§22 adapter baseline)
     d_sigma: int = 128                # bottlenecked hypothesis register width (§0.4)
     d_mu: int = 32                    # precision / error projection width (k)
     d_phase: int = 32                 # phase embedding width Φ(φ)

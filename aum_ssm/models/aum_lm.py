@@ -106,7 +106,7 @@ class AumBackbone(nn.Module):
         # Global silence block — single block on top of the evidence stack (§0.1, §3).
         self.silence = SilenceBlock(config.d_model, d_sigma=config.d_sigma, d_mu=config.d_mu,
                                     d_phase=config.d_phase, j_max=config.j_max, kappa=config.kappa,
-                                    **factory)
+                                    top_gru=(config.baseline == "top_gru"), **factory)
         # False -> the silence-ablated evidence-core baseline (g_t output, §22).
         self.silence_enabled = config.silence_enabled
 

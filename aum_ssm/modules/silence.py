@@ -112,12 +112,13 @@ class SilenceBlock(nn.Module):
     """The single global silence block on top of the evidence stack (§3)."""
 
     def __init__(self, d_model, d_sigma=128, d_mu=32, d_phase=32, j_max=2, kappa=0.1,
-                 device=None, dtype=None):
+                 top_gru=False, device=None, dtype=None):
         kw = {"device": device, "dtype": dtype}
         super().__init__()
         self.d_model, self.d_sigma, self.d_mu, self.d_phase = d_model, d_sigma, d_mu, d_phase
         self.j_max = j_max
         self.kappa = kappa
+        self.top_gru = top_gru      # Top-GRU adapter baseline (§22): generic recurrent, no S read
 
         self.predict = PredictiveGrounding(d_model, d_sigma, d_phase, **kw)
         self.modulate = GlobalModulate(d_model, d_sigma, d_mu, **kw)
@@ -128,6 +129,9 @@ class SilenceBlock(nn.Module):
         self.condition_out = nn.Linear(d_model, d_model, bias=False, **kw)        # W_o
         self.condition_out_sigma = nn.Linear(d_sigma, d_model, bias=False, **kw)  # W_sigma
         self.condition_norm = nn.LayerNorm(d_model, **kw)
+
+        if top_gru:  # baseline: revise sigma with a GRU on [g, e_tilde, mu] and no S read
+            self.gru = nn.GRUCell(d_model + 2 * d_mu, d_sigma, **kw)
 
     # ---- §4-§14 helpers (batch-agnostic; operate over any leading (B,L) dims) ----
     def _predict(self, g_t, sigma_prev, phi_prev, evidence_read, no_read):
@@ -188,14 +192,20 @@ class SilenceBlock(nn.Module):
         sigma_traj, r_traj = [sigma0], []
         sigma_j = sigma0
         for _ in range(self.j_max):
-            r_j = read(sigma_j)
+            if self.top_gru:                                    # generic recurrent adapter, no S read
+                r_j = torch.zeros_like(g_t)
+                inp = torch.cat([g_t, e_tilde, mu], -1)
+                sigma_j = self.gru(inp.reshape(-1, inp.shape[-1]),
+                                   sigma_j.reshape(-1, self.d_sigma)).reshape(sigma_j.shape)
+            else:
+                r_j = read(sigma_j)
+                z = torch.cat([sigma_j, g_t, e_tilde, mu, r_j], -1)
+                sigma_j = self.register.norm(
+                    sigma_j + torch.sigmoid(self.register.update_gate(z))
+                    * torch.tanh(self.register.update_cand(z)))
             r_traj.append(r_j)
-            z = torch.cat([sigma_j, g_t, e_tilde, mu, r_j], -1)
-            sigma_j = self.register.norm(
-                sigma_j + torch.sigmoid(self.register.update_gate(z))
-                * torch.tanh(self.register.update_cand(z)))
             sigma_traj.append(sigma_j)
-        r_traj.append(read(sigma_j))                            # read of sigma^Jmax (for E/consistency)
+        r_traj.append(torch.zeros_like(g_t) if self.top_gru else read(sigma_j))
 
         # §11 consistency over the trajectory
         E_traj = torch.stack([self._consistency(g_t, sigma_traj[j], r_traj[j], mu, sigma_prev)
@@ -236,6 +246,10 @@ class SilenceBlock(nn.Module):
 
         if ablation == "no_op":                                 # revision ran but is discarded (§22)
             sigma_bar = sigma0
+        elif ablation == "random":                              # fire at random tokens, matched E[J] (§22)
+            p = (expected_J / self.j_max).mean().detach().clamp(0, 1)
+            fire = (torch.rand_like(expected_J) < p).unsqueeze(-1).to(sigma_bar.dtype)
+            sigma_bar = fire * sigma_bar + (1 - fire) * sigma0
 
         # §14 output
         o_t = self._output(g_t, sigma_bar)
