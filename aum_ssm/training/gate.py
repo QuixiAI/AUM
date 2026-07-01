@@ -93,18 +93,18 @@ def recency_gradient(model, cfg, rng, ages=(2, 5, 9), batch=16, length=14):
 
 
 def train_variant(variant: Variant, steps, rng, lr=1e-3, batch=16, length=12,
-                  task_fns=(S.branch_reversal, S.latent_binding_swap), gate_eta=100.0):
+                  task_fns=(S.branch_reversal, S.latent_binding_swap), gate_eta_r2=-1e9):
     cfg = _base_config(**variant.config)
     model = AumLMHeadModel(cfg)
     tr = AumTrainer(model, torch.optim.Adam(model.parameters(), lr), cfg,
-                    ScheduleConfig(pred_val_gate_eta=gate_eta))
+                    ScheduleConfig(eta_r2=gate_eta_r2))     # smoke default: gate always clears
     tr.force_ablation = variant.ablation
     for i in range(steps):
         fn = task_fns[i % len(task_fns)]
         ids, _ = S.make_batch(fn, rng, batch, length)
         tr.train_step(ids)
         if i == steps // 3:                                     # advance past the pressure gate midway
-            tr.maybe_advance_stage(tr.pred_val_loss(ids))
+            tr.maybe_advance_stage(tr.pred_val_r2(ids))
     return model, cfg, tr
 
 

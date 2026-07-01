@@ -23,7 +23,8 @@ class EvidenceLayer(nn.Module):
     ):
         super().__init__()
         self.residual_in_fp32 = residual_in_fp32
-        self.input_layernorm = norm_cls(dim)              # shared LN(x) for A / U / controller (§5)
+        self._last_mu = None                              # per-layer mu^l stash for the §10 l1 term
+        self.input_layernorm = norm_cls(dim)              # shared LN(x) for A / U / controller (§3)
         self.ground_attn = attn_cls(dim)                  # A phase
         self.unfold = unfold_cls(dim)                     # U phase
         self.modulate = modulate_cls(dim)                 # M phase
@@ -52,7 +53,8 @@ class EvidenceLayer(nn.Module):
                 x_bar, inference_params=inference_params, cache=unfold_cache, return_read=True)
         else:
             h_U, m_t, s_t = self.unfold(x_bar, inference_params=inference_params, cache=unfold_cache)
-        h_M, _mu = self.modulate(h_A, h_U, m_t)           # h^A + h^U + Δh (§8)
+        h_M, _mu = self.modulate(h_A, h_U, m_t)           # h^A + h^U + Δh (§3)
+        self._last_mu = _mu                               # exposed for the per-layer-only l1 (§10)
 
         residual = residual + h_M
         x2 = self.post_attention_layernorm(residual)
