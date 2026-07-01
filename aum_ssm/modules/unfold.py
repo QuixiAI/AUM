@@ -93,7 +93,9 @@ class Unfold(nn.Module):
             )
             return h
         if backend == "metal":
-            raise NotImplementedError("metal backend: see AUM-metal-plan.md (M2/M3)")
+            from aum_ssm.ops.metal.unfold_metal import unfold_metal_chunk
+            return unfold_metal_chunk(q, k, v, tau_bar, lam_bar, r, theta, z=z, D=D_hd,
+                                      dt_bias=self.dt_bias, eps=self.eps, norm_weight=self.norm.weight)
         if backend == "triton":
             raise NotImplementedError("triton backend deferred to NVIDIA bring-up")
         raise ValueError(f"unknown kernel_backend {backend!r}")
