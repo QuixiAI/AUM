@@ -1,132 +1,153 @@
-# AUM-Ø Metal Kernel Plan (Apple Silicon, near-term)
+# AUM-Ø Metal Kernel Plan (Apple Silicon, near-term) — rev. 2
 
 ## Context
 
-AUM-Ø's hot kernel is the U-phase affine recurrence (§6). We now target **two** GPU
+AUM-Ø's hot kernel is the U-phase affine recurrence (§6). We target **two** GPU
 backends over the same math, plus a portable oracle:
 
 | Backend | Hardware | Status | Role |
 |---|---|---|---|
-| `reference` | CPU + **Apple MPS** | **done** (Phase 0) | pure-PyTorch oracle + portable fallback; runs/ trains today |
-| `metal` | Apple Silicon (Metal/MLX) | **this plan — near-term** | local-dev acceleration on the Mac |
-| `triton` | **NVIDIA** | **deferred, NOT canceled** | the ultimate production training path |
+| `reference` | CPU + **Apple MPS** | **done** (Phase 0) | pure-PyTorch oracle + portable fallback; **trains today on MPS** |
+| `metal` | Apple Silicon (Metal) | **this plan — near-term** | local-dev acceleration via **ThunderMittens / `tk_torch`** |
+| `triton` | **NVIDIA** | **deferred, NOT canceled** | ultimate production training path |
 
-**Decision (user):** Triton is *deferred*, not dropped — final training runs on NVIDIA,
-so the existing `ops/triton/unfold/` SISO kernels stay and the ρ/k-v-norm fusion (the
-old Phase 1.2) is rescheduled to the NVIDIA bring-up, not removed. Near-term development
-happens on Apple Silicon, so we add a Metal backend now.
+**rev. 2 — ThunderMittens matured a lot** since rev. 1 (it is being actively developed
+in `/Users/eric/ThunderMittens`). Three findings rewrite the plan:
 
-**Cornerstone fact (verified):** the §6 reference (`aum_unfold_chunk_ref`) runs
-forward **and backward** on `mps` at reference dims (B=2, L=16, 4 heads, headdim 128),
-fp32. So AUM-Ø can be brought up and trained on the Mac via the `reference` backend
-immediately; the Metal kernel only has to *beat the reference on MPS*, with the
-reference as its correctness oracle.
+1. **`tk_torch` is a torch-native MPS path — no MLX, no DLPack.** It compiles the shared
+   `.metal` kernels into `tk.metallib` with `xcrun metal`, JIT-builds a thin ObjC++
+   extension (`torch.utils.cpp_extension.load`) that binds a torch MPS tensor's
+   `MTLBuffer` and dispatches on **PyTorch's own MPS command stream**
+   (`torch::mps::get_command_buffer/get_dispatch_queue`). Call site is just
+   `import tk_torch; y = tk_torch.<kernel>(mps_tensors, scalars)` → torch MPS tensor.
+   Requirements: PyTorch≥2.1 (MPS) + Xcode Metal toolchain only.
+2. **The kernel bases already exist.** `mamba2` (chunked SSD), `lin_attn_decay`
+   (RetNet/Lightning decay LA), `lin_attn_causal` (explicit running `D×D` state),
+   `based`, `hedgehog`, `linear_attn`, plus `rotary`, `rope_kv`/`rope_kv_insert_norm`
+   (fused K-RMSNorm+RoPE), `rms_norm`, `attn_bwd` (FA-2 backward scaffold).
+3. **The substrate is ~90% ready** — `mma_AtB` (the rank-1 state update `S += Kᵀ·V`),
+   the decay tile `exp(cumlog_i−cumlog_j)`, reductions, `make_causal`, rotary,
+   `exp/tanh/silu` all present. Only genuine gaps: **`sigmoid` + `softplus` ops**, and
+   (optional) an in-kernel float cumsum (the shipped kernels host-precompute `cumlog`).
 
-## Strategy: one math, pluggable backend
+**Cornerstone (verified):** the §6 reference runs **fwd+bwd on `mps`** at reference dims
+(4 heads × 128). So the model + the §23 gate can run on the `reference` backend now; the
+Metal kernel is a **speed track that does not block the gate**.
 
-The U phase calls a dispatcher selecting the backend from config
-(`AumConfig.kernel_backend ∈ {auto, reference, metal, triton}`, default `auto`):
-- `auto` → `triton` on CUDA, `metal` on Apple (if built), else `reference`.
-- `reference` always available (the oracle); used for tests and any unsupported shape.
+## Strategy: one math, pluggable backend, two independent tracks
 
-This keeps the model identical across hardware and lets every backend be validated
-against `ssd_reference` (Phase 0). The silence reads (§4/§10) are the *same* readout with
-a swapped query, so they reuse whichever backend is active (`aum_state_readout_*`).
+The U phase dispatches on `AumConfig.kernel_backend ∈ {auto, reference, metal, triton}`
+(default `auto` → `triton` on CUDA, `metal` on Apple if `tk_torch` importable, else
+`reference`). Every backend is validated against `ssd_reference` (Phase 0).
 
-## Why MLX `mx.fast.metal_kernel`, not the full ThunderMittens build (initially)
+- **Model/gate track** (Phases 1–5) runs on `reference` over MPS — no Metal dependency.
+- **Metal track** (this doc) accelerates the U phase and the silence reads; it can proceed
+  in parallel and be swapped in per-backend once grad-clean.
 
-ThunderMittens is an early MSL port of ThunderKittens (3 kernels: `add_rt`,
-`matmul_custom`, `attn_fwd`; no SSM/linear-attention kernel; **missing primitives**:
-sequence cumsum/segsum, outer-product accumulate into a state tile, rotary pair-rotation,
-L2-norm reduction) and needs MLX-from-source + Xcode to build. Standing up a fused SSD
-kernel on its primitives is itself a multi-step sub-project.
+## Integration: `tk_torch` + `torch.autograd.Function` (replaces the old MLX/DLPack plan)
 
-`mx.fast.metal_kernel` lets us write MSL **inline in Python**, JIT-compiled and callable on
-MLX arrays — the fastest path to a *correct* Metal kernel with no separate build. We start
-there; we graduate the kernel onto structured ThunderMittens primitives later, once it is
-correct and we want the tiled/optimized version (and TM's primitives have matured).
+`tk_torch` is **forward-only** (no autograd anywhere in it — confirmed). So the `metal`
+backend wraps each kernel call:
 
-**Reference templates** (under `/Users/eric/ThunderMittens/.reference/`):
-- Decode recurrence (Metal-native): `vllm-metal/.../kernels_v2/gdn_recurrent_decode.metal`
-  — per-head scalar decay, k·state / q·state via `simd_sum`, rank-1 state update.
-- Chunk-parallel training: `ThunderKittens/kernels/linear_attention/linear_attention.cu`
-  — intra-chunk (Q·Kᵀ masked + decay) vs inter-chunk (state·=decay; state+=Kᵀ·V) split.
-- Rotary + norm: `mlx/.../kernels/rope.metal`, `rms_norm.metal`.
+```python
+# aum_ssm/ops/metal/unfold_metal.py  (metal backend)
+import tk_torch                                    # from /Users/eric/ThunderMittens/.../kernels
+class _UnfoldChunkMetal(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, v, tau, lam, r, theta, z, D, dt_bias):
+        # host prep (MPS): cumlog=cumsum(-lam*tau); cos/sin from phi; L2norm(k),L2norm(v);
+        # X = (sigmoid(r)*tau)*v_hat ; C=rotate(q); B=rotate(k_hat)
+        y = tk_torch.aum_unfold(C, B, X, cumlog, ...)   # the forked mamba2-core kernel
+        ctx.save_for_backward(...); return y
+    @staticmethod
+    def backward(ctx, dy): ...                       # manual bwd (see kernel plan)
+```
 
-## Integration architecture: Hybrid (torch backbone + MLX Metal U-phase)
+- Tensors stay on `mps`; `torch.mps.synchronize()` before any host read.
+- bf16 activations, fp32 for `cumlog`/decay and mma accumulators (matches TM convention
+  and the reference's fp32 state).
+- The kernel itself lives in **ThunderMittens** (added via the `tk_torch` "add-a-kernel"
+  recipe: `tk_launch.h` launch template → `torch_kernels.mm` `_mps` fn + `m.def` →
+  `__init__.py` wrapper + `_METAL_SOURCES`). `aum_ssm` imports it through `tk_torch`; this
+  is a documented cross-repo dependency (ThunderMittens on `PYTHONPATH` / pip-installed).
 
-Keep the model in **PyTorch/MPS** (ecosystem, the existing harness, and the eventual
-NVIDIA/Triton path); replace only the U-phase op with an MLX Metal kernel:
-- **Bridge:** torch-MPS ↔ MLX via **DLPack** (`mx.from_dlpack` / `torch.from_dlpack`),
-  zero-copy on the Metal device.
-- **Autograd:** DLPack carries data only, so wrap the MLX kernel in a
-  `torch.autograd.Function` with a **manual backward**. The backward formulas are
-  grad-checked against autograd-through-`ssd_reference` (which is exact).
-- **Not** a full MLX port of the model (MLX's nn/autograd is less mature; the harness,
-  HF interop, and the NVIDIA path are torch). Revisit only if the bridge proves a
-  bottleneck.
+## Kernel plan (validated against `ssd_reference` at every step)
 
-Requires: `pip install mlx` into the venv (torch MPS already present).
+### Training (chunk-parallel) — fork `kernels/mamba2/mamba2.metal`
+It already computes `O = ((C@Bᵀ) ⊙ L ⊙ causal) @ X`, `L[i,j]=exp(cumlog_i−cumlog_j)`.
+Map: `C=R(φ)q`, `B=k_rot=R(φ)·L2norm(k)`, `X=ρτ·L2norm(v)`, `cumlog=cumsum(−λτ)`.
+- **Decay:** *no kernel change* — feed `cumlog` from host.
+- **Incremental fusion:**
+  - *Stage 1 (fastest correct GPU path):* do rotary + L2-norm + ρτ + `cumlog` as PyTorch
+    ops on MPS, call the (D=128-instantiated) mamba2 core for the SSD matmul+decay only.
+    Near-zero new Metal code; validate vs `aum_unfold_chunk_ref`.
+  - *Stage 2 (fused):* move rotary (single scalar phase/head), L2-norm, and the ρτ scale
+    in-register (reuse `rope_kv_insert_norm`'s norm+rotate block), add `sigmoid`/`softplus`
+    ops to `base_ops.metal`+`maps.metal`.
+- **D=128:** all TM SSM kernels are `static_assert(D==64)`; add the `D=128` instantiation
+  (rotary/rope_kv already ship D=128). 4 heads → grid `(N/8, 4, B)`.
+- **Backward (the hard part):** none of the SSM kernels have one. Two-step:
+  - *bridge:* Stage-1 forward + backward via autograd through the PyTorch prep and a
+    reference-computed core-gradient (correct, not fast) — unblocks training on Metal.
+  - *fused:* write the decay-weighted/rotated/gated backward (`dC,dB,dX,d cumlog→dλ`, and
+    grads back through rotary φ, the L2-norms, and `ρ=sigmoid`) using the shipped
+    `attn_bwd` (FA-2 dQ/dK/dV) family as the scaffold.
 
-## Kernels to build (each validated against `ssd_reference`)
+### Decode (single-token) — fork `kernels/lin_attn_causal/lin_attn_causal.metal`
+It already holds an explicit `rt_fl<D,D>` state and does `KV += kᵀv` + `q@KV`. Deltas:
+collapse to one token; persist `S` in device memory across steps (reuse `rope_kv`'s
+read/modify/write-cache pattern); add scalar decay `S *= exp(−λτ)`; gated rank-1 update
+`S += ρτ (v̂ ⊗ k_rot)`; readout `S·R(φ)q`; carry running `φ`; D=128. Inference-only → no
+backward. Oracle: `aum_unfold_step_ref`.
 
-1. **Decode (single-token), `aum_unfold_step_metal`** — inference-only, no grad first
-   (simplest). SIMD-per-head: load state `S (Dv×Dqk)`; `S*=exp(-λτ)`; `S += ρτ (v̂⊗k̂_rot)`;
-   `r = S·q_rot`; gated-RMSNorm readout. Oracle: `aum_unfold_step_ref`. Template:
-   `gdn_recurrent_decode.metal`.
-2. **Chunk-parallel (training), `aum_unfold_chunk_metal`** — fwd via simdgroup-matrix
-   intra/inter-chunk SSD scan; **manual backward** in the `torch.autograd.Function`.
-   Oracle: `aum_unfold_chunk_ref` (fwd) and autograd-through-reference (grads). Template:
-   `linear_attention.cu` structure on Apple `simdgroup_matrix`.
-3. **Silence readout** — the swapped-query readout reuses kernel 2 with `Q=σ-query`,
-   no new write. Oracle: `aum_state_readout_ref`.
+### Silence reads — reuse the training kernel with a swapped query
+`r_t^j = S_t R(φ_t) W_q^σ σ_t^j` is the same readout with `C = σ-query`; no new write.
+Oracle: `aum_state_readout_ref`.
 
-Rotary (`R(φ)`, single data-dependent phase per head), k/v L2-norm, and the ρ write-gate
-are applied **inside** the Metal kernel (or as cheap MLX pre-passes), mirroring the
-reference; `R(φ)` is orthogonal so norm/rotary order is free.
+## Substrate additions to ThunderMittens (small)
+1. `sigmoid` (`struct sigmoid` in `common/base_ops.metal` + wrappers in the 4 `maps.metal`,
+   mirroring `silu`). 2. `softplus` (numerically-stable `log1p(exp(x))`). 3. *(optional)*
+   a float prefix-scan for in-kernel `cumlog` (wrap `metal::simd_prefix_inclusive_sum`);
+   otherwise keep host-precompute.
 
-## Milestones (near-term, all CPU/MPS-validatable on the Mac)
+## Milestones (near-term; M0/M1 gate the rest, all MPS-validatable)
 
-- **M0 — bridge smoke.** `pip install mlx`; verify `torch.backends.mps`, a trivial
-  `mx.fast.metal_kernel`, and a DLPack round-trip torch-MPS↔MLX. *(verified: MPS up.)*
-- **M1 — run on Apple Silicon via reference.** Land the U-phase **module restructure**
-  (controller/in_proj_qkv/in_proj_dyn etc., Appendix A — pure PyTorch) + the backend
-  selector defaulting to `reference`. Result: `AumLMHeadModel` forward+backward on `mps`
-  end-to-end (silence off). This is "it trains on the Mac." No kernel yet.
-- **M2 — decode Metal kernel** via `mx.fast.metal_kernel`, validated vs
-  `aum_unfold_step_ref` on MPS (fp32, then fp16/bf16 tolerance).
-- **M3 — chunk training Metal kernel** + `torch.autograd.Function` (fwd vs
-  `aum_unfold_chunk_ref`; bwd grad-checked vs autograd-through-reference).
-- **M4 — silence readout backend** + wire the silence block (Phase 2) to the active
-  backend; one-token == decode parity.
-- **M5 — benchmark** Metal vs reference-on-MPS; optimize; optionally restructure onto
-  ThunderMittens primitives (and add the missing TM primitives: seq-cumsum/segsum,
-  outer-product accumulate, rotary, L2-norm) for the tiled version.
+- **M0 — tk_torch smoke.** Put ThunderMittens on path; `import tk_torch`; run its
+  `tests/test_mps.py`; confirm a `mamba2`/`lin_attn_decay` call round-trips a torch-MPS
+  bf16 tensor. *(MPS already verified up.)*
+- **M1 — run on Apple Silicon via reference.** U-phase module restructure (Appendix-A
+  controller; make the Triton import lazy) + backend selector default `reference` →
+  `AumLMHeadModel` trains fwd+bwd on `mps` end-to-end (silence off). "It trains on the Mac."
+- **M2 — decode Metal kernel** (`lin_attn_causal` fork) vs `aum_unfold_step_ref`.
+- **M3 — training Metal kernel, Stage 1** (mamba2 core + PyTorch prep) inside a
+  `torch.autograd.Function`; fwd vs `aum_unfold_chunk_ref`, bwd via the reference bridge.
+- **M4 — fuse (Stage 2)** rotary+norm+gate + `sigmoid`/`softplus` ops; **fused backward**
+  via the `attn_bwd` scaffold, grad-checked vs autograd-through-reference; silence reads on
+  the metal backend.
+- **M5 — benchmark** metal vs reference-on-MPS; optimize (D=128 tiling, shared-memory
+  state); optional in-kernel `cumlog` scan.
 
 ## Verification
-
-- **Correctness:** every Metal kernel output diffed against `ssd_reference` — CPU float64
-  oracle vs MPS float32/bf16 with appropriate tolerance; backward via
-  `torch.autograd.gradcheck`-style comparison against autograd-through-reference.
-- **Parity:** decode kernel == one-token chunk == reference step.
-- **Portability gate:** with `kernel_backend=reference`, the full model + all Phase 2–5
-  tests run on CPU and MPS with no Metal/Triton dependency.
+- Correctness: every Metal kernel diffed against `ssd_reference` (CPU float64 oracle vs MPS
+  bf16/fp32 with per-kernel tolerance, as `tk_torch`'s own tests do); backward grad-checked
+  vs autograd-through-reference.
+- Parity: decode == one-token chunk == reference step.
+- Portability gate: `kernel_backend=reference` runs the whole model + Phases 2–5 on CPU and
+  MPS with no Metal/Triton dependency.
 
 ## Risks
-
-1. **MLX↔torch DLPack on MPS** maturity (nightly torch + MLX version skew). Mitigation:
-   M0 smoke gates everything; fall back to `reference` on any bridge failure.
-2. **Manual backward** for the chunk kernel — error-prone. Mitigation: the reference gives
-   an exact gradient oracle; keep `reference` as the default training backend until the
-   Metal backward is grad-clean.
-3. **ThunderMittens immaturity** if/when we move off `mx.fast.metal_kernel`. Mitigation:
-   inline kernels first; structured TM port is M5, optional.
-4. **fp16/bf16 accuracy** of the affine scan on Apple GPUs. Mitigation: fp32 state
-   accumulation (as the reference does), reduced-precision I/O only.
+1. **Manual/fused backward** for the chunk kernel (hardest). Mitigation: reference is an
+   exact gradient oracle; keep `reference` the default training backend until the fused
+   backward is grad-clean; `attn_bwd` gives the scaffold.
+2. **Cross-repo coupling** (aum_ssm ↔ ThunderMittens, actively developed). Mitigation:
+   pin/import via `tk_torch`; the `metal` backend is optional (auto-falls back to reference).
+3. **bf16 accuracy** of the affine scan on Apple GPUs. Mitigation: fp32 `cumlog`/state
+   accumulation (reference parity), bf16 I/O only.
+4. **D=128 / new activations** in TM. Mitigation: tiny, well-scoped additions with the
+   shipping D=64 kernels + `silu`/`tanh` as templates; land as ThunderMittens PRs with tests.
 
 ## Relationship to the master plan
-
-This refines the master plan's Phase 1 kernel sub-task into a backend matrix. Phase 1.1
-(module restructure) is backend-agnostic and is M1 here. The old Phase 1.2 (in-kernel
-Triton fusion) is **deferred to NVIDIA bring-up**. Phases 2–5 (silence, integration,
-training, gate) are unchanged and run on MPS via the `reference`/`metal` backends.
+Refines Phase 1's kernel sub-task into the backend matrix. Phase 1.1 (module restructure)
+is backend-agnostic and is **M1**. The old Triton in-kernel fusion is **deferred to NVIDIA
+bring-up**. Phases 2–5 (silence, integration, training, gate) are unchanged and run on MPS
+via `reference` (and `metal` once landed).
