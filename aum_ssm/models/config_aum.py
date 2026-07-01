@@ -33,10 +33,12 @@ class AumConfig:
     ssm_cfg: dict = field(default_factory=dict)
 
     # ---- Global silence block (§3-§14) ----
+    silence_enabled: bool = False     # False -> evidence-core baseline (g_t output, §22)
     d_sigma: int = 128                # bottlenecked hypothesis register width (§0.4)
     d_mu: int = 32                    # precision / error projection width (k)
     d_phase: int = 32                 # phase embedding width Φ(φ)
     j_max: int = 2                    # forced final halt depth (§13, §15)
+    kappa: float = 0.1                # consistency register-inertia weight (§11)
 
     # ---- Loss weights (§18) ----
     lambda_pred: float = 1.0          # prediction-head objective (§16)

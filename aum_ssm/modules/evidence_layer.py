@@ -31,7 +31,7 @@ class EvidenceLayer(nn.Module):
         self.mlp = mlp_cls(dim)
 
     def forward(self, hidden_states: Tensor, residual: Optional[Tensor] = None,
-                inference_params=None, **kwargs):
+                inference_params=None, return_silence_ctx=False, **kwargs):
         # fold the previous block's output into the residual stream
         residual = (hidden_states + residual) if residual is not None else hidden_states
         if self.residual_in_fp32:
@@ -39,12 +39,18 @@ class EvidenceLayer(nn.Module):
 
         x_bar = self.input_layernorm(residual)
         h_A = self.ground_attn(x_bar, inference_params=inference_params)
-        h_U, m_t, s_t = self.unfold(x_bar, inference_params=inference_params)
+        if return_silence_ctx:                            # top layer: expose read closure + phase
+            h_U, m_t, s_t, phi, read_fn = self.unfold(
+                x_bar, inference_params=inference_params, return_read=True)
+        else:
+            h_U, m_t, s_t = self.unfold(x_bar, inference_params=inference_params)
         h_M, _mu = self.modulate(h_A, h_U, m_t)           # h^A + h^U + Δh (§8)
 
         residual = residual + h_M
         x2 = self.post_attention_layernorm(residual)
         hidden_states = self.mlp(x2)
+        if return_silence_ctx:
+            return hidden_states, residual, {"phi": phi, "m_t": m_t, "s_t": s_t, "read_fn": read_fn}
         return hidden_states, residual
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):

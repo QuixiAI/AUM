@@ -98,11 +98,12 @@ class Unfold(nn.Module):
             raise NotImplementedError("triton backend deferred to NVIDIA bring-up")
         raise ValueError(f"unknown kernel_backend {backend!r}")
 
-    def forward(self, x, inference_params=None, **kwargs):
+    def forward(self, x, inference_params=None, return_read=False, **kwargs):
         """x: (B, L, d_model) — already layer-normed by the evidence layer (§5 shared LN).
 
         Returns (out, m_t, s_t): out (B,L,d_model); m_t (B,L,m_dim) for the M phase;
-        s_t (B,L,1) pressure drive for the top-layer silence block.
+        s_t (B,L,1) pressure drive for the top-layer silence block. When return_read=True,
+        also returns (phi, read_fn) for the silence block's swapped-query reads (§4/§10).
         """
         if inference_params is not None:
             raise NotImplementedError("Unfold single-token decode is a later milestone (M2/Phase 3)")
@@ -123,12 +124,30 @@ class Unfold(nn.Module):
         m_t = dyn[..., 4 * self.nheads : 4 * self.nheads + self.m_dim]   # (B,L,m_dim)
         s_t = dyn[..., 4 * self.nheads + self.m_dim :]                   # (B,L,1)
 
-        lam_bar = lam_bar + self.A_log                              # per-head lambda base offset
+        lam_bar = lam_bar + self.A_log                              # per-head lambda base offset (effective lambda_bar)
         D_hd = self.D.view(self.nheads, self.headdim)
 
         h = self._dispatch(q, k, v, tau_bar, lam_bar, r, theta, z, D_hd)  # (B,L,nheads,headdim)
         out = self.out_proj(rearrange(h, "b l h p -> b l (h p)"))
-        return out, m_t, s_t
+        if not return_read:
+            return out, m_t, s_t
+
+        # Bind the swapped-query read against THIS layer's evidence state (§4/§10). The read is a
+        # linear-attention readout with the same write (k, v, dynamics); only the query changes.
+        from aum_ssm.modules.ssd_reference import aum_dynamics, aum_state_readout_ref
+        _, _, _, dphi = aum_dynamics(tau_bar, lam_bar, r, theta, self.dt_bias, self.eps)
+        phi = torch.cumsum(dphi, dim=1)                             # (B,L,nheads) resonance phase
+        k_c, v_c, tb, lb, rw, th = k, v, tau_bar, lam_bar, r, theta
+
+        def read_fn(query, phi_arg=None, exclude_current=False):
+            L_ = query.shape[1]
+            bl = self.chunk_size if (L_ % self.chunk_size == 0) else L_
+            qh = rearrange(query, "b l (h p) -> b l h p", p=self.headdim)
+            rr = aum_state_readout_ref(qh, k_c, v_c, tb, lb, rw, th, phi=phi, dt_bias=self.dt_bias,
+                                       eps=self.eps, block_len=bl, exclude_current=exclude_current)
+            return rearrange(rr, "b l h p -> b l (h p)")
+
+        return out, m_t, s_t, phi, read_fn
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         raise NotImplementedError("Unfold decode cache is a later milestone (M2/Phase 3)")

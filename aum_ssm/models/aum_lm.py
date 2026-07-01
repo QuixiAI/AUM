@@ -10,6 +10,7 @@ from collections import namedtuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from aum_ssm.models.config_aum import AumConfig
 from aum_ssm.modules.unfold import Unfold                 # U phase
@@ -104,10 +105,10 @@ class AumBackbone(nn.Module):
 
         # Global silence block — single block on top of the evidence stack (§0.1, §3).
         self.silence = SilenceBlock(config.d_model, d_sigma=config.d_sigma, d_mu=config.d_mu,
-                                    d_phase=config.d_phase, j_max=config.j_max, **factory)
-        # TODO(AUM/Phase 2): enable once SilenceBlock.forward is implemented. While False, the
-        # backbone returns g_t alone (the silence-ablated baseline, §22).
-        self.silence_enabled = False
+                                    d_phase=config.d_phase, j_max=config.j_max, kappa=config.kappa,
+                                    **factory)
+        # False -> the silence-ablated evidence-core baseline (g_t output, §22).
+        self.silence_enabled = config.silence_enabled
 
         self.norm_f = (RMSNorm if config.rms_norm else nn.LayerNorm)(
             config.d_model, eps=config.norm_epsilon, **factory
@@ -115,17 +116,36 @@ class AumBackbone(nn.Module):
         self.apply(partial(_init_weights, n_layer=config.n_layer,
                            **(config.initializer_cfg or {})))
 
-    def forward(self, input_ids, inference_params=None, **kwargs):
+    def forward(self, input_ids, inference_params=None, return_aux=False, **kwargs):
         hidden_states = self.embedding(input_ids)
         residual = None
-        for layer in self.layers:
-            hidden_states, residual = layer(hidden_states, residual,
-                                            inference_params=inference_params, **kwargs)
+        ctx = None
+        n = len(self.layers)
+        for i, layer in enumerate(self.layers):
+            top = self.silence_enabled and i == n - 1
+            if top:
+                hidden_states, residual, ctx = layer(
+                    hidden_states, residual, inference_params=inference_params,
+                    return_silence_ctx=True, **kwargs)
+            else:
+                hidden_states, residual = layer(
+                    hidden_states, residual, inference_params=inference_params, **kwargs)
         residual = (hidden_states + residual) if residual is not None else hidden_states
-        hidden_states = self.norm_f(residual)              # g_t (top-of-stack grounded summary)
-        if self.silence_enabled:
-            hidden_states = self.silence(hidden_states, inference_params=inference_params)
-        return hidden_states
+        g_t = self.norm_f(residual)                        # top-of-stack grounded summary
+        if not self.silence_enabled:
+            return (g_t, None) if return_aux else g_t
+
+        phi = ctx["phi"]
+        phi_prev = torch.cat([torch.zeros_like(phi[:, :1]), phi[:, :-1]], dim=1)
+        logits_fn = lambda o: F.linear(o, self.embedding.weight)  # tied classifier for H_t (§12)
+        read_fn, m_t, s_t = ctx["read_fn"], ctx["m_t"], ctx["s_t"]
+        # Two-pass truncated sigma carry (§9/§10): seed with zero, then feed the detached, shifted
+        # sigma_bar so each token's revision starts from the previous interpretation (TBPTT window 1).
+        _, aux0 = self.silence(g_t, read_fn, phi, phi_prev, None, m_t, s_t, logits_fn)
+        sigma_prev = torch.cat(
+            [torch.zeros_like(aux0.sigma_bar[:, :1]), aux0.sigma_bar[:, :-1].detach()], dim=1)
+        o_t, aux = self.silence(g_t, read_fn, phi, phi_prev, sigma_prev, m_t, s_t, logits_fn)
+        return (o_t, aux) if return_aux else o_t
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return {i: layer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
@@ -152,13 +172,16 @@ class AumLMHeadModel(nn.Module, GenerationMixin):
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return self.backbone.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
 
-    def forward(self, input_ids, position_ids=None, inference_params=None, num_last_tokens=0, **kwargs):
-        hidden_states = self.backbone(input_ids, inference_params=inference_params, **kwargs)
+    def forward(self, input_ids, position_ids=None, inference_params=None, num_last_tokens=0,
+                return_aux=False, **kwargs):
+        out = self.backbone(input_ids, inference_params=inference_params, return_aux=return_aux, **kwargs)
+        hidden_states, aux = out if return_aux else (out, None)
         if num_last_tokens > 0:
             hidden_states = hidden_states[:, -num_last_tokens:]
         lm_logits = self.lm_head(hidden_states)
         CausalLMOutput = namedtuple("CausalLMOutput", ["logits"])
-        return CausalLMOutput(logits=lm_logits)
+        result = CausalLMOutput(logits=lm_logits)
+        return (result, aux) if return_aux else result
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name, device=None, dtype=None, **kwargs):

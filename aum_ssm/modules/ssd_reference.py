@@ -36,11 +36,13 @@ def segsum(x):
     return x_segsum
 
 
-def ssd_minimal_discrete(X, A, B, C, block_len, initial_states=None):
+def ssd_minimal_discrete(X, A, B, C, block_len, initial_states=None, exclude_diag=False):
     """Linear (affine) SSD: Y_t = C_t sum_{s<=t} exp(sum_{s<r<=t} A_r) B_s X_s.
 
     X: (b, l, h, p)   A: (b, l, h)   B: (b, l, h, n)   C: (b, l, h, n)
     Returns Y (b, l, h, p) and final_state (b, h, p, n).
+    exclude_diag=True gives the STRICTLY-causal read Y_t = C_t sum_{s<t} ... (i.e. reads the
+    state S_{t-1}, before the current token's write) — used by the §4 predictive grounding read.
     """
     assert X.shape[1] % block_len == 0
     X, A, B, C = [rearrange(t, "b (c l) ... -> b c l ...", l=block_len) for t in (X, A, B, C)]
@@ -49,6 +51,9 @@ def ssd_minimal_discrete(X, A, B, C, block_len, initial_states=None):
 
     # 1. intra-chunk (diagonal) output
     L = torch.exp(segsum(A))
+    if exclude_diag:  # drop the current position (l == s); off-diagonal chunks are already < t
+        n = L.shape[-1]
+        L = L * (1 - torch.eye(n, device=L.device, dtype=L.dtype))
     Y_diag = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp", C, B, L, X)
 
     # 2. per-chunk end states
@@ -184,12 +189,13 @@ def aum_unfold_chunk_ref(q, k, v, tau_bar, lam_bar, r, theta, z=None, D=None,
 
 
 def aum_state_readout_ref(query, k, v, tau_bar, lam_bar, r, theta, phi=None,
-                          dt_bias=0.0, eps=1e-4, block_len=None):
+                          dt_bias=0.0, eps=1e-4, block_len=None, exclude_current=False):
     """Swapped-query readout r_t = S_t R(phi_t) query_t (the silence read, §4/§10/§12).
 
     Reuses the SAME evidence write (k, v, dynamics) as the U phase, but reads with an
     external `query` (B, L, H, Dqk) instead of the token's own q. Returns r (B, L, H, Dv).
     If `phi` (B,L,H) is supplied it is reused; otherwise it is recomputed from the dynamics.
+    exclude_current=True reads S_{t-1} (the §4 predictive read).
     """
     B, L, H, Dqk = query.shape
     if block_len is None:
@@ -200,5 +206,9 @@ def aum_state_readout_ref(query, k, v, tau_bar, lam_bar, r, theta, phi=None,
     q_rot = _rotate_single_phase(query, phi)
     k_rot = _rotate_single_phase(_l2norm(k), phi)
     X = (rho * tau).unsqueeze(-1) * _l2norm(v)
-    r_out, _ = ssd_minimal_discrete(X, alpha_log, k_rot, q_rot, block_len)
+    r_out, _ = ssd_minimal_discrete(X, alpha_log, k_rot, q_rot, block_len, exclude_diag=exclude_current)
+    if exclude_current:
+        # The decay tile decays to position i; reading S_{t-1} should decay only to i-1, so undo
+        # the extra alpha_i = exp(alpha_log_i) step.
+        r_out = r_out * torch.exp(-alpha_log).unsqueeze(-1)
     return r_out
