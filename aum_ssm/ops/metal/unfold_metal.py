@@ -4,10 +4,9 @@
 #
 # tk_torch.mamba2(C,B,X,cumlog) computes ((C@Bᵀ) ⊙ exp(cumlog_i−cumlog_j) ⊙ causal) @ X, which is
 # exactly the AUM readout S_t·R(φ)q with C=R(φ)q, B=k_rot=R(φ)·L2norm(k), X=ρτ·L2norm(v),
-# cumlog=cumsum(−λτ). The kernel supports headdim D=64 or D=128 (the Appendix-A reference is
-# 4 heads x 128) and is forward-only, so the SSD core is wrapped in a torch.autograd.Function whose
-# backward recomputes the (cheap, O(N²)) SSD gradient in PyTorch — a correct Stage-1 fusion; a
-# fused Metal backward is M4.
+# cumlog=cumsum(−λτ). Headdim D=64 or D=128 (the Appendix-A reference is 4 heads x 128). Both the
+# forward (mamba2) and the backward (mamba2_bwd → dC,dB,dX) run on the Metal GPU; dcumlog is the
+# cheap host identity <dY,Y>−<dX,X>. `_ssd_core_ref` stays as the correctness oracle / fallback.
 #
 # tk_torch lives in the ThunderMittens repo; put .../ThunderMittens/kernels on PYTHONPATH.
 
@@ -28,25 +27,38 @@ def _ssd_core_ref(C, B, X, cumlog):
     return (scores * decay * mask) @ X.float()
 
 
+_FUSED_BWD = True   # M4: fused mamba2_bwd Metal kernel. Set False to fall back to the PyTorch oracle.
+
+
 class _Mamba2SSD(torch.autograd.Function):
-    """Forward: tk_torch.mamba2 Metal kernel. Backward: the reference SSD core (PyTorch)."""
+    """Forward + backward both on the Metal GPU (tk_torch.mamba2 / mamba2_bwd).
+
+    dcumlog is the cheap host identity dcl_k = <dY_k,Y_k> − <dX_k,X_k> (rowsum/colsum of dM⊙M),
+    so the kernels only emit dC/dB/dX. `_ssd_core_ref` remains the correctness oracle / fallback.
+    """
 
     @staticmethod
     def forward(ctx, C, B, X, cumlog):
         import tk_torch
-        ctx.save_for_backward(C, B, X, cumlog)
         with torch.no_grad():
-            Y = tk_torch.mamba2(C.bfloat16(), B.bfloat16(), X.bfloat16(), cumlog.float())
-        return Y.to(C.dtype)
+            Y = tk_torch.mamba2(C.bfloat16(), B.bfloat16(), X.bfloat16(), cumlog.float()).to(C.dtype)
+        ctx.save_for_backward(C, B, X, cumlog, Y)
+        return Y
 
     @staticmethod
     def backward(ctx, dY):
-        C, B, X, cumlog = ctx.saved_tensors
-        with torch.enable_grad():
-            ins = [t.detach().requires_grad_(True) for t in (C, B, X, cumlog)]
-            Y = _ssd_core_ref(*ins)
-            grads = torch.autograd.grad(Y, ins, dY.float())
-        return tuple(g.to(t.dtype) for g, t in zip(grads, (C, B, X, cumlog)))
+        C, B, X, cumlog, Y = ctx.saved_tensors
+        if _FUSED_BWD:
+            import tk_torch
+            dC, dB, dX = tk_torch.mamba2_bwd(C.bfloat16(), B.bfloat16(), X.bfloat16(),
+                                             cumlog.float(), dY.bfloat16())
+            dC, dB, dX = dC.float(), dB.float(), dX.float()
+            dcumlog = (dY.float() * Y.float()).sum(-1) - (dX * X.float()).sum(-1)
+        else:
+            with torch.enable_grad():
+                ins = [t.detach().requires_grad_(True) for t in (C, B, X, cumlog)]
+                dC, dB, dX, dcumlog = torch.autograd.grad(_ssd_core_ref(*ins), ins, dY.float())
+        return dC.to(C.dtype), dB.to(B.dtype), dX.to(X.dtype), dcumlog.to(cumlog.dtype)
 
 
 def unfold_metal_chunk(q, k, v, tau_bar, lam_bar, r, theta, z=None, D=None,
