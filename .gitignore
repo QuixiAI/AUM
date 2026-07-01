@@ -6,3 +6,6 @@ build/
 *_hip.*
 # Vendored Metal build artifact
 kernels/metal/aum.metallib
+
+# Training checkpoints (large; regenerate with train/init.py)
+train/checkpoints/
