@@ -9,3 +9,4 @@ kernels/metal/aum.metallib
 
 # Training checkpoints (large; regenerate with train/init.py)
 train/checkpoints/
+train/data/
