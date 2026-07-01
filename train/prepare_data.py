@@ -170,7 +170,7 @@ def run(args):
         every = max(2, round(1.0 / args.val_fraction))
         writer_for = lambda i: writers["val" if i % every == 0 else "train"]
     else:
-        writer_for = lambda i: writers["train"]
+        writer_for = lambda _: writers["train"]
 
     docs = iter_documents(args.source, args.split, args.text_column, args.streaming, args.limit_docs)
     n_docs = pack(docs, encode_fn, eos_id, writer_for, args.batch_docs)
