@@ -78,6 +78,11 @@ class Unfold(nn.Module):
         self.norm = _NormWeight(headdim, **factory)
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=False, **factory)
 
+        # §4 multi-frequency rotation ladder (Appendix A: unfold.rope_freqs [headdim/2], F32).
+        # A fixed buffer, not a parameter: omega_b geometric in [1e-3, 1].
+        from aum_ssm.modules.ssd_reference import ladder_freqs
+        self.register_buffer("rope_freqs", ladder_freqs(headdim // 2, device=device), persistent=True)
+
     def _dispatch(self, q, k, v, tau_bar, lam_bar, r, theta, z, D_hd):
         backend = self.kernel_backend
         if backend == "auto":
@@ -89,13 +94,14 @@ class Unfold(nn.Module):
             h, _ = aum_unfold_chunk_ref(
                 q, k, v, tau_bar, lam_bar, r, theta, z=z, D=D_hd,
                 dt_bias=self.dt_bias, eps=self.eps, block_len=block_len,
-                norm_weight=self.norm.weight,
+                norm_weight=self.norm.weight, freqs=self.rope_freqs,
             )
             return h
         if backend == "metal":
             from aum_ssm.ops.metal.unfold_metal import unfold_metal_chunk
             return unfold_metal_chunk(q, k, v, tau_bar, lam_bar, r, theta, z=z, D=D_hd,
-                                      dt_bias=self.dt_bias, eps=self.eps, norm_weight=self.norm.weight)
+                                      dt_bias=self.dt_bias, eps=self.eps,
+                                      norm_weight=self.norm.weight, freqs=self.rope_freqs)
         if backend == "triton":
             raise NotImplementedError("triton backend deferred to NVIDIA bring-up")
         raise ValueError(f"unknown kernel_backend {backend!r}")
@@ -110,7 +116,7 @@ class Unfold(nn.Module):
         """
         from aum_ssm.modules.ssd_reference import (
             aum_dynamics, aum_state_readout_ref, aum_unfold_chunk_ref, aum_unfold_step_ref,
-            _rotate_single_phase,
+            _rotate_ladder,
         )
         B, L, _ = x.shape
         decoding = inference_params is not None and inference_params.seqlen_offset > 0
@@ -154,7 +160,7 @@ class Unfold(nn.Module):
                 step = aum_unfold_step_metal
             h, (S_new, phi_new) = step(
                 q, k, v, tau_bar, lam_bar, r, theta, z=z, D=D_hd, dt_bias=self.dt_bias,
-                eps=self.eps, S0=S_cache, phi0=phi_cache, norm_weight=nw)
+                eps=self.eps, S0=S_cache, phi0=phi_cache, norm_weight=nw, freqs=self.rope_freqs)
             S_cache.copy_(S_new); phi_cache.copy_(phi_new)
             out = self.out_proj(rearrange(h, "b l h p -> b l (h p)"))
             if not return_read:
@@ -164,7 +170,7 @@ class Unfold(nn.Module):
             def read_fn(query, phi_arg=None, exclude_current=False):
                 S = S_pre if exclude_current else S_new
                 qh = rearrange(query, "b l (h p) -> b l h p", p=self.headdim)
-                q_rot = _rotate_single_phase(qh, phi_1H.unsqueeze(1))
+                q_rot = _rotate_ladder(qh, phi_1H.unsqueeze(1), self.rope_freqs)
                 rr = torch.einsum("bhpn,blhn->blhp", S, q_rot)
                 return rearrange(rr, "b l h p -> b l (h p)")
 
@@ -174,7 +180,7 @@ class Unfold(nn.Module):
             bl = self.chunk_size if (L % self.chunk_size == 0) else L
             h, (S_T, phi_T) = aum_unfold_chunk_ref(
                 q, k, v, tau_bar, lam_bar, r, theta, z=z, D=D_hd, dt_bias=self.dt_bias,
-                eps=self.eps, block_len=bl, norm_weight=nw)
+                eps=self.eps, block_len=bl, norm_weight=nw, freqs=self.rope_freqs)
             S_cache.copy_(S_T); phi_cache.copy_(phi_T)
         else:                                                     # training
             h = self._dispatch(q, k, v, tau_bar, lam_bar, r, theta, z, D_hd)
@@ -191,7 +197,8 @@ class Unfold(nn.Module):
             bl_ = self.chunk_size if (L_ % self.chunk_size == 0) else L_
             qh = rearrange(query, "b l (h p) -> b l h p", p=self.headdim)
             rr = aum_state_readout_ref(qh, k_c, v_c, tb, lb, rw, th, phi=phi, dt_bias=self.dt_bias,
-                                       eps=self.eps, block_len=bl_, exclude_current=exclude_current)
+                                       eps=self.eps, block_len=bl_, exclude_current=exclude_current,
+                                       freqs=self.rope_freqs)
             return rearrange(rr, "b l h p -> b l (h p)")
 
         return out, m_t, s_t, phi, read_fn

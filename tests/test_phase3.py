@@ -11,7 +11,7 @@ import torch
 from aum_ssm.models.config_aum import AumConfig
 from aum_ssm.models.aum_lm import AumLMHeadModel
 from aum_ssm.modules.ssd_reference import (
-    aum_state_readout_ref, aum_dynamics, _rotate_single_phase, _l2norm,
+    aum_state_readout_ref, aum_dynamics, _rotate_ladder, _l2norm,
 )
 
 torch.manual_seed(0)
@@ -25,9 +25,9 @@ def _brute_exclusive_read(query, k, v, tau_bar, lam_bar, r, theta, dt_bias, eps=
     S = torch.zeros(B, H, Dv, Dqk, dtype=query.dtype)
     outs = []
     for t in range(L):
-        q_rot = _rotate_single_phase(query[:, t], phi[:, t])
+        q_rot = _rotate_ladder(query[:, t], phi[:, t])
         outs.append(torch.einsum("bhpn,bhn->bhp", S, q_rot))          # read S_{t-1} (before write)
-        k_rot = _rotate_single_phase(_l2norm(k[:, t]), phi[:, t])
+        k_rot = _rotate_ladder(_l2norm(k[:, t]), phi[:, t])
         v_hat = _l2norm(v[:, t])
         w = (rho[:, t] * tau[:, t]).unsqueeze(-1).unsqueeze(-1)
         S = torch.exp(alog[:, t]).unsqueeze(-1).unsqueeze(-1) * S \

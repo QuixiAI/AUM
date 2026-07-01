@@ -16,7 +16,7 @@ import torch
 from einops import rearrange
 
 from aum_ssm.modules.ssd_reference import (
-    aum_dynamics, _rotate_single_phase, _l2norm, _gated_rmsnorm,
+    aum_dynamics, _rotate_ladder, _l2norm, _gated_rmsnorm,
 )
 
 
@@ -72,15 +72,15 @@ class _Mamba2SSD(torch.autograd.Function):
 
 
 def unfold_metal_chunk(q, k, v, tau_bar, lam_bar, r, theta, z=None, D=None,
-                       dt_bias=0.0, eps=1e-4, norm_weight=None):
-    """Metal U-phase readout h^U (§6). q,k,v: (B,L,H,headdim=64). Returns (B,L,H,headdim)."""
-    assert q.shape[-1] in (64, 128), "tk_torch.mamba2 supports headdim D=64 or D=128"
+                       dt_bias=0.0, eps=1e-4, norm_weight=None, freqs=None):
+    """Metal U-phase readout h^U (§4). q,k,v: (B,L,H,headdim). Returns (B,L,H,headdim)."""
+    assert q.shape[-1] in (64, 128), "aum mamba2 kernel supports headdim D=64 or D=128"
     assert q.shape[1] % 8 == 0, "mamba2 requires seqlen % 8 == 0"
 
     tau, alpha_log, rho, dphi = aum_dynamics(tau_bar, lam_bar, r, theta, dt_bias, eps)
     phi = torch.cumsum(dphi, dim=1)
-    C = rearrange(_rotate_single_phase(q, phi), "b l h d -> b h l d")
-    Bm = rearrange(_rotate_single_phase(_l2norm(k), phi), "b l h d -> b h l d")
+    C = rearrange(_rotate_ladder(q, phi, freqs), "b l h d -> b h l d")
+    Bm = rearrange(_rotate_ladder(_l2norm(k), phi, freqs), "b l h d -> b h l d")
     Xm = rearrange((rho * tau).unsqueeze(-1) * _l2norm(v), "b l h d -> b h l d")
     cumlog = rearrange(torch.cumsum(alpha_log, dim=1), "b l h -> b h l")
 
@@ -94,7 +94,7 @@ def unfold_metal_chunk(q, k, v, tau_bar, lam_bar, r, theta, z=None, D=None,
 
 
 def aum_unfold_step_metal(q, k, v, tau_bar, lam_bar, r, theta, z=None, D=None,
-                          dt_bias=0.0, eps=1e-4, S0=None, phi0=None, norm_weight=None):
+                          dt_bias=0.0, eps=1e-4, S0=None, phi0=None, norm_weight=None, freqs=None):
     """Metal single-token decode step (§6) — a drop-in for `aum_unfold_step_ref`.
 
     The `aum_decode` kernel does the D×D state update + readout (S <- alpha*S + x⊗k_rot; out =
@@ -115,8 +115,8 @@ def aum_unfold_step_metal(q, k, v, tau_bar, lam_bar, r, theta, z=None, D=None,
     tau, alpha_log, rho, dphi = aum_dynamics(
         tau_bar[:, 0], lam_bar[:, 0], r[:, 0], theta[:, 0], dt_bias, eps)
     phi = phi_prev + dphi                                   # (B,H)
-    q_rot = _rotate_single_phase(q[:, 0], phi)              # (B,H,Dqk)
-    k_rot = _rotate_single_phase(_l2norm(k[:, 0]), phi)     # (B,H,Dqk)
+    q_rot = _rotate_ladder(q[:, 0], phi, freqs)             # (B,H,Dqk)
+    k_rot = _rotate_ladder(_l2norm(k[:, 0]), phi, freqs)    # (B,H,Dqk)
     x = (rho * tau).unsqueeze(-1) * _l2norm(v[:, 0])        # (B,H,Dv)  = rho*tau*v_hat
     alpha = torch.exp(alpha_log)                            # (B,H)
 

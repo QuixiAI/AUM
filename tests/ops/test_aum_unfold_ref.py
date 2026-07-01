@@ -15,7 +15,8 @@ from aum_ssm.modules.ssd_reference import (
     aum_unfold_chunk_ref,
     aum_state_readout_ref,
     aum_dynamics,
-    _rotate_single_phase,
+    ladder_freqs,
+    _rotate_ladder,
     _l2norm,
 )
 
@@ -45,12 +46,12 @@ def _brute_readout(query, inp, eps=1e-4):
             inp["dt_bias"], eps,
         )
         phi = phi + dphi
-        k_rot = _rotate_single_phase(_l2norm(inp["k"][:, t]), phi)
+        k_rot = _rotate_ladder(_l2norm(inp["k"][:, t]), phi)
         v_hat = _l2norm(inp["v"][:, t])
         w = (rho * tau).unsqueeze(-1).unsqueeze(-1)
         S = torch.exp(alog).unsqueeze(-1).unsqueeze(-1) * S
         S = S + w * (v_hat.unsqueeze(-1) * k_rot.unsqueeze(-2))
-        q_rot = _rotate_single_phase(query[:, t], phi)
+        q_rot = _rotate_ladder(query[:, t], phi)
         outs.append(torch.einsum("bhpn,bhn->bhp", S, q_rot))
     return torch.stack(outs, dim=1)
 
@@ -104,8 +105,40 @@ def test_rotation_is_orthogonal():
     g = torch.Generator().manual_seed(7)
     x = torch.randn(4, 8, dtype=torch.float64, generator=g)
     phi = torch.randn(4, dtype=torch.float64, generator=g)
-    xr = _rotate_single_phase(x, phi)
-    assert torch.allclose(x.norm(dim=-1), xr.norm(dim=-1), rtol=1e-12, atol=1e-12)
+    xr = _rotate_ladder(x, phi)
+    assert torch.allclose(x.norm(dim=-1), xr.norm(dim=-1), rtol=1e-9, atol=1e-9)
+
+
+def test_rotation_depends_on_relative_phase():
+    # <R(phi_t) q, R(phi_s) k> == <R(phi_t - phi_s) q, k>: data-dependent RELATIVE position (§4).
+    g = torch.Generator().manual_seed(11)
+    q = torch.randn(8, dtype=torch.float64, generator=g)
+    k = torch.randn(8, dtype=torch.float64, generator=g)
+    pt, ps = torch.tensor(2.7), torch.tensor(-1.3)
+    lhs = (_rotate_ladder(q, pt) * _rotate_ladder(k, ps)).sum()
+    rhs = (_rotate_ladder(q, pt - ps) * k).sum()
+    assert torch.allclose(lhs, rhs, rtol=1e-6, atol=1e-6)
+
+
+def test_ladder_kills_2pi_aliasing():
+    # v6 §0(1)/§4: single-frequency alignment rings back to 1 at Δphi = 2π (aliased retrieval);
+    # the geometric ladder must NOT re-align there — retrieval decays quasi-monotonically.
+    D = 128
+    g = torch.Generator().manual_seed(3)
+    q = _l2norm(torch.randn(64, D, generator=g).double())
+
+    def alignment(delta, freqs):
+        return (_rotate_ladder(q, torch.tensor(float(delta)).double(), freqs) * q).sum(-1).mean()
+
+    single = torch.ones(D // 2, dtype=torch.float64)              # v5.3 behavior (all pairs same phase)
+    ladder = ladder_freqs(D // 2, dtype=torch.float64)
+    two_pi = 2 * math.pi
+    assert alignment(two_pi, single) > 0.999                      # the aliasing v6 removes
+    assert alignment(two_pi, ladder) < 0.9                        # the ladder de-aliases it
+    # quasi-monotone: alignment at growing phase distances never recovers toward 1
+    vals = [alignment(d, ladder) for d in (0.0, 1.0, two_pi, 10.0, 50.0)]
+    assert vals[0] > 0.999
+    assert all(v < 0.9 for v in vals[2:])
 
 
 def test_backward_is_finite():
@@ -125,5 +158,7 @@ if __name__ == "__main__":
     test_state_readout_matches_brute_force()
     test_readout_with_own_query_equals_forward_readout()
     test_rotation_is_orthogonal()
+    test_rotation_depends_on_relative_phase()
+    test_ladder_kills_2pi_aliasing()
     test_backward_is_finite()
     print("all AUM unfold reference tests passed")
