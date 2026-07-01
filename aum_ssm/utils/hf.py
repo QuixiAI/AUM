@@ -2,8 +2,12 @@ import json
 
 import torch
 
-from transformers.utils import WEIGHTS_NAME, CONFIG_NAME
-from transformers.utils.hub import cached_file
+# transformers is only needed for HF load/save, not for training — keep it optional.
+try:
+    from transformers.utils import WEIGHTS_NAME, CONFIG_NAME
+    from transformers.utils.hub import cached_file
+except ImportError:
+    WEIGHTS_NAME = CONFIG_NAME = cached_file = None
 
 
 def load_config_hf(model_name):

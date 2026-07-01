@@ -1,5 +1,6 @@
 # AUM-Ø configuration. See AUM-Ø.md (Appendix A) for the reference layout.
 from dataclasses import dataclass, field
+from typing import Optional
 
 
 @dataclass
@@ -16,13 +17,19 @@ class AumConfig:
     norm_epsilon: float = 1e-5
     rms_norm: bool = True
     residual_in_fp32: bool = True
-    fused_add_norm: bool = True
+    fused_add_norm: bool = False       # Triton fused add+norm is a NVIDIA-only optimization
     initializer_cfg: dict = field(default_factory=dict)
 
     # ---- A phase: bounded local GQA grounding (§4) ----
+    attn_num_heads: int = 8
+    attn_num_heads_kv: int = 2
+    attn_head_dim: int = 64
+    attn_window: Optional[int] = None  # None -> full causal; int -> sliding-window
     attn_cfg: dict = field(default_factory=dict)
 
-    # ---- U phase: resonant affine evidence recurrence, Mamba-3 SISO lineage (§6) ----
+    # ---- U phase: resonant affine evidence recurrence (§5-§6) ----
+    kernel_backend: str = "auto"       # auto|reference|metal|triton
+    chunk_size: int = 64
     ssm_cfg: dict = field(default_factory=dict)
 
     # ---- Global silence block (§3-§14) ----

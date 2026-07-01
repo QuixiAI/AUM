@@ -11,7 +11,11 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from torch import Tensor
 from torch.profiler import ProfilerActivity, profile, record_function
-from transformers.generation import GenerateDecoderOnlyOutput, TextStreamer
+# transformers is only needed for the HF-style generate() helpers, not for training.
+try:
+    from transformers.generation import GenerateDecoderOnlyOutput, TextStreamer
+except ImportError:
+    GenerateDecoderOnlyOutput, TextStreamer = None, None
 
 
 @dataclass
