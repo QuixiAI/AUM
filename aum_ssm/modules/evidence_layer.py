@@ -47,8 +47,8 @@ class EvidenceLayer(nn.Module):
 
         x_bar = self.input_layernorm(residual)
         h_A = self.ground_attn(x_bar, inference_params=inference_params, cache=attn_cache)
-        if return_silence_ctx:                            # top layer: expose read closure + phase
-            h_U, m_t, s_t, phi, read_fn = self.unfold(
+        if return_silence_ctx:                            # top layer: expose the read source + phase
+            h_U, m_t, s_t, phi, read_src = self.unfold(
                 x_bar, inference_params=inference_params, cache=unfold_cache, return_read=True)
         else:
             h_U, m_t, s_t = self.unfold(x_bar, inference_params=inference_params, cache=unfold_cache)
@@ -58,7 +58,9 @@ class EvidenceLayer(nn.Module):
         x2 = self.post_attention_layernorm(residual)
         hidden_states = self.mlp(x2)
         if return_silence_ctx:
-            return hidden_states, residual, {"phi": phi, "m_t": m_t, "s_t": s_t, "read_fn": read_fn}
+            # "read" is a per-token closure when decoding, or the write-tensor pack (alpha, x,
+            # k_rot, ...) for the backbone's sequential global recurrence when training/prefilling.
+            return hidden_states, residual, {"phi": phi, "m_t": m_t, "s_t": s_t, "read": read_src}
         return hidden_states, residual
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):

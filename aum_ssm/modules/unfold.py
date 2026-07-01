@@ -115,8 +115,7 @@ class Unfold(nn.Module):
         by the evidence layer; decode always uses the reference step.
         """
         from aum_ssm.modules.ssd_reference import (
-            aum_dynamics, aum_state_readout_ref, aum_unfold_chunk_ref, aum_unfold_step_ref,
-            _rotate_ladder,
+            aum_dynamics, aum_unfold_chunk_ref, aum_unfold_step_ref, _rotate_ladder, _l2norm,
         )
         B, L, _ = x.shape
         decoding = inference_params is not None and inference_params.seqlen_offset > 0
@@ -171,8 +170,9 @@ class Unfold(nn.Module):
                 S = S_pre if exclude_current else S_new
                 if pooled:                                     # Pool(S) = mean over the key axis (§14)
                     return rearrange(S.mean(-1), "b h p -> b (h p)").unsqueeze(1)
+                ph = phi_1H.unsqueeze(1) if phi_arg is None else phi_arg    # honor the caller's phase
                 qh = rearrange(query, "b l (h p) -> b l h p", p=self.headdim)
-                q_rot = _rotate_ladder(qh, phi_1H.unsqueeze(1), self.rope_freqs)
+                q_rot = _rotate_ladder(qh, ph, self.rope_freqs)
                 rr = torch.einsum("bhpn,blhn->blhp", S, q_rot)
                 return rearrange(rr, "b l h p -> b l (h p)")
 
@@ -190,26 +190,21 @@ class Unfold(nn.Module):
         if not return_read:
             return out, m_t, s_t
 
-        _, _, _, dphi = aum_dynamics(tau_bar, lam_bar, r, theta, self.dt_bias, self.eps)
+        # v6 §2/§12: the global block is a SEQUENTIAL token recurrence — silent-read queries depend
+        # on sigma_{t-1}, so no chunk-parallel readout is possible. Expose the per-token write
+        # tensors instead; the backbone's sequential loop steps S_t = alpha_t*S_{t-1} + x_t (x) k_t
+        # itself and serves every read (S_{t-1} for predict, S_t for the silent read) from it.
+        tau_w, alpha_log, rho_w, dphi = aum_dynamics(tau_bar, lam_bar, r, theta,
+                                                     self.dt_bias, self.eps)
         phi = torch.cumsum(dphi, dim=1)
-        k_c, v_c, tb, lb, rw, th = k, v, tau_bar, lam_bar, r, theta
-
-        def read_fn(query, phi_arg=None, exclude_current=False, pooled=False):
-            if pooled:                                         # Pool(S) = mean over the key axis (§14):
-                B_, L_, _, Dqk = k_c.shape                     # a phase-free read with query 1/Dqk
-                qh = k_c.new_full((B_, L_, self.nheads, Dqk), 1.0 / Dqk)
-                rotate = False
-            else:
-                L_ = query.shape[1]
-                qh = rearrange(query, "b l (h p) -> b l h p", p=self.headdim)
-                rotate = True
-            bl_ = self.chunk_size if (L_ % self.chunk_size == 0) else L_
-            rr = aum_state_readout_ref(qh, k_c, v_c, tb, lb, rw, th, phi=phi, dt_bias=self.dt_bias,
-                                       eps=self.eps, block_len=bl_, exclude_current=exclude_current,
-                                       freqs=self.rope_freqs, rotate_query=rotate)
-            return rearrange(rr, "b l h p -> b l (h p)")
-
-        return out, m_t, s_t, phi, read_fn
+        pack = {
+            "alpha": torch.exp(alpha_log),                              # (B,L,H)
+            "x": (rho_w * tau_w).unsqueeze(-1) * _l2norm(v),            # (B,L,H,Dv) write value
+            "k_rot": _rotate_ladder(_l2norm(k), phi, self.rope_freqs),  # (B,L,H,Dqk) write key
+            "freqs": self.rope_freqs,
+            "headdim": self.headdim,
+        }
+        return out, m_t, s_t, phi, pack
 
     def _conv_step(self, x_new, conv_state):
         """Single-token causal depthwise conv. x_new (B,3*d_inner); conv_state (B,3*d_inner,d_conv-1)."""
