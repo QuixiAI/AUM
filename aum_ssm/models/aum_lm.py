@@ -116,7 +116,7 @@ class AumBackbone(nn.Module):
         self.apply(partial(_init_weights, n_layer=config.n_layer,
                            **(config.initializer_cfg or {})))
 
-    def forward(self, input_ids, inference_params=None, return_aux=False, **kwargs):
+    def forward(self, input_ids, inference_params=None, return_aux=False, ablation=None, **kwargs):
         hidden_states = self.embedding(input_ids)
         residual = None
         ctx = None
@@ -141,10 +141,10 @@ class AumBackbone(nn.Module):
         read_fn, m_t, s_t = ctx["read_fn"], ctx["m_t"], ctx["s_t"]
         # Two-pass truncated sigma carry (§9/§10): seed with zero, then feed the detached, shifted
         # sigma_bar so each token's revision starts from the previous interpretation (TBPTT window 1).
-        _, aux0 = self.silence(g_t, read_fn, phi, phi_prev, None, m_t, s_t, logits_fn)
+        _, aux0 = self.silence(g_t, read_fn, phi, phi_prev, None, m_t, s_t, logits_fn, ablation)
         sigma_prev = torch.cat(
             [torch.zeros_like(aux0.sigma_bar[:, :1]), aux0.sigma_bar[:, :-1].detach()], dim=1)
-        o_t, aux = self.silence(g_t, read_fn, phi, phi_prev, sigma_prev, m_t, s_t, logits_fn)
+        o_t, aux = self.silence(g_t, read_fn, phi, phi_prev, sigma_prev, m_t, s_t, logits_fn, ablation)
         return (o_t, aux) if return_aux else o_t
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
@@ -173,8 +173,9 @@ class AumLMHeadModel(nn.Module, GenerationMixin):
         return self.backbone.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
 
     def forward(self, input_ids, position_ids=None, inference_params=None, num_last_tokens=0,
-                return_aux=False, **kwargs):
-        out = self.backbone(input_ids, inference_params=inference_params, return_aux=return_aux, **kwargs)
+                return_aux=False, ablation=None, **kwargs):
+        out = self.backbone(input_ids, inference_params=inference_params, return_aux=return_aux,
+                            ablation=ablation, **kwargs)
         hidden_states, aux = out if return_aux else (out, None)
         if num_last_tokens > 0:
             hidden_states = hidden_states[:, -num_last_tokens:]

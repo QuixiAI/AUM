@@ -48,6 +48,11 @@ def consistency_loss(E_traj, lambda_consistency):
     return lambda_consistency * diffs.clamp_min(0).sum(-1).mean()
 
 
-def total_loss(parts, config):
-    """Sum the active terms (§18). `parts` is a dict of the per-term scalars above."""
-    raise NotImplementedError("Wire the per-term losses to the silence aux outputs and AumConfig weights.")
+def total_loss(parts, active_terms):
+    """Sum the per-term losses (already lambda-weighted) named in active_terms (§18, §20).
+
+    parts: dict term-name -> scalar tensor. Returns (total_tensor, {term: float}).
+    """
+    used = {k: parts[k] for k in active_terms if k in parts}
+    total = sum(used.values()) if used else torch.zeros(())
+    return total, {k: float(v.detach()) for k, v in used.items()}

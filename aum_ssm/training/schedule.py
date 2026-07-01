@@ -33,3 +33,11 @@ def active_loss_terms(stage: Stage):
 def pressure_gate_clear(pred_val_loss, schedule: ScheduleConfig):
     """True once the evidence-core prediction head is good enough to trust b_t (§20)."""
     return pred_val_loss < schedule.pred_val_gate_eta
+
+
+def p_explore_at(step, total_steps, schedule: ScheduleConfig):
+    """Linearly anneal forced-silence exploration p_explore_start -> p_explore_end (§19)."""
+    if total_steps <= 0:
+        return schedule.p_explore_end
+    frac = min(max(step / total_steps, 0.0), 1.0)
+    return schedule.p_explore_start + frac * (schedule.p_explore_end - schedule.p_explore_start)

@@ -29,6 +29,7 @@ def _phase_embed(phi, d_phase):
 
 @dataclass
 class SilenceAux:
+    g: torch.Tensor         # g_t (the grounded summary the block conditioned on)
     g_hat: torch.Tensor
     e: torch.Tensor
     mu: torch.Tensor
@@ -238,7 +239,7 @@ class SilenceBlock(nn.Module):
 
         # §14 output
         o_t = self._output(g_t, sigma_bar)
-        aux = SilenceAux(g_hat, e, mu, e_tilde, sigma0, sigma_traj, r_traj, E_traj, pi, w,
+        aux = SilenceAux(g_t, g_hat, e, mu, e_tilde, sigma0, sigma_traj, r_traj, E_traj, pi, w,
                          expected_J, sigma_bar)
         return o_t, aux
 
