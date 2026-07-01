@@ -1,0 +1,22 @@
+AUM-Ø Metal kernels — attribution
+==================================
+
+This directory builds the AUM-Ø Apple-Silicon (Metal/MPS) kernels standalone, with no dependency
+on the ThunderMittens repository at build or runtime.
+
+Vendored substrate (header-only MSL, in ./include/):
+  Derived from ThunderMittens (https://github.com/... — an Apple Metal Shading Language port of
+  ThunderKittens, HazyResearch, https://github.com/HazyResearch/ThunderKittens). These are the
+  reusable tile/type/op primitives (`tk.metal` and the common/, ops/, types/ trees). Unmodified.
+
+Kernel sources (in ./src/):
+  - mamba2.metal      : SSD forward. Derived from ThunderMittens' mamba2 kernel, with the D=128
+                        instantiation added for the AUM-Ø reference config (4 heads x 128).
+  - mamba2_bwd.metal  : SSD backward (dC, dB, dX). Written for AUM-Ø, forked from the
+                        ThunderMittens/ThunderKittens FlashAttention-2 backward structure.
+
+Host dispatch (./aum_metal.mm) and build (./__init__.py):
+  Written for AUM-Ø; the generic torch-MPS encoder/plumbing follows ThunderMittens' tk_torch
+  pattern (torch::mps command-stream dispatch), inlined here so the build is self-contained.
+
+ThunderKittens and ThunderMittens are used under their respective licenses; see those projects.

@@ -1,15 +1,12 @@
-"""Metal backend (M2/M3): the AUM U-phase via tk_torch's mamba2 Metal kernel on MPS, validated
-against the pure-PyTorch reference — at both headdim 64 and the Appendix-A headdim 128, and
-end-to-end in the full model. Requires ThunderMittens (tk_torch) + an Apple GPU; skips otherwise."""
-
-import sys
+"""Metal backend (M2/M3): the AUM U-phase via the self-contained kernels/metal build on MPS,
+validated against the pure-PyTorch reference — at both headdim 64 and the Appendix-A headdim 128,
+and end-to-end in the full model. Requires an Apple GPU + Xcode's Metal toolchain; skips otherwise."""
 
 import pytest
 import torch
 
-sys.path.insert(0, "/Users/eric/ThunderMittens/ThunderMittens/kernels")
-pytest.importorskip("tk_torch")
 pytestmark = pytest.mark.skipif(not torch.backends.mps.is_available(), reason="no MPS")
+km = pytest.importorskip("kernels.metal")   # vendored, self-contained build (no ThunderMittens)
 
 from aum_ssm.ops.metal.unfold_metal import unfold_metal_chunk
 from aum_ssm.modules.ssd_reference import aum_unfold_chunk_ref
@@ -60,8 +57,6 @@ def test_metal_grad_matches_reference(H, D):
 @pytest.mark.parametrize("D", [64, 128])
 def test_mamba2_bwd_kernel_matches_autograd(D):
     # the fused SSD backward kernel directly vs autograd-through the PyTorch SSD core (tight)
-    import tk_torch
-
     def fwd(C, B, X, cl):
         N = C.shape[-2]
         s = C.float() @ B.float().transpose(-1, -2)
@@ -79,8 +74,8 @@ def test_mamba2_bwd_kernel_matches_autograd(D):
     dY = torch.randn(Bt, H, N, D, device="mps")
     Cr, Br, Xr, clr = (t.clone().detach().requires_grad_() for t in (C, Bm, X, cl))
     fwd(Cr, Br, Xr, clr).backward(dY.float())
-    dC, dB, dX = tk_torch.mamba2_bwd(C.bfloat16(), Bm.bfloat16(), X.bfloat16(), cl, dY.bfloat16())
-    Y = tk_torch.mamba2(C.bfloat16(), Bm.bfloat16(), X.bfloat16(), cl).float()
+    dC, dB, dX = km.mamba2_bwd(C.bfloat16(), Bm.bfloat16(), X.bfloat16(), cl, dY.bfloat16())
+    Y = km.mamba2(C.bfloat16(), Bm.bfloat16(), X.bfloat16(), cl).float()
     torch.mps.synchronize()
     dcl = (dY.float() * Y).sum(-1) - (dX.float() * X.float()).sum(-1)   # host identity
     rel = lambda u, v: ((u - v).abs().max() / (v.abs().max() + 1e-6)).item()

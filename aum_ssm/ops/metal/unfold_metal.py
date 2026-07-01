@@ -1,14 +1,16 @@
-# AUM-Ø U-phase, Apple-Metal backend (§6). The SSD core runs as ThunderMittens' `mamba2` Metal
-# kernel on PyTorch's MPS stream (via tk_torch); the resonance rotary, k/v L2-norm, rho write-gate,
-# cumlog, D-skip and gated readout are PyTorch ops around it. Validated against ssd_reference.
+# AUM-Ø U-phase, Apple-Metal backend (§6). The SSD core runs as the `mamba2` Metal kernel on
+# PyTorch's MPS stream via the SELF-CONTAINED vendored build in kernels/metal (no ThunderMittens
+# dependency); the resonance rotary, k/v L2-norm, rho write-gate, cumlog, D-skip and gated readout
+# are PyTorch ops around it. Validated against ssd_reference.
 #
-# tk_torch.mamba2(C,B,X,cumlog) computes ((C@Bᵀ) ⊙ exp(cumlog_i−cumlog_j) ⊙ causal) @ X, which is
-# exactly the AUM readout S_t·R(φ)q with C=R(φ)q, B=k_rot=R(φ)·L2norm(k), X=ρτ·L2norm(v),
-# cumlog=cumsum(−λτ). Headdim D=64 or D=128 (the Appendix-A reference is 4 heads x 128). Both the
-# forward (mamba2) and the backward (mamba2_bwd → dC,dB,dX) run on the Metal GPU; dcumlog is the
-# cheap host identity <dY,Y>−<dX,X>. `_ssd_core_ref` stays as the correctness oracle / fallback.
-#
-# tk_torch lives in the ThunderMittens repo; put .../ThunderMittens/kernels on PYTHONPATH.
+# mamba2(C,B,X,cumlog) computes ((C@Bᵀ) ⊙ exp(cumlog_i−cumlog_j) ⊙ causal) @ X, which is exactly the
+# AUM readout S_t·R(φ)q with C=R(φ)q, B=k_rot=R(φ)·L2norm(k), X=ρτ·L2norm(v), cumlog=cumsum(−λτ).
+# Headdim D=64 or D=128 (the Appendix-A reference is 4 heads x 128). Both the forward (mamba2) and
+# the backward (mamba2_bwd → dC,dB,dX) run on the Metal GPU; dcumlog is the cheap host identity
+# <dY,Y>−<dX,X>. `_ssd_core_ref` stays as the correctness oracle / fallback.
+
+import os
+import sys
 
 import torch
 from einops import rearrange
@@ -16,6 +18,15 @@ from einops import rearrange
 from aum_ssm.modules.ssd_reference import (
     aum_dynamics, _rotate_single_phase, _l2norm, _gated_rmsnorm,
 )
+
+
+def _metal():
+    """Import the vendored, self-contained Metal build (kernels/metal) — builds on first use."""
+    repo = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    if repo not in sys.path:
+        sys.path.insert(0, repo)
+    import kernels.metal as km
+    return km
 
 
 def _ssd_core_ref(C, B, X, cumlog):
@@ -39,9 +50,9 @@ class _Mamba2SSD(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, C, B, X, cumlog):
-        import tk_torch
+        km = _metal()
         with torch.no_grad():
-            Y = tk_torch.mamba2(C.bfloat16(), B.bfloat16(), X.bfloat16(), cumlog.float()).to(C.dtype)
+            Y = km.mamba2(C.bfloat16(), B.bfloat16(), X.bfloat16(), cumlog.float()).to(C.dtype)
         ctx.save_for_backward(C, B, X, cumlog, Y)
         return Y
 
@@ -49,8 +60,7 @@ class _Mamba2SSD(torch.autograd.Function):
     def backward(ctx, dY):
         C, B, X, cumlog, Y = ctx.saved_tensors
         if _FUSED_BWD:
-            import tk_torch
-            dC, dB, dX = tk_torch.mamba2_bwd(C.bfloat16(), B.bfloat16(), X.bfloat16(),
+            dC, dB, dX = _metal().mamba2_bwd(C.bfloat16(), B.bfloat16(), X.bfloat16(),
                                              cumlog.float(), dY.bfloat16())
             dC, dB, dX = dC.float(), dB.float(), dX.float()
             dcumlog = (dY.float() * Y.float()).sum(-1) - (dX * X.float()).sum(-1)
