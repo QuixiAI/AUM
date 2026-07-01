@@ -4,10 +4,10 @@
 #
 # tk_torch.mamba2(C,B,X,cumlog) computes ((C@Bᵀ) ⊙ exp(cumlog_i−cumlog_j) ⊙ causal) @ X, which is
 # exactly the AUM readout S_t·R(φ)q with C=R(φ)q, B=k_rot=R(φ)·L2norm(k), X=ρτ·L2norm(v),
-# cumlog=cumsum(−λτ). The kernel is D=64 and forward-only, so:
-#   - headdim must be 64 (headdim-128 needs a D=128 mamba2 instantiation in ThunderMittens — M5),
-#   - the SSD core is wrapped in a torch.autograd.Function whose backward recomputes the (cheap,
-#     O(N²)) SSD gradient in PyTorch — a correct Stage-1 fusion; a fused Metal backward is M4.
+# cumlog=cumsum(−λτ). The kernel supports headdim D=64 or D=128 (the Appendix-A reference is
+# 4 heads x 128) and is forward-only, so the SSD core is wrapped in a torch.autograd.Function whose
+# backward recomputes the (cheap, O(N²)) SSD gradient in PyTorch — a correct Stage-1 fusion; a
+# fused Metal backward is M4.
 #
 # tk_torch lives in the ThunderMittens repo; put .../ThunderMittens/kernels on PYTHONPATH.
 
@@ -52,7 +52,7 @@ class _Mamba2SSD(torch.autograd.Function):
 def unfold_metal_chunk(q, k, v, tau_bar, lam_bar, r, theta, z=None, D=None,
                        dt_bias=0.0, eps=1e-4, norm_weight=None):
     """Metal U-phase readout h^U (§6). q,k,v: (B,L,H,headdim=64). Returns (B,L,H,headdim)."""
-    assert q.shape[-1] == 64, "tk_torch.mamba2 is D=64; headdim-128 needs a D=128 TM instantiation (M5)"
+    assert q.shape[-1] in (64, 128), "tk_torch.mamba2 supports headdim D=64 or D=128"
     assert q.shape[1] % 8 == 0, "mamba2 requires seqlen % 8 == 0"
 
     tau, alpha_log, rho, dphi = aum_dynamics(tau_bar, lam_bar, r, theta, dt_bias, eps)
