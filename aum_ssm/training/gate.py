@@ -70,7 +70,7 @@ def evaluate(model, cfg, ablation, rng, task_fn=S.branch_reversal, batch=16, len
     out["corr_pi_b"] = D.corr_pi_benefit(aux.pi.detach(), b)
     # sigma-decode: decode the latent rule from the register at the event position
     ev = torch.tensor([m["event_pos"] for m in metas])
-    sig = aux.sigma_bar.detach()[torch.arange(len(metas)), ev]  # (B, d_sigma)
+    sig = aux.sigma_star.detach()[torch.arange(len(metas)), ev]  # (B, d_sigma)
     labels = torch.tensor([int(m.get("rule", 0)) % 2 for m in metas])
     if labels.unique().numel() > 1:
         out["sigma_decode"] = D.sigma_decode_probe(sig, labels, n_classes=2)

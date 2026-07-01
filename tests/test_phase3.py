@@ -58,7 +58,7 @@ def _run_model(device, silence):
     result, aux = model(ids, return_aux=True)
     assert result.logits.shape == (2, 16, 512)
     if silence:
-        assert aux is not None and aux.sigma_bar.shape == (2, 16, model.config.d_sigma)
+        assert aux is not None and aux.sigma_star.shape == (2, 16, model.config.d_sigma)
         assert torch.isfinite(aux.pi).all()
     else:
         assert aux is None

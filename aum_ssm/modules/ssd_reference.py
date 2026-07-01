@@ -207,13 +207,15 @@ def aum_unfold_chunk_ref(q, k, v, tau_bar, lam_bar, r, theta, z=None, D=None,
 
 def aum_state_readout_ref(query, k, v, tau_bar, lam_bar, r, theta, phi=None,
                           dt_bias=0.0, eps=1e-4, block_len=None, exclude_current=False,
-                          freqs=None):
+                          freqs=None, rotate_query=True):
     """Swapped-query readout r_t = S_t R(phi_t) query_t (the silence read, §5/§8).
 
     Reuses the SAME evidence write (k, v, dynamics) as the U phase, but reads with an
     external `query` (B, L, H, Dqk) instead of the token's own q. Returns r (B, L, H, Dv).
     If `phi` (B,L,H) is supplied it is reused; otherwise it is recomputed from the dynamics.
-    exclude_current=True reads S_{t-1} (the §5 predictive read).
+    exclude_current=True reads S_{t-1} (the §5 predictive read). rotate_query=False applies the
+    raw query (a phase-free read: with query = 1/Dqk this is Pool(S), the §14 pooled-evidence
+    read of the Top-GRU baseline).
     """
     B, L, H, Dqk = query.shape
     if block_len is None:
@@ -221,7 +223,7 @@ def aum_state_readout_ref(query, k, v, tau_bar, lam_bar, r, theta, phi=None,
     tau, alpha_log, rho, dphi = aum_dynamics(tau_bar, lam_bar, r, theta, dt_bias, eps)
     if phi is None:
         phi = torch.cumsum(dphi, dim=1)
-    q_rot = _rotate_ladder(query, phi, freqs)
+    q_rot = _rotate_ladder(query, phi, freqs) if rotate_query else query
     k_rot = _rotate_ladder(_l2norm(k), phi, freqs)
     X = (rho * tau).unsqueeze(-1) * _l2norm(v)
     r_out, _ = ssd_minimal_discrete(X, alpha_log, k_rot, q_rot, block_len, exclude_diag=exclude_current)

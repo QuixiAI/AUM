@@ -35,11 +35,12 @@ class AumConfig:
     # ---- Global silence block (§3-§14) ----
     silence_enabled: bool = False     # False -> evidence-core baseline (g_t output, §22)
     baseline: Optional[str] = None    # None (reference) | "top_gru" (§22 adapter baseline)
-    d_sigma: int = 128                # bottlenecked hypothesis register width (§0.4)
+    d_sigma: int = 128                # bottlenecked hypothesis register width (C4)
     d_mu: int = 32                    # precision / error projection width (k)
     d_phase: int = 32                 # phase embedding width Φ(φ)
-    j_max: int = 2                    # forced final halt depth (§13, §15)
-    kappa: float = 0.1                # consistency register-inertia weight (§11)
+    j_max: int = 2                    # forced final halt depth (§8)
+    kappa: float = 0.1                # consistency register-inertia weight (§7)
+    entropy_feature: bool = False     # optional H_t pressure feature — the registered §14 ablation
 
     # ---- Loss weights (§18) ----
     lambda_pred: float = 1.0          # prediction-head objective (§16)

@@ -20,8 +20,8 @@ def corr_pi_benefit(pi, b):
 
 
 def delta_sigma_quartet(aux):
-    """Hypothesis inertia (§21): silent register movement + the co-firing signals at events."""
-    d_silent = (aux.sigma_bar - aux.sigma0).norm(dim=-1)
+    """Hypothesis inertia (§16): Delta-sigma_silent = ||sigma^{j*} - sigma^0|| + co-firing signals."""
+    d_silent = (aux.sigma_star - aux.sigma0).norm(dim=-1)
     return {
         "delta_sigma_silent": float(d_silent.mean()),
         "expected_J": float(aux.expected_J.mean()),

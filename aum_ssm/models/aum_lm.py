@@ -106,6 +106,8 @@ class AumBackbone(nn.Module):
         # Global silence block — single block on top of the evidence stack (§0.1, §3).
         self.silence = SilenceBlock(config.d_model, d_sigma=config.d_sigma, d_mu=config.d_mu,
                                     d_phase=config.d_phase, j_max=config.j_max, kappa=config.kappa,
+                                    halt_delta=config.halt_delta,
+                                    entropy_feature=getattr(config, "entropy_feature", False),
                                     top_gru=(config.baseline == "top_gru"), **factory)
         # False -> the silence-ablated evidence-core baseline (g_t output, §22).
         self.silence_enabled = config.silence_enabled
@@ -116,7 +118,8 @@ class AumBackbone(nn.Module):
         self.apply(partial(_init_weights, n_layer=config.n_layer,
                            **(config.initializer_cfg or {})))
 
-    def forward(self, input_ids, inference_params=None, return_aux=False, ablation=None, **kwargs):
+    def forward(self, input_ids, inference_params=None, return_aux=False, ablation=None,
+                forced_depth=None, **kwargs):
         hidden_states = self.embedding(input_ids)
         residual = None
         ctx = None
@@ -139,26 +142,30 @@ class AumBackbone(nn.Module):
         read_fn, m_t, s_t = ctx["read_fn"], ctx["m_t"], ctx["s_t"]
         logits_fn = lambda o: F.linear(o, self.embedding.weight)  # tied classifier for H_t (§12)
         decoding = inference_params is not None and inference_params.seqlen_offset > 0
-        if decoding:                                          # single token: carry sigma_bar1 + phi_prev
+        if decoding:                                          # single token: carry sigma_star + phi_prev
             slot = self._silence_slot(inference_params, g_t.shape[0], g_t.device)
             phi_prev = slot["phi_prev"]
-            _, aux1 = self.silence(g_t, read_fn, phi, phi_prev, None, m_t, s_t, logits_fn, ablation)
-            o_t, aux = self.silence(g_t, read_fn, phi, phi_prev,
-                                    slot["sigma_bar1"].unsqueeze(1), m_t, s_t, logits_fn, ablation)
-            slot["sigma_bar1"].copy_(aux1.sigma_bar[:, 0])
+            _, aux1 = self.silence(g_t, read_fn, phi, phi_prev, None, m_t, s_t, logits_fn,
+                                   ablation, forced_depth)
+            o_t, aux = self.silence(g_t, read_fn, phi, phi_prev, slot["sigma"].unsqueeze(1),
+                                    m_t, s_t, logits_fn, ablation, forced_depth)
+            slot["sigma"].copy_(aux1.sigma_star[:, 0])
             slot["phi_prev"].copy_(phi)
             return (o_t, aux) if return_aux else o_t
 
-        # prefill / training: two-pass truncated sigma carry over the sequence (§9/§10, TBPTT-1) —
-        # seed with zero, then feed the detached, shifted pass-1 sigma_bar.
+        # prefill / training: two-pass truncated sigma carry over the sequence (TBPTT-1) —
+        # seed with zero, then feed the detached, shifted pass-1 sigma_star.
+        # (v6 ③ replaces this with the true sequential global recurrence of §2/§12.)
         phi_prev = torch.cat([torch.zeros_like(phi[:, :1]), phi[:, :-1]], dim=1)
-        _, aux0 = self.silence(g_t, read_fn, phi, phi_prev, None, m_t, s_t, logits_fn, ablation)
+        _, aux0 = self.silence(g_t, read_fn, phi, phi_prev, None, m_t, s_t, logits_fn,
+                               ablation, forced_depth)
         sigma_prev = torch.cat(
-            [torch.zeros_like(aux0.sigma_bar[:, :1]), aux0.sigma_bar[:, :-1].detach()], dim=1)
-        o_t, aux = self.silence(g_t, read_fn, phi, phi_prev, sigma_prev, m_t, s_t, logits_fn, ablation)
+            [torch.zeros_like(aux0.sigma_star[:, :1]), aux0.sigma_star[:, :-1].detach()], dim=1)
+        o_t, aux = self.silence(g_t, read_fn, phi, phi_prev, sigma_prev, m_t, s_t, logits_fn,
+                                ablation, forced_depth)
         if inference_params is not None:                      # prefill: seed the silence carry slot
             slot = self._silence_slot(inference_params, g_t.shape[0], g_t.device)
-            slot["sigma_bar1"].copy_(aux0.sigma_bar[:, -1])
+            slot["sigma"].copy_(aux0.sigma_star[:, -1])
             slot["phi_prev"].copy_(phi[:, -1:])
         return (o_t, aux) if return_aux else o_t
 
@@ -167,7 +174,7 @@ class AumBackbone(nn.Module):
         if "silence" not in kv:
             H = self.layers[-1].unfold.nheads
             kv["silence"] = {
-                "sigma_bar1": torch.zeros(batch, self.silence.d_sigma, device=device, dtype=torch.float32),
+                "sigma": torch.zeros(batch, self.silence.d_sigma, device=device, dtype=torch.float32),
                 "phi_prev": torch.zeros(batch, 1, H, device=device, dtype=torch.float32),
             }
         return kv["silence"]
@@ -179,7 +186,7 @@ class AumBackbone(nn.Module):
             dev = self.embedding.weight.device
             H = self.layers[-1].unfold.nheads
             cache["silence"] = {
-                "sigma_bar1": torch.zeros(batch_size, self.silence.d_sigma, device=dev, dtype=torch.float32),
+                "sigma": torch.zeros(batch_size, self.silence.d_sigma, device=dev, dtype=torch.float32),
                 "phi_prev": torch.zeros(batch_size, 1, H, device=dev, dtype=torch.float32),
             }
         return cache

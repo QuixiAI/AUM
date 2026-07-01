@@ -23,7 +23,7 @@ def test_param_counts():
     # Appendix-A reference: core ~76.5M (silence-ablated baseline), full ~78M, silence ~1.77M.
     assert abs(core - 76.5e6) < 0.5e6, f"core={core:,}"
     assert abs(full - 78.25e6) < 0.5e6, f"full={full:,}"
-    assert full - core == 1_769_536, f"silence={full - core:,}"
+    assert full - core == 1_769_408, f"silence={full - core:,}"   # v6: pressure_in [128,515] (§9)
 
 
 def _smoke(device):

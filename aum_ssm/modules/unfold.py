@@ -167,8 +167,10 @@ class Unfold(nn.Module):
                 return out, m_t, s_t
             phi_1H = phi_new                                       # (B,H) current phase
 
-            def read_fn(query, phi_arg=None, exclude_current=False):
+            def read_fn(query, phi_arg=None, exclude_current=False, pooled=False):
                 S = S_pre if exclude_current else S_new
+                if pooled:                                     # Pool(S) = mean over the key axis (§14)
+                    return rearrange(S.mean(-1), "b h p -> b (h p)").unsqueeze(1)
                 qh = rearrange(query, "b l (h p) -> b l h p", p=self.headdim)
                 q_rot = _rotate_ladder(qh, phi_1H.unsqueeze(1), self.rope_freqs)
                 rr = torch.einsum("bhpn,blhn->blhp", S, q_rot)
@@ -192,13 +194,19 @@ class Unfold(nn.Module):
         phi = torch.cumsum(dphi, dim=1)
         k_c, v_c, tb, lb, rw, th = k, v, tau_bar, lam_bar, r, theta
 
-        def read_fn(query, phi_arg=None, exclude_current=False):
-            L_ = query.shape[1]
+        def read_fn(query, phi_arg=None, exclude_current=False, pooled=False):
+            if pooled:                                         # Pool(S) = mean over the key axis (§14):
+                B_, L_, _, Dqk = k_c.shape                     # a phase-free read with query 1/Dqk
+                qh = k_c.new_full((B_, L_, self.nheads, Dqk), 1.0 / Dqk)
+                rotate = False
+            else:
+                L_ = query.shape[1]
+                qh = rearrange(query, "b l (h p) -> b l h p", p=self.headdim)
+                rotate = True
             bl_ = self.chunk_size if (L_ % self.chunk_size == 0) else L_
-            qh = rearrange(query, "b l (h p) -> b l h p", p=self.headdim)
             rr = aum_state_readout_ref(qh, k_c, v_c, tb, lb, rw, th, phi=phi, dt_bias=self.dt_bias,
                                        eps=self.eps, block_len=bl_, exclude_current=exclude_current,
-                                       freqs=self.rope_freqs)
+                                       freqs=self.rope_freqs, rotate_query=rotate)
             return rearrange(rr, "b l h p -> b l (h p)")
 
         return out, m_t, s_t, phi, read_fn
