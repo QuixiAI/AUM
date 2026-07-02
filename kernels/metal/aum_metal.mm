@@ -170,23 +170,16 @@ static at::Tensor mamba2_chunked_mps(const at::Tensor& C_in, const at::Tensor& B
   return mamba2_chunked(C, B, X, cl);                      // forced route (tests / benchmarks)
 }
 
-// ---- mamba2 SSD backward -> (dC, dB, dX, dcumlog) ----
-// dcumlog = rowsum(M) - colsum(M), M = dSt ∘ S, accumulated IN-KERNEL in fp32 (mamba2_bwd_row
-// emits r, mamba2_bwd_col emits cc) — no host identity, and the forward output Y is not needed.
-static std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mamba2_bwd_mps(
-    const at::Tensor& C_in, const at::Tensor& B_in, const at::Tensor& X_in,
-    const at::Tensor& cl_in, const at::Tensor& dY_in) {
-  TORCH_CHECK(C_in.device().is_mps(), "mamba2_bwd: tensors must be MPS");
-  TORCH_CHECK(C_in.scalar_type() == at::kBFloat16 && dY_in.scalar_type() == at::kBFloat16,
-              "mamba2_bwd: C,B,X,dY must be bfloat16");
-  TORCH_CHECK(cl_in.scalar_type() == at::kFloat, "mamba2_bwd: cumlog must be float32");
-  auto C = C_in.contiguous(), B = B_in.contiguous(), X = X_in.contiguous(),
-       cl = cl_in.contiguous(), dY = dY_in.contiguous();
-  const int Bsz = C.size(0), H = C.size(1);
+// ---- mamba2 SSD backward -> (dC, dB, dX, dcumlog), two routes like the forward ----
+// Quadratic: mamba2_bwd_row/col with IN-KERNEL fp32 dcumlog = rowsum(M) - colsum(M), M = dSt∘S.
+// Chunked (linear-time): recompute the forward chunk states, build the gradient states G_c,
+// reverse-scan dKV, then chunk-bounded row/col kernels; dcumlog via the exact identity
+// dcl = <dY,Y> - <dX,X> with a linear-time Y recompute.
+static std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mamba2_bwd_quadratic(
+    const at::Tensor& C, const at::Tensor& B, const at::Tensor& X,
+    const at::Tensor& cl, const at::Tensor& dY) {
+  const int Bsz = C.size(0), H = C.size(1), D = C.size(3);
   const unsigned N = (unsigned)C.size(2);
-  const int D = C.size(3);
-  TORCH_CHECK(D == 64 || D == 128, "mamba2_bwd: D must be 64 or 128");
-  TORCH_CHECK(N % 8 == 0, "mamba2_bwd: N must be a multiple of 8");
   auto f32 = C.options().dtype(at::kFloat);
   auto dC = at::empty_like(C), dB = at::empty_like(C), dX = at::empty_like(C);
   auto r = at::empty({Bsz, H, (long)N}, f32);
@@ -205,6 +198,93 @@ static std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mamba2_bwd_mps
     e.dispatch((int)N / 8, H, Bsz, 32, 1, 1);
   });
   return {dC, dB, dX, r - cc};
+}
+
+static std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mamba2_bwd_chunked(
+    const at::Tensor& C, const at::Tensor& B, const at::Tensor& X,
+    const at::Tensor& cl, const at::Tensor& dY) {
+  const int Bsz = C.size(0), H = C.size(1), D = C.size(3);
+  const unsigned N = (unsigned)C.size(2);
+  TORCH_CHECK(N % kSsdChunkL == 0 && N >= 2 * kSsdChunkL,
+              "mamba2_bwd_chunked: N must be a multiple of 64 and >= 128");
+  const int Cn = (int)(N / kSsdChunkL);
+  const int QB = D / 64;
+  auto dC = at::empty_like(C), dB = at::empty_like(C), dX = at::empty_like(C);
+  auto Y = at::empty_like(C);
+  auto s_raw = at::empty({Bsz, H, Cn, D, D}, C.options().dtype(at::kFloat));
+  auto s_ex = at::empty({Bsz, H, Cn, D, D}, C.options());          // bf16
+  auto dkv = at::empty({Bsz, H, Cn, D, D}, C.options());           // bf16
+  encode([&](Encoder& e) {                              // forward chunk states (recompute)
+    e.pipeline("ssd_chunk_kv_" + std::to_string(D));
+    e.in(B, 0); e.in(X, 1); e.in(cl, 2); e.out(s_raw, 3);
+    e.bytes(N, 4); e.bytes((unsigned)H, 5);
+    e.dispatch(Cn * QB * QB, H, Bsz, 32, 1, 1);
+  });
+  encode([&](Encoder& e) {
+    e.pipeline("ssd_chunk_scan_" + std::to_string(D));
+    e.in(s_raw, 0); e.in(cl, 1); e.out(s_ex, 2);
+    e.bytes((unsigned)Cn, 3); e.bytes(N, 4);
+    e.dispatch(Bsz * H, 1, 1, 256, 1, 1);
+  });
+  encode([&](Encoder& e) {                              // Y recompute for the dcl identity
+    e.pipeline("ssd_chunk_out_" + std::to_string(D));
+    e.in(C, 0); e.in(B, 1); e.in(X, 2); e.in(cl, 3); e.in(s_ex, 4); e.out(Y, 5);
+    e.bytes(N, 6); e.bytes((unsigned)H, 7);
+    e.dispatch((int)N / 8, H, Bsz, 32, 1, 1);
+  });
+  encode([&](Encoder& e) {                              // G_c = dSex_c (reuses s_raw: dead after scan)
+    e.pipeline("ssd_chunk_gstate_" + std::to_string(D));
+    e.in(C, 0); e.in(dY, 1); e.in(cl, 2); e.out(s_raw, 3);
+    e.bytes(N, 4); e.bytes((unsigned)H, 5);
+    e.dispatch(Cn * QB * QB, H, Bsz, 32, 1, 1);
+  });
+  encode([&](Encoder& e) {                              // dKV: reverse decayed suffix
+    e.pipeline("ssd_chunk_rscan_" + std::to_string(D));
+    e.in(s_raw, 0); e.in(cl, 1); e.out(dkv, 2);
+    e.bytes((unsigned)Cn, 3); e.bytes(N, 4);
+    e.dispatch(Bsz * H, 1, 1, 256, 1, 1);
+  });
+  encode([&](Encoder& e) {                              // dC
+    e.pipeline("ssd_chunk_bwd_row_" + std::to_string(D));
+    e.in(C, 0); e.in(B, 1); e.in(X, 2); e.in(cl, 3); e.in(dY, 4); e.in(s_ex, 5); e.out(dC, 6);
+    e.bytes(N, 7); e.bytes((unsigned)H, 8);
+    e.dispatch((int)N / 8, H, Bsz, 32, 1, 1);
+  });
+  encode([&](Encoder& e) {                              // dB, dX
+    e.pipeline("ssd_chunk_bwd_col_" + std::to_string(D));
+    e.in(C, 0); e.in(B, 1); e.in(X, 2); e.in(cl, 3); e.in(dY, 4); e.in(dkv, 5);
+    e.out(dB, 6); e.out(dX, 7);
+    e.bytes(N, 8); e.bytes((unsigned)H, 9);
+    e.dispatch((int)N / 8, H, Bsz, 32, 1, 1);
+  });
+  // dcl = rowsum(M) - colsum(M) = <dY,Y> - <dX,X>  (exact identity, fp32 on host)
+  auto dcl = (dY.to(at::kFloat) * Y.to(at::kFloat)).sum(-1)
+           - (dX.to(at::kFloat) * X.to(at::kFloat)).sum(-1);
+  return {dC, dB, dX, dcl};
+}
+
+static std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mamba2_bwd_mps(
+    const at::Tensor& C_in, const at::Tensor& B_in, const at::Tensor& X_in,
+    const at::Tensor& cl_in, const at::Tensor& dY_in) {
+  TORCH_CHECK(dY_in.scalar_type() == at::kBFloat16, "mamba2_bwd: dY must be bfloat16");
+  auto C = C_in.contiguous(), B = B_in.contiguous(), X = X_in.contiguous(),
+       cl = cl_in.contiguous(), dY = dY_in.contiguous();
+  mamba2_check(C, cl);
+  const unsigned N = (unsigned)C.size(2);
+  const int D = C.size(3);
+  const unsigned chunk_min = (D == 64) ? 2048 : 8192;      // measured forward crossovers
+  if (N % kSsdChunkL != 0 || N < chunk_min)
+    return mamba2_bwd_quadratic(C, B, X, cl, dY);
+  return mamba2_bwd_chunked(C, B, X, cl, dY);
+}
+
+static std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mamba2_bwd_chunked_mps(
+    const at::Tensor& C_in, const at::Tensor& B_in, const at::Tensor& X_in,
+    const at::Tensor& cl_in, const at::Tensor& dY_in) {
+  auto C = C_in.contiguous(), B = B_in.contiguous(), X = X_in.contiguous(),
+       cl = cl_in.contiguous(), dY = dY_in.contiguous();
+  mamba2_check(C, cl);
+  return mamba2_bwd_chunked(C, B, X, cl, dY);              // forced route (tests / benchmarks)
 }
 
 // ---- aum_decode: single-token U-phase step  S <- a*S + x⊗k_rot ; out = S·q_rot ----
@@ -236,6 +316,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("_set_library", &aum_set_library, "set the metallib path");
   m.def("mamba2", &mamba2_mps, "AUM-Ø SSD forward (MPS, auto-routed)");
   m.def("mamba2_chunked", &mamba2_chunked_mps, "AUM-Ø SSD forward, forced chunked route");
-  m.def("mamba2_bwd", &mamba2_bwd_mps, "AUM-Ø SSD backward dC,dB,dX (MPS)");
+  m.def("mamba2_bwd", &mamba2_bwd_mps, "AUM-Ø SSD backward (MPS, auto-routed)");
+  m.def("mamba2_bwd_chunked", &mamba2_bwd_chunked_mps, "AUM-Ø SSD backward, forced chunked route");
   m.def("aum_decode", &aum_decode_mps, "AUM-Ø single-token U-phase decode step (MPS)");
 }

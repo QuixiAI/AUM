@@ -311,6 +311,354 @@ instantiate_ssd_chunk(64);
 instantiate_ssd_chunk(128);
 
 // ---------------------------------------------------------------------------
+// Chunked linear-time SSD BACKWARD — O(N·(L+D)·D) like the forward, vs the quadratic
+// mamba2_bwd_row/col below. Derived from the forward's chunk decomposition:
+//   G_c   = sum_{t in c} exp(cl_t - cl[r_{c-1}]) C_t^T dY_t          (= dSex_c; K4 gstate)
+//   dKV_c = G_{c+1} + lam_{c+1} dKV_{c+1},  dKV_{C-1} = 0,           (K5 rscan — the reverse
+//           lam_k = exp(cl[r_k] - cl[r_{k-1}])                        decayed suffix scan)
+//   dC_t  = intra(chunk-bounded) + w_t (dY_t Sex_c^T),  w_t = exp(cl_t - cl[r_{c-1}])   (K6)
+//   dX_j  = intra + w'_j (B_j dKV_c),   dB_j = intra + w'_j (X_j dKV_c^T),              (K7)
+//           w'_j = exp(cl[r_c] - cl_j)
+// dcl is the exact identity  dcl = <dY,Y> - <dX,X>  (rowsum - colsum of dSt.S), assembled on
+// the host from a linear-time Y recompute — it avoids the boundary-row scatter an in-kernel
+// chunked dcl would need. Same 64x64 quadrant tiling as the forward; Sex/dKV are read bf16.
+// ---------------------------------------------------------------------------
+
+// K4: G_c quadrants (fp32). Same skeleton as ssd_chunk_kv with (B,X) -> (C,dY) and the weight
+// referenced at r_{c-1} WITHOUT the sign flip. G_0 is never consumed by the reverse scan; it is
+// computed with ref = r_0 only to keep its (unused) exponents bounded.
+template <int D>
+kernel void ssd_chunk_gstate(device   bf16     *Cq [[buffer(0)]],
+                             device   bf16     *dY [[buffer(1)]],
+                             device   float    *cl [[buffer(2)]],
+                             device   float    *G  [[buffer(3)]],   // (B,H,C,D,D)
+                             constant unsigned &N  [[buffer(4)]],
+                             constant unsigned &H  [[buffer(5)]],
+                             uint3 blockIdx [[threadgroup_position_in_grid]],
+                             uint  laneId   [[thread_index_in_simdgroup]]) {
+    static_assert(D == 64 || D == 128, "ssd_chunk_gstate supports D in {64,128}");
+    constexpr int TPC = SSD_CHUNK_L / 8;
+    constexpr int QB = D / 64;
+    using gl_t  = gl<bfloat, 1, -1, -1, D>;
+    using gl_cl = gl<float, 1, -1, 1, -1>;
+    gl_t  gC(Cq, nullptr, H, N, nullptr);
+    gl_t  gdY(dY, nullptr, H, N, nullptr);
+    gl_cl gcl(cl, nullptr, H, nullptr, N);
+    const int cq = blockIdx.x, head = blockIdx.y, batch = blockIdx.z;
+    const int c = cq / (QB * QB);
+    const int kb = (cq % (QB * QB)) / QB;             // state row block (C-dim)
+    const int xb = cq % QB;                           // state col block (dY-dim)
+    const int C = (int)N / SSD_CHUNK_L;
+    const long clbase = ((long)batch * (int)H + head) * (long)N;
+    const float ref = cl[clbase + (long)(c > 0 ? c : 1) * SSD_CHUNK_L - 1];   // r_{c-1} (r_0 at c=0)
+
+    rt_fl<64, 64> g;
+    zero(g);
+    for (int t = 0; t < TPC; ++t) {
+        const int tile = c * TPC + t;
+        rt_bf<8, 64, ducks::rt_layout::col> c_reg;
+        rt_bf<8, 64> dy_reg;
+        load(c_reg, gC, {batch, head, tile, kb}, laneId);
+        load(dy_reg, gdY, {batch, head, tile, xb}, laneId);
+        // per-row weight w_t = exp(cl_t - cl[r_{c-1}])  (<= 1 for c > 0)
+        typename rt_fl<8, 8>::col_vec lt, w;
+        load(lt, gcl, {batch, head, 0, tile}, laneId);
+        sub(w, lt, ref);
+        exp(w, w);
+        rt_fl<8, 64> dy_fl;
+        copy(dy_fl, dy_reg);
+        mul_row(dy_fl, dy_fl, w);
+        rt_bf<8, 64> dy_w;
+        copy(dy_w, dy_fl);
+        mma_AtB(g, c_reg, dy_w, g);
+    }
+    gl<float, 1, -1, D, D> gg(G, nullptr, (int)H * C, nullptr, nullptr);
+    store(gg, g, {batch, head * C + c, kb, xb}, laneId);
+}
+
+// K5: reverse exclusive decayed suffix over chunks (fp32 accumulate, bf16 out for the mma).
+template <int D>
+kernel void ssd_chunk_rscan(device const float *Gin [[buffer(0)]],
+                            device const float *cl  [[buffer(1)]],
+                            device bf16        *dKV [[buffer(2)]],
+                            constant unsigned  &C   [[buffer(3)]],
+                            constant unsigned  &N   [[buffer(4)]],
+                            uint3 blockIdx [[threadgroup_position_in_grid]],
+                            uint  tid      [[thread_index_in_threadgroup]]) {
+    const long bh = blockIdx.x;
+    const long base = bh * (long)C * D * D;
+    device const float* clbh = cl + bh * (long)N;
+    for (int e = (int)tid; e < D * D; e += 256) {
+        float run = 0.0f;                                    // = dKV_{C-1}
+        for (int c = (int)C - 1; c >= 0; --c) {
+            dKV[base + (long)c * D * D + e] = bf16(run);
+            if (c > 0) {                                     // dKV_{c-1} = G_c + lam_c dKV_c
+                const float lam = metal::exp(clbh[(long)(c + 1) * SSD_CHUNK_L - 1]
+                                             - clbh[(long)c * SSD_CHUNK_L - 1]);
+                run = Gin[base + (long)c * D * D + e] + lam * run;
+            }
+        }
+    }
+}
+
+// K6: dC — chunk-bounded intra tiles + the inter term w_t (dY_t Sex_c^T). Grid (N/8, H, B).
+template <int D>
+kernel void ssd_chunk_bwd_row(device   bf16     *Cq [[buffer(0)]],
+                              device   bf16     *Bm [[buffer(1)]],
+                              device   bf16     *X  [[buffer(2)]],
+                              device   float    *cl [[buffer(3)]],
+                              device   bf16     *dY [[buffer(4)]],
+                              device   const bf16 *Sex [[buffer(5)]],
+                              device   bf16     *dC [[buffer(6)]],
+                              constant unsigned &N  [[buffer(7)]],
+                              constant unsigned &H  [[buffer(8)]],
+                              uint3 blockIdx [[threadgroup_position_in_grid]],
+                              uint  laneId   [[thread_index_in_simdgroup]]) {
+    static_assert(D == 64 || D == 128, "ssd_chunk_bwd_row supports D in {64,128}");
+    constexpr int TPC = SSD_CHUNK_L / 8;
+    constexpr int QB = D / 64;
+    using gl_t  = gl<bfloat, 1, -1, -1, D>;
+    using gl_cl = gl<float, 1, -1, 1, -1>;
+    gl_t  gC(Cq, nullptr, H, N, nullptr), gB(Bm, nullptr, H, N, nullptr);
+    gl_t  gX(X, nullptr, H, N, nullptr), gdY(dY, nullptr, H, N, nullptr);
+    gl_t  gdC(dC, nullptr, H, N, nullptr);
+    gl_cl gcl(cl, nullptr, H, nullptr, N);
+    const int i = blockIdx.x, head = blockIdx.y, batch = blockIdx.z;
+    const int c = i / TPC;
+    const int C = (int)N / SSD_CHUNK_L;
+
+    rt_bf<8, D> c_i, dy_i;
+    load(c_i, gC, {batch, head, i, 0}, laneId);
+    load(dy_i, gdY, {batch, head, i, 0}, laneId);
+    typename rt_fl<8, 8>::col_vec cumlog_i;
+    load(cumlog_i, gcl, {batch, head, 0, i}, laneId);
+
+    rt_fl<8, 64> dc_blk[QB];
+    #pragma clang loop unroll(full)
+    for (int kq = 0; kq < QB; ++kq)
+        zero(dc_blk[kq]);
+
+    // inter: dC_i[:, kq] += w_i * sum_xq dY_i[:, xq] @ Sex_c[kq, xq]^T   (skip chunk 0)
+    if (c > 0) {
+        gl<bfloat, 1, -1, D, D> gs(const_cast<device bf16*>(Sex), nullptr,
+                                   (int)H * C, nullptr, nullptr);
+        for (int kq = 0; kq < QB; ++kq) {
+            for (int xq = 0; xq < QB; ++xq) {
+                rt_bf<64, 64, ducks::rt_layout::col> s_col;
+                load(s_col, gs, {batch, head * C + c, kq, xq}, laneId);
+                rt_bf<8, 64> dy_xq;
+                load(dy_xq, gdY, {batch, head, i, xq}, laneId);
+                mma_ABt(dc_blk[kq], dy_xq, s_col, dc_blk[kq]);
+            }
+        }
+        const float cl_ref = cl[((long)batch * (int)H + head) * (long)N
+                                + (long)c * SSD_CHUNK_L - 1];   // r_{c-1}
+        typename rt_fl<8, 8>::col_vec w;
+        sub(w, cumlog_i, cl_ref);
+        exp(w, w);
+        #pragma clang loop unroll(full)
+        for (int kq = 0; kq < QB; ++kq)
+            mul_row(dc_blk[kq], dc_blk[kq], w);
+    }
+
+    // intra: the quadratic bwd_row loop, bounded to this chunk
+    for (int j = c * TPC; j <= i; ++j) {
+        rt_bf<8, D, ducks::rt_layout::col> b_col, x_col;
+        load(b_col, gB, {batch, head, j, 0}, laneId);
+        load(x_col, gX, {batch, head, j, 0}, laneId);
+        typename rt_fl<8, 8>::row_vec cumlog_j;
+        load(cumlog_j, gcl, {batch, head, 0, j}, laneId);
+
+        rt_fl<8, 8> dSt;
+        zero(dSt);
+        mma_ABt(dSt, dy_i, x_col, dSt);            // dY_i·X^T_j
+        rt_fl<8, 8> Ld;
+        zero(Ld);
+        add_row(Ld, Ld, cumlog_i);
+        sub_col(Ld, Ld, cumlog_j);
+        exp(Ld, Ld);
+        rt_fl<8, 8> dG;
+        mul(dG, dSt, Ld);                          // dG = dSt ∘ L
+        if (j == i) {
+            float zf = 0.0f;
+            make_causal(dG, dG, laneId, zf);
+        }
+        rt_bf<8, 8> dG_bf;
+        copy(dG_bf, dG);
+        #pragma clang loop unroll(full)
+        for (int kq = 0; kq < QB; ++kq) {
+            rt_bf<8, 64> b_kq;
+            load(b_kq, gB, {batch, head, j, kq}, laneId);
+            mma_AB(dc_blk[kq], dG_bf, b_kq, dc_blk[kq]);   // dC_i += dG·B_j
+        }
+    }
+    #pragma clang loop unroll(full)
+    for (int kq = 0; kq < QB; ++kq)
+        store(gdC, dc_blk[kq], {batch, head, i, kq}, laneId);
+}
+
+// K7: dB, dX — chunk-bounded intra tiles + the inter terms through dKV_c. Grid (N/8, H, B).
+template <int D>
+kernel void ssd_chunk_bwd_col(device   bf16     *Cq [[buffer(0)]],
+                              device   bf16     *Bm [[buffer(1)]],
+                              device   bf16     *X  [[buffer(2)]],
+                              device   float    *cl [[buffer(3)]],
+                              device   bf16     *dY [[buffer(4)]],
+                              device   const bf16 *dKV [[buffer(5)]],
+                              device   bf16     *dB [[buffer(6)]],
+                              device   bf16     *dX [[buffer(7)]],
+                              constant unsigned &N  [[buffer(8)]],
+                              constant unsigned &H  [[buffer(9)]],
+                              uint3 blockIdx [[threadgroup_position_in_grid]],
+                              uint  laneId   [[thread_index_in_simdgroup]]) {
+    static_assert(D == 64 || D == 128, "ssd_chunk_bwd_col supports D in {64,128}");
+    constexpr int TPC = SSD_CHUNK_L / 8;
+    constexpr int QB = D / 64;
+    using gl_t  = gl<bfloat, 1, -1, -1, D>;
+    using gl_cl = gl<float, 1, -1, 1, -1>;
+    gl_t  gC(Cq, nullptr, H, N, nullptr), gB(Bm, nullptr, H, N, nullptr);
+    gl_t  gX(X, nullptr, H, N, nullptr), gdY(dY, nullptr, H, N, nullptr);
+    gl_t  gdB(dB, nullptr, H, N, nullptr), gdX(dX, nullptr, H, N, nullptr);
+    gl_cl gcl(cl, nullptr, H, nullptr, N);
+    const int j = blockIdx.x, head = blockIdx.y, batch = blockIdx.z;
+    const int c = j / TPC;
+    const int C = (int)N / SSD_CHUNK_L;
+
+    rt_bf<8, D, ducks::rt_layout::col> b_col, x_col;
+    load(b_col, gB, {batch, head, j, 0}, laneId);
+    load(x_col, gX, {batch, head, j, 0}, laneId);
+    typename rt_fl<8, 8>::row_vec cumlog_j;
+    load(cumlog_j, gcl, {batch, head, 0, j}, laneId);
+
+    rt_fl<8, 64> db_blk[QB], dx_blk[QB];
+    #pragma clang loop unroll(full)
+    for (int q = 0; q < QB; ++q) {
+        zero(db_blk[q]);
+        zero(dx_blk[q]);
+    }
+
+    // inter: dX_j += w'_j B_j@dKV_c ; dB_j += w'_j X_j@dKV_c^T   (dKV of the last chunk is 0)
+    if (c < C - 1) {
+        gl<bfloat, 1, -1, D, D> gk(const_cast<device bf16*>(dKV), nullptr,
+                                   (int)H * C, nullptr, nullptr);
+        for (int kq = 0; kq < QB; ++kq) {
+            rt_bf<8, 64> b_kq;
+            load(b_kq, gB, {batch, head, j, kq}, laneId);
+            for (int xq = 0; xq < QB; ++xq) {
+                rt_bf<64, 64> k_row;
+                load(k_row, gk, {batch, head * C + c, kq, xq}, laneId);
+                mma_AB(dx_blk[xq], b_kq, k_row, dx_blk[xq]);
+            }
+        }
+        for (int kq = 0; kq < QB; ++kq) {
+            for (int xq = 0; xq < QB; ++xq) {
+                rt_bf<64, 64, ducks::rt_layout::col> k_col;
+                load(k_col, gk, {batch, head * C + c, kq, xq}, laneId);
+                rt_bf<8, 64> x_xq;
+                load(x_xq, gX, {batch, head, j, xq}, laneId);
+                mma_ABt(db_blk[kq], x_xq, k_col, db_blk[kq]);
+            }
+        }
+        // w'_j = exp(cl[r_c] - cl_j)
+        const float cl_rc = cl[((long)batch * (int)H + head) * (long)N
+                               + (long)(c + 1) * SSD_CHUNK_L - 1];
+        typename rt_fl<8, 8>::col_vec lj, w;
+        load(lj, gcl, {batch, head, 0, j}, laneId);
+        sub(w, lj, cl_rc);
+        mul(w, w, -1.0f);
+        exp(w, w);
+        #pragma clang loop unroll(full)
+        for (int q = 0; q < QB; ++q) {
+            mul_row(dx_blk[q], dx_blk[q], w);
+            mul_row(db_blk[q], db_blk[q], w);
+        }
+    }
+
+    // intra: the quadratic bwd_col loop, bounded to this chunk
+    const int i_end = (c + 1) * TPC;
+    for (int i = j; i < i_end; ++i) {
+        rt_bf<8, D> c_i, dy_i;
+        load(c_i, gC, {batch, head, i, 0}, laneId);
+        load(dy_i, gdY, {batch, head, i, 0}, laneId);
+        typename rt_fl<8, 8>::col_vec cumlog_i;
+        load(cumlog_i, gcl, {batch, head, 0, i}, laneId);
+
+        rt_fl<8, 8> G;
+        zero(G);
+        mma_ABt(G, c_i, b_col, G);
+        rt_fl<8, 8> Ld;
+        zero(Ld);
+        add_row(Ld, Ld, cumlog_i);
+        sub_col(Ld, Ld, cumlog_j);
+        exp(Ld, Ld);
+        rt_fl<8, 8> S;
+        mul(S, G, Ld);
+        rt_fl<8, 8> dSt;
+        zero(dSt);
+        mma_ABt(dSt, dy_i, x_col, dSt);
+        rt_fl<8, 8> dG;
+        mul(dG, dSt, Ld);
+        if (i == j) {
+            float zf = 0.0f;
+            make_causal(S, S, laneId, zf);
+            make_causal(dG, dG, laneId, zf);
+        }
+        rt_bf<8, 8> S_bf, dG_bf;
+        copy(S_bf, S);
+        copy(dG_bf, dG);
+        rt_bf<8, 8, ducks::rt_layout::col> S_col, dG_col;
+        swap_layout(S_col, S_bf, laneId);
+        swap_layout(dG_col, dG_bf, laneId);
+        #pragma clang loop unroll(full)
+        for (int q = 0; q < QB; ++q) {
+            rt_bf<8, 64> dy_q, c_q;
+            load(dy_q, gdY, {batch, head, i, q}, laneId);
+            load(c_q, gC, {batch, head, i, q}, laneId);
+            mma_AtB(dx_blk[q], S_col, dy_q, dx_blk[q]);    // dX_j += S^T·dY_i
+            mma_AtB(db_blk[q], dG_col, c_q, db_blk[q]);    // dB_j += dG^T·C_i
+        }
+    }
+    #pragma clang loop unroll(full)
+    for (int q = 0; q < QB; ++q) {
+        store(gdB, db_blk[q], {batch, head, j, q}, laneId);
+        store(gdX, dx_blk[q], {batch, head, j, q}, laneId);
+    }
+}
+
+#define instantiate_ssd_chunk_bwd(D)                                                 \
+  template [[host_name("ssd_chunk_gstate_" #D)]] [[kernel]] void                     \
+  ssd_chunk_gstate<D>(device bf16 *Cq [[buffer(0)]], device bf16 *dY [[buffer(1)]],  \
+    device float *cl [[buffer(2)]], device float *G [[buffer(3)]],                   \
+    constant unsigned &N [[buffer(4)]], constant unsigned &H [[buffer(5)]],          \
+    uint3 blockIdx [[threadgroup_position_in_grid]],                                 \
+    uint laneId [[thread_index_in_simdgroup]]);                                      \
+  template [[host_name("ssd_chunk_rscan_" #D)]] [[kernel]] void                      \
+  ssd_chunk_rscan<D>(device const float *Gin [[buffer(0)]],                          \
+    device const float *cl [[buffer(1)]], device bf16 *dKV [[buffer(2)]],            \
+    constant unsigned &C [[buffer(3)]], constant unsigned &N [[buffer(4)]],          \
+    uint3 blockIdx [[threadgroup_position_in_grid]],                                 \
+    uint tid [[thread_index_in_threadgroup]]);                                       \
+  template [[host_name("ssd_chunk_bwd_row_" #D)]] [[kernel]] void                    \
+  ssd_chunk_bwd_row<D>(device bf16 *Cq [[buffer(0)]], device bf16 *Bm [[buffer(1)]], \
+    device bf16 *X [[buffer(2)]], device float *cl [[buffer(3)]],                    \
+    device bf16 *dY [[buffer(4)]], device const bf16 *Sex [[buffer(5)]],             \
+    device bf16 *dC [[buffer(6)]], constant unsigned &N [[buffer(7)]],               \
+    constant unsigned &H [[buffer(8)]],                                              \
+    uint3 blockIdx [[threadgroup_position_in_grid]],                                 \
+    uint laneId [[thread_index_in_simdgroup]]);                                      \
+  template [[host_name("ssd_chunk_bwd_col_" #D)]] [[kernel]] void                    \
+  ssd_chunk_bwd_col<D>(device bf16 *Cq [[buffer(0)]], device bf16 *Bm [[buffer(1)]], \
+    device bf16 *X [[buffer(2)]], device float *cl [[buffer(3)]],                    \
+    device bf16 *dY [[buffer(4)]], device const bf16 *dKV [[buffer(5)]],             \
+    device bf16 *dB [[buffer(6)]], device bf16 *dX [[buffer(7)]],                    \
+    constant unsigned &N [[buffer(8)]], constant unsigned &H [[buffer(9)]],          \
+    uint3 blockIdx [[threadgroup_position_in_grid]],                                 \
+    uint laneId [[thread_index_in_simdgroup]]);
+
+instantiate_ssd_chunk_bwd(64);
+instantiate_ssd_chunk_bwd(128);
+
+// ---------------------------------------------------------------------------
 // Mamba-2 / SSD BACKWARD (quadratic, no atomics), D in {64,128}. The forward is the
 // attention-equivalent G = C·Bᵀ, S = tril(G∘L), Y = S·X (C↔Q, B↔K, X↔V, S↔P; no softmax).
 // Both kernels recompute S and dSt = dY·Xᵀ from C,B,X,cl (like attn_bwd recomputes P), per-tile:

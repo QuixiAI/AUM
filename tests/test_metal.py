@@ -91,6 +91,24 @@ def test_mamba2_bwd_kernel_matches_autograd(D):
     assert rel(dcl.float(), clr.grad) < 0.02, ("dcumlog", rel(dcl.float(), clr.grad))
 
 
+@pytest.mark.parametrize("N,D", [(128, 64), (256, 64), (128, 128), (256, 128)])
+def test_ssd_chunked_bwd_matches_autograd(N, D):
+    # the chunked linear-time backward (gradient states + reverse scan + chunk-bounded tiles,
+    # dcl via the <dY,Y>-<dX,X> identity) vs autograd through the fp32 core
+    C, Bm, X, cl = _ssd_inputs(2, 2, N, D, seed=5)
+    dY = torch.randn(2, 2, N, D, device="mps")
+    Cr, Br, Xr, clr = (t.clone().detach().requires_grad_() for t in (C, Bm, X, cl))
+    _ssd_fwd_ref(Cr, Br, Xr, clr).backward(dY.float())
+    dC, dB, dX, dcl = km.mamba2_bwd_chunked(C.bfloat16(), Bm.bfloat16(), X.bfloat16(),
+                                            cl, dY.bfloat16())
+    torch.mps.synchronize()
+    rel = lambda u, v: ((u.float() - v).abs().max() / (v.abs().max() + 1e-6)).item()
+    assert rel(dC, Cr.grad) < 0.03, ("dC", N, D, rel(dC, Cr.grad))
+    assert rel(dB, Br.grad) < 0.03, ("dB", N, D, rel(dB, Br.grad))
+    assert rel(dX, Xr.grad) < 0.03, ("dX", N, D, rel(dX, Xr.grad))
+    assert rel(dcl, clr.grad) < 0.03, ("dcl", N, D, rel(dcl, clr.grad))
+
+
 @pytest.mark.parametrize("N,D,route", [
     (128, 64, "chunked"), (256, 64, "chunked"),     # forced linear-time (64x64 quadrant state)
     (128, 128, "chunked"), (256, 128, "chunked"),   # ... at the reference head dim

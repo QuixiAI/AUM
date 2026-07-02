@@ -59,9 +59,16 @@ def mamba2_chunked(C, B, X, cumlog):
 
 def mamba2_bwd(C, B, X, cumlog, dY):
     """SSD backward -> (dC, dB, dX, dcumlog). C,B,X,dY bf16 (B,H,N,D); cumlog fp32 (B,H,N). MPS;
-    D in {64,128}. dcumlog = rowsum(M) − colsum(M) with M = dSt∘S, accumulated in-kernel in fp32
-    — the forward output Y is NOT needed for the backward."""
+    D in {64,128}. Auto-routed like the forward: the chunked LINEAR-TIME backward (gradient
+    states + reverse decayed scan + chunk-bounded tiles; dcumlog via the exact <dY,Y>-<dX,X>
+    identity over a linear-time Y recompute) above the measured crossovers, the quadratic
+    row/col kernels (in-kernel fp32 dcumlog) otherwise."""
     return _ext.mamba2_bwd(C, B, X, cumlog, dY)
+
+
+def mamba2_bwd_chunked(C, B, X, cumlog, dY):
+    """The chunked linear-time backward, forced (testing/benchmarks). N%64==0, N>=128."""
+    return _ext.mamba2_bwd_chunked(C, B, X, cumlog, dY)
 
 
 def aum_decode(S, alpha, x, k_rot, q_rot):
