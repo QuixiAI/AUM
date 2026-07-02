@@ -59,4 +59,6 @@ class AumConfig:
     # ---- Pressure calibration (§11) and halting (§8, §12) ----
     beta: float = 0.02                # fixed calibrated benefit transform constant
     halt_delta: float = 0.5           # inference halting threshold delta
+    pi_trigger: Optional[float] = None  # stage-4 policy J(pi): j*=j_max iff pi_t > trigger, else 0
+                                        # (None -> the delta-threshold halting of §8)
     p_explore: float = 0.02           # forced-exploration FLOOR (§12; anneal 0.2 -> this, never 0)

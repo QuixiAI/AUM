@@ -334,14 +334,15 @@ def partition_params(model):
     return muon, embed, scalar
 
 
-def build_optimizer(model, muon_lr=0.02, embed_lr=3e-4, scalar_lr=3e-4, momentum=0.95,
-                    weight_decay=0.0, betas=(0.9, 0.95), eps=1e-10):
+def build_optimizer(model, muon_lr=0.02, embed_lr=6e-4, scalar_lr=6e-4, momentum=0.95,
+                    weight_decay=0.1, betas=(0.9, 0.95), eps=1e-10):
     """A single SingleDeviceMuonWithAuxAdam over AumLMHeadModel: Muon for the hidden matrices,
     AdamW for the (tied) embedding/classifier and all scalars.
 
-    Muon `lr` is in spectral-norm-per-update units (0.02 is a sane default); the Adam LRs are
-    ordinary. Weight decay is applied to the Muon matrices only (embeddings/norms are left
-    undecayed, the usual choice). Tune the LRs per your schedule/batch size.
+    Defaults are the AUM-Ø.md §13 reference recipe: Muon lr 0.02 (spectral-norm-per-update
+    units), momentum 0.95, wd 0.1 on the Muon matrices ONLY; AdamW beta=(0.9,0.95), peak lr
+    6e-4, no weight decay, for the embedding/classifier and every scalar (norms, gains, A_log,
+    dt_bias, D, biases, the depthwise conv). Warmup/cosine live in the training loop.
     """
     muon, embed, scalar = partition_params(model)
     groups = []

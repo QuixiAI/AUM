@@ -149,6 +149,7 @@ class AumBackbone(nn.Module):
         self.silence = SilenceBlock(config.d_model, d_sigma=config.d_sigma, d_mu=config.d_mu,
                                     d_phase=config.d_phase, j_max=config.j_max, kappa=config.kappa,
                                     halt_delta=config.halt_delta,
+                                    pi_trigger=getattr(config, "pi_trigger", None),
                                     entropy_feature=getattr(config, "entropy_feature", False),
                                     top_gru=(config.baseline == "top_gru"), **factory)
         # False -> the silence-ablated evidence-core baseline (g_t output, §22).

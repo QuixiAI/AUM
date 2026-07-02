@@ -89,6 +89,19 @@ def test_forced_depth_one_hot():
     assert torch.allclose(aux.expected_J, torch.full_like(aux.expected_J, 2.0))
 
 
+def test_pi_trigger_policy():
+    # §8/§12 stage-4 J(pi): at inference, run to full depth ONLY where pi clears the trigger,
+    # else spend nothing. Trigger at -inf -> always j_max; at +inf -> always 0.
+    blk = SilenceBlock(32, d_sigma=8, d_mu=4, d_phase=8, j_max=2, pi_trigger=float("-inf")).eval()
+    g = torch.randn(2, 6, 32)
+    args = (_stub_read(32), torch.randn(2, 6, 4), torch.randn(2, 6, 4))
+    _, aux = blk(g, args[0], args[1], args[2])
+    assert (aux.j_star == 2).all()
+    blk.pi_trigger = float("inf")
+    _, aux = blk(g, args[0], args[1], args[2])
+    assert (aux.j_star == 0).all()
+
+
 def test_eval_selection_is_thresholded_and_deterministic():
     torch.manual_seed(1)
     _, _, o1, aux1 = _run(train=False)

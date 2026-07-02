@@ -29,7 +29,7 @@ format, so ``AumLMHeadModel.from_pretrained(<out>)`` loads it) plus ``<out>/init
 (seed, dtype, param counts, git commit, spec target). Run:
 
     python train/init.py                      # fp32 master weights, seed 0
-    python train/init.py --dtype bfloat16      # Appendix-A dtypes (A_log / unfold.norm stay F32)
+    python train/init.py --dtype bfloat16      # Appendix-A dtypes (A_log/unfold.norm/rope_freqs F32)
 """
 
 import argparse
@@ -122,7 +122,8 @@ def main():
                     help="output checkpoint directory")
     ap.add_argument("--seed", type=int, default=0, help="RNG seed for reproducible weights")
     ap.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32",
-                    help="storage dtype (bfloat16 follows Appendix A: A_log / unfold.norm stay F32)")
+                    help="storage dtype (bfloat16 follows Appendix A: A_log / unfold.norm / "
+                         "rope_freqs stay F32)")
     ap.add_argument("--vocab-size", type=int, default=None, help="override vocab (default 49152)")
     ap.add_argument("--no-check", action="store_true", help="skip the forward-pass sanity check")
     ap.add_argument("--force", action="store_true", help="overwrite a non-empty --out")

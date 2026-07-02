@@ -126,13 +126,15 @@ class SilenceBlock(nn.Module):
     """The single global silence block on top of the evidence stack (§3)."""
 
     def __init__(self, d_model, d_sigma=128, d_mu=32, d_phase=32, j_max=2, kappa=0.1,
-                 halt_delta=0.5, entropy_feature=False, top_gru=False, device=None, dtype=None):
+                 halt_delta=0.5, pi_trigger=None, entropy_feature=False, top_gru=False,
+                 device=None, dtype=None):
         kw = {"device": device, "dtype": dtype}
         super().__init__()
         self.d_model, self.d_sigma, self.d_mu, self.d_phase = d_model, d_sigma, d_mu, d_phase
         self.j_max = j_max
         self.kappa = kappa
         self.halt_delta = halt_delta          # inference halting threshold delta (§8)
+        self.pi_trigger = pi_trigger          # stage-4 policy J(pi): depth j_max iff pi clears this
         self.entropy_feature = entropy_feature
         self.top_gru = top_gru      # Top-GRU adapter baseline (§14): generic recurrent, no S read
 
@@ -309,6 +311,11 @@ class SilenceBlock(nn.Module):
             else:
                 j_star = torch.multinomial(
                     w.reshape(-1, self.j_max + 1), 1).reshape(lead)
+        elif self.pi_trigger is not None:                       # §8/§12 stage-4 policy J(pi):
+            fire = pi > self.pi_trigger                         # full depth only at high expected
+            j_star = torch.where(fire,                          # benefit, else no revision at all
+                                 torch.full(lead, self.j_max, device=w.device, dtype=torch.long),
+                                 torch.zeros(lead, device=w.device, dtype=torch.long))
         else:                                                   # inference: j* = min{j: p_j >= delta}
             hit = (torch.stack(ps, dim=-1) >= self.halt_delta).to(torch.uint8)
             j_star = hit.argmax(dim=-1)                         # first j whose p clears delta
