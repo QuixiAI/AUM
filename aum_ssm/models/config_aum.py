@@ -12,7 +12,7 @@ class AumConfig:
     # ---- Backbone / evidence core (AUM-Ø-Tiny v6 reference, ~78M) ----
     d_model: int = 512
     n_layer: int = 12                 # L evidence layers (token-clock recurrence)
-    seq_len: int = 8192               # §13 reference training sequence length (a training-recipe
+    seq_len: int = 4096               # §13 reference training sequence length (a training-recipe
                                       # value — the model itself is length-agnostic)
     d_intermediate: int = 1408        # SwiGLU MLP hidden width
     vocab_size: int = 49152
