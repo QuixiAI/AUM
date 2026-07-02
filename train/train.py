@@ -1,0 +1,390 @@
+#!/usr/bin/env python
+"""AUM-Ø training driver (v6 §10-§13): packed shards -> Accelerate -> Muon -> staged schedule.
+
+Pieces it ties together:
+  - DATA   : the uint16 shards written by train/prepare_data.py, read as NON-OVERLAPPING
+             ``seq_len``-token windows (default 4096). Documents are EOS-separated in the flat
+             stream, so a book-length document is automatically split into consecutive 4k chunks
+             — no truncation, no fake document boundaries injected inside it.
+  - MODEL  : AumLMHeadModel from an init/resume checkpoint directory (config.json +
+             pytorch_model.bin, the train/init.py format). Attention is SDPA —
+             GroundAttention calls F.scaled_dot_product_attention (torch picks the
+             flash/mem-efficient kernel per device); nothing to configure here.
+  - OPTIM  : train/muon.py ``build_optimizer`` — Muon (lr 0.02 spectral, momentum 0.95, wd 0.1)
+             for the 2D hidden matrices, AdamW (6e-4, betas (0.9,0.95), no wd) for the tied
+             embedding/classifier and all scalars; shared 1500-step warmup + cosine to 10% (§13).
+  - LOOP   : HF Accelerate (device placement, gradient accumulation, optional mixed precision)
+             around AumTrainer's stage-aware step; the §12 schedule advances on the token-budget
+             split 60/20/15/5 with the load-bearing R^2 gate before stage 2 (L_pressure stays off
+             until the prediction head beats the trivial predictor on held-out data), the
+             lambda_C 0 -> 5e-3 ramp inside stage 3, and the p_explore 0.2 -> 0.02 anneal.
+
+    # the reference run (20B tokens; override everything for local smoke)
+    python train/train.py
+
+    # a laptop smoke run: 30 optimizer steps at short context
+    python train/train.py --total-tokens 500000 --seq-len 512 --batch-size 1 --grad-accum 4 \
+        --warmup-steps 5 --eval-every 10 --save-every 20 --run-name smoke
+
+    # evidence-core baseline (silence stack off; plain LM loss)
+    python train/train.py --no-silence --run-name evidence-core
+
+    # resume
+    python train/train.py --resume train/checkpoints/<run>/step-000200
+
+    # with Weights & Biases reporting (accelerate tracker; WANDB_MODE=offline works too)
+    python train/train.py --wandb --wandb-project aum-ssm
+
+Progress is a tqdm bar over optimizer steps (loss/stage/lr/tok-s live in the postfix); periodic
+loss-part lines, eval results, and stage transitions print above it and append to
+<run>/metrics.jsonl. --wandb mirrors everything to W&B (train/* per log interval, val/* per
+eval, lr, tokens, stage).
+
+Single-process only for now (MPS or one GPU): the vendored Muon here is the single-device
+variant and the silence-path trainer reaches through the raw module. `accelerate launch` with
+num_processes=1 (or plain `python`) both work.
+"""
+
+import argparse
+import json
+import math
+import os
+import sys
+import time
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, Dataset
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from aum_ssm.models.aum_lm import AumLMHeadModel                      # noqa: E402
+from aum_ssm.models.config_aum import AumConfig                       # noqa: E402
+from aum_ssm.training import losses as L                              # noqa: E402
+from aum_ssm.training.trainer import AumTrainer                       # noqa: E402
+from aum_ssm.training.schedule import (Stage, ScheduleConfig, p_explore_at,   # noqa: E402
+                                       pressure_gate_clear)
+from train.muon import build_optimizer                                # noqa: E402
+
+
+# --------------------------------------------------------------------------- data
+class PackedWindows(Dataset):
+    """Non-overlapping seq_len-token windows over the flat uint16 shard stream.
+
+    This IS the 4k chunking: window i of shard s is tokens [i*seq_len, (i+1)*seq_len) — a long
+    document spans as many consecutive windows as it needs, short documents pack together with
+    their EOS separators. The per-shard tail (< seq_len tokens) is dropped.
+    """
+
+    def __init__(self, data_dir, split, seq_len):
+        with open(os.path.join(data_dir, "manifest.json")) as f:
+            manifest = json.load(f)
+        if split not in manifest["splits"]:
+            raise KeyError(split)
+        self.seq_len = seq_len
+        self.paths, self.index = [], []            # index[i] = (shard_idx, window_idx)
+        for s in manifest["splits"][split]["shards"]:
+            path = os.path.join(data_dir, s["name"])
+            n_win = s["n_tokens"] // seq_len
+            self.index.extend((len(self.paths), w) for w in range(n_win))
+            self.paths.append(path)
+        self.vocab_size = manifest["vocab_size"]
+        self._maps = {}                            # lazy per-shard memmaps (worker-safe)
+
+    def __len__(self):
+        return len(self.index)
+
+    def __getitem__(self, i):
+        shard, w = self.index[i]
+        mm = self._maps.get(shard)
+        if mm is None:
+            mm = self._maps[shard] = np.memmap(self.paths[shard], dtype=np.uint16, mode="r")
+        a = np.asarray(mm[w * self.seq_len:(w + 1) * self.seq_len], dtype=np.int64)
+        return torch.from_numpy(a)
+
+
+def make_loader(dataset, batch_size, seed, shuffle=True):
+    g = torch.Generator().manual_seed(seed)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, generator=g,
+                      drop_last=True, num_workers=0)
+
+
+def cycle(loader):
+    while True:
+        yield from loader                          # a fresh pass reshuffles via the sampler
+
+
+# --------------------------------------------------------------------------- schedule pieces
+def lr_scale(step, warmup, total, floor=0.10):
+    """§13: linear warmup then cosine to `floor` of the peak. Multiplies each group's base lr."""
+    if step < warmup:
+        return (step + 1) / max(1, warmup)
+    t = (step - warmup) / max(1, total - warmup)
+    return floor + (1 - floor) * 0.5 * (1 + math.cos(math.pi * min(t, 1.0)))
+
+
+def stage_boundaries(total_steps, fractions):
+    """Cumulative §12/§13 token-budget boundaries in optimizer steps: [end1, end2, end3]."""
+    ends, acc = [], 0.0
+    for f in fractions[:-1]:
+        acc += f
+        ends.append(int(acc * total_steps))
+    return ends
+
+
+# --------------------------------------------------------------------------- eval
+@torch.no_grad()
+def evaluate(model, cfg, val_iter, n_batches):
+    """Held-out LM loss (the §8 mixture when the silence stack is on, plain CE otherwise)."""
+    was_training = model.training
+    model.eval()
+    model.backbone.silence_enabled = cfg.silence_enabled
+    losses = []
+    for _ in range(n_batches):
+        x = next(val_iter)
+        if cfg.silence_enabled:
+            _, aux = model(x, return_aux=True)
+            losses.append(float(L.lm_mixture_loss(aux.o_stack[:, :-1], aux.w[:, :-1],
+                                                  model.lm_head, x[:, 1:])))
+        else:
+            losses.append(float(L.lm_loss(model(x).logits[:, :-1], x[:, 1:])))
+    if was_training:
+        model.train()
+    return sum(losses) / max(1, len(losses))
+
+
+# --------------------------------------------------------------------------- checkpointing
+def load_model(ckpt_dir, overrides):
+    with open(os.path.join(ckpt_dir, "config.json")) as f:
+        d = json.load(f)
+    d.update(overrides)
+    model = AumLMHeadModel(AumConfig(**d))
+    state = torch.load(os.path.join(ckpt_dir, "pytorch_model.bin"),
+                       map_location="cpu", weights_only=True)
+    model.load_state_dict(state)
+    return model
+
+
+def save_checkpoint(accelerator, model, optimizer, run_dir, step, stage, tokens_seen):
+    path = os.path.join(run_dir, f"step-{step:06d}")
+    accelerator.unwrap_model(model).save_pretrained(path)
+    torch.save({"optimizer": optimizer.state_dict(), "step": step, "stage": int(stage),
+                "tokens_seen": tokens_seen}, os.path.join(path, "trainer_state.pt"))
+    latest = os.path.join(run_dir, "latest")
+    if os.path.islink(latest):
+        os.remove(latest)
+    os.symlink(os.path.basename(path), latest)
+    return path
+
+
+# --------------------------------------------------------------------------- main
+def main():
+    here = os.path.dirname(os.path.abspath(__file__))
+    ap = argparse.ArgumentParser(description="Train AUM-Ø (Accelerate + Muon + staged §12 schedule).")
+    ap.add_argument("--init", default=os.path.join(here, "checkpoints", "aum-tiny-v6-init"),
+                    help="init checkpoint dir (train/init.py output)")
+    ap.add_argument("--resume", default=None, help="checkpoint dir (step-NNNNNN) to resume from")
+    ap.add_argument("--data-dir", default=os.path.join(here, "data"))
+    ap.add_argument("--run-name", default="aum-tiny-v6")
+    ap.add_argument("--out-dir", default=os.path.join(here, "checkpoints"))
+    # §13 recipe knobs
+    ap.add_argument("--total-tokens", type=float, default=20e9, help="token budget (§13: 20B)")
+    ap.add_argument("--seq-len", type=int, default=4096)
+    ap.add_argument("--batch-size", type=int, default=2, help="micro-batch (sequences)")
+    ap.add_argument("--grad-accum", type=int, default=8)
+    ap.add_argument("--warmup-steps", type=int, default=1500)
+    ap.add_argument("--muon-lr", type=float, default=0.02)
+    ap.add_argument("--adamw-lr", type=float, default=6e-4)
+    ap.add_argument("--weight-decay", type=float, default=0.1, help="Muon matrices only")
+    ap.add_argument("--lambda-compute-max", type=float, default=5e-3, help="stage-3 ramp target")
+    ap.add_argument("--eta-r2", type=float, default=None,
+                    help="override the §12 R^2 pressure gate (default 0.15; e.g. -1e9 to force "
+                         "stage progression in smoke tests)")
+    ap.add_argument("--no-silence", action="store_true",
+                    help="evidence-core baseline: silence stack off, plain LM loss, no stages")
+    ap.add_argument("--kernel-backend", default=None, help="override config (auto|reference|metal)")
+    ap.add_argument("--mixed-precision", default="no", choices=["no", "bf16", "fp16"])
+    # cadence
+    ap.add_argument("--eval-every", type=int, default=250, help="optimizer steps between evals")
+    ap.add_argument("--eval-batches", type=int, default=8)
+    ap.add_argument("--r2-len", type=int, default=512, help="context length for the R^2 gate probe")
+    ap.add_argument("--save-every", type=int, default=1000)
+    ap.add_argument("--log-every", type=int, default=10)
+    ap.add_argument("--no-tqdm", action="store_true", help="plain-print progress (logs/CI)")
+    ap.add_argument("--wandb", action="store_true", help="report to Weights & Biases")
+    ap.add_argument("--wandb-project", default="aum-ssm")
+    ap.add_argument("--seed", type=int, default=0)
+    args = ap.parse_args()
+
+    from accelerate import Accelerator
+    from accelerate.utils import set_seed
+    accelerator = Accelerator(gradient_accumulation_steps=args.grad_accum,
+                              mixed_precision=args.mixed_precision,
+                              log_with="wandb" if args.wandb else None)
+    if accelerator.num_processes > 1:
+        raise SystemExit("train.py is single-process for now (single-device Muon + the silence "
+                         "trainer reach through the raw module); run with num_processes=1.")
+    set_seed(args.seed)
+
+    # ---- model
+    overrides = {"seq_len": args.seq_len, "silence_enabled": not args.no_silence}
+    if args.kernel_backend:
+        overrides["kernel_backend"] = args.kernel_backend
+    ckpt = os.path.join(args.resume) if args.resume else args.init
+    model = load_model(ckpt, overrides)
+    cfg = model.config
+    n_params = sum(p.numel() for p in model.parameters())
+
+    # ---- data (the 4k chunking lives here — see PackedWindows)
+    train_ds = PackedWindows(args.data_dir, "train", args.seq_len)
+    try:
+        val_ds = PackedWindows(args.data_dir, "val", args.seq_len)
+    except KeyError:
+        val_ds = None
+    if val_ds is None or len(val_ds) == 0:
+        accelerator.print("WARNING: no val split — eval + the §12 R^2 gate use TRAIN windows")
+        val_ds = train_ds
+    train_loader = make_loader(train_ds, args.batch_size, args.seed)
+    val_loader = make_loader(val_ds, args.batch_size, args.seed + 1)
+
+    # ---- steps / schedule
+    tokens_per_step = args.batch_size * args.grad_accum * args.seq_len
+    total_steps = max(1, math.ceil(args.total_tokens / tokens_per_step))
+    schedule = ScheduleConfig() if args.eta_r2 is None else ScheduleConfig(eta_r2=args.eta_r2)
+    ends = stage_boundaries(total_steps, schedule.stage_fractions)   # [s1_end, s2_end, s3_end]
+
+    # ---- optimizer (§13 split) + trainer
+    optimizer = build_optimizer(model, muon_lr=args.muon_lr, embed_lr=args.adamw_lr,
+                                scalar_lr=args.adamw_lr, weight_decay=args.weight_decay)
+    model, optimizer, train_loader, val_loader = accelerator.prepare(
+        model, optimizer, train_loader, val_loader)
+    base_lrs = [g["lr"] for g in optimizer.param_groups]
+    trainer = AumTrainer(accelerator.unwrap_model(model), optimizer, cfg, schedule,
+                         accelerator=accelerator)
+
+    start_step, tokens_seen = 0, 0
+    if args.resume:
+        st = torch.load(os.path.join(args.resume, "trainer_state.pt"),
+                        map_location="cpu", weights_only=False)
+        optimizer.load_state_dict(st["optimizer"])
+        start_step, tokens_seen = st["step"], st["tokens_seen"]
+        trainer.stage = Stage(st["stage"])
+
+    run_dir = os.path.join(args.out_dir, args.run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    log_path = os.path.join(run_dir, "metrics.jsonl")
+
+    if args.wandb:
+        accelerator.init_trackers(args.wandb_project, config=vars(args),
+                                  init_kwargs={"wandb": {"name": args.run_name,
+                                                         "resume": "allow"}})
+
+    accelerator.print(
+        f"AUM-Ø train: {n_params / 1e6:.1f}M params on {accelerator.device} | "
+        f"{tokens_per_step:,} tok/step x {total_steps:,} steps = {tokens_per_step * total_steps / 1e9:.2f}B tokens\n"
+        f"  data: {len(train_ds):,} train / {len(val_ds):,} val windows of {args.seq_len} "
+        f"(books split into non-overlapping {args.seq_len}-token chunks)\n"
+        f"  silence={'on' if cfg.silence_enabled else 'OFF (evidence-core baseline)'} "
+        f"stage-ends={ends} warmup={args.warmup_steps} mp={args.mixed_precision} "
+        f"wandb={'on (' + args.wandb_project + ')' if args.wandb else 'off'}"
+        + (f"\n  resumed from {args.resume} @ step {start_step} stage {int(trainer.stage)}"
+           if args.resume else ""))
+
+    from tqdm.auto import tqdm
+    bar = tqdm(total=total_steps, initial=start_step, unit="step", dynamic_ncols=True,
+               disable=args.no_tqdm or not accelerator.is_main_process, desc=args.run_name)
+    say = bar.write if not bar.disable else accelerator.print
+
+    train_iter, val_iter = cycle(train_loader), cycle(val_loader)
+    pred_r2 = float("-inf")
+    t0, tokens0 = time.time(), tokens_seen
+    model.train()
+
+    for step in range(start_step, total_steps):
+        # §12 stage management on the token-budget boundaries; 1->2 additionally needs the R^2
+        # gate (checked at eval cadence below) — until it clears, stage 1 simply continues.
+        if cfg.silence_enabled:
+            if trainer.stage == Stage.EVIDENCE_CORE and step >= ends[0] \
+                    and pressure_gate_clear(pred_r2, schedule):
+                trainer.maybe_advance_stage(pred_r2)
+                say(f"step {step}: stage -> {int(trainer.stage)} (R^2={pred_r2:.3f})")
+            elif trainer.stage == Stage.FORCED_REVISION and step >= ends[1]:
+                trainer.maybe_advance_stage(pred_r2)
+                say(f"step {step}: stage -> {int(trainer.stage)}")
+            elif trainer.stage == Stage.SOFT_HALTING and step >= ends[2]:
+                trainer.maybe_advance_stage(pred_r2)
+                say(f"step {step}: stage -> {int(trainer.stage)}")
+            if trainer.stage >= Stage.SOFT_HALTING:      # lambda_C ramp inside stage 3 (§12)
+                ramp = (step - ends[1]) / max(1, ends[2] - ends[1])
+                trainer.config.lambda_compute = args.lambda_compute_max * min(max(ramp, 0.0), 1.0)
+
+        # LR: shared warmup + cosine, scaled onto each group's base lr (§13)
+        scale = lr_scale(step, args.warmup_steps, total_steps)
+        for g, base in zip(optimizer.param_groups, base_lrs):
+            g["lr"] = base * scale
+
+        p_explore = p_explore_at(step, total_steps, schedule)
+        step_metrics = None
+        for _ in range(args.grad_accum):                 # one optimizer step per iteration
+            with accelerator.accumulate(model):
+                batch = next(train_iter)
+                step_metrics, _ = trainer.train_step(batch, p_explore=p_explore)
+        tokens_seen += tokens_per_step
+        bar.update(1)
+        bar.set_postfix(loss=f"{step_metrics['loss']:.3f}", stage=int(trainer.stage),
+                        lr=f"x{scale:.2f}", refresh=False)
+
+        if (step + 1) % args.log_every == 0 and accelerator.is_main_process:
+            dt = time.time() - t0
+            tps = (tokens_seen - tokens0) / max(dt, 1e-9)
+            parts = " ".join(f"{k}={v:.4f}" for k, v in step_metrics["parts"].items())
+            say(f"step {step + 1:>6}/{total_steps} stage {int(trainer.stage)} "
+                f"loss {step_metrics['loss']:.4f} [{parts}] "
+                f"lr x{scale:.3f} {tps / 1e3:.1f}k tok/s")
+            with open(log_path, "a") as f:
+                json.dump({"step": step + 1, "tokens": tokens_seen, "lr_scale": scale,
+                           "p_explore": p_explore, **step_metrics}, f)
+                f.write("\n")
+            if args.wandb:
+                accelerator.log(
+                    {"train/loss": step_metrics["loss"],
+                     **{f"train/{k}": v for k, v in step_metrics["parts"].items()},
+                     "lr_scale": scale, "tokens": tokens_seen, "tokens_per_s": tps,
+                     "stage": int(trainer.stage), "p_explore": p_explore,
+                     "lambda_compute": trainer.config.lambda_compute,
+                     **({"train/benefit_mean": step_metrics["benefit_mean"]}
+                        if "benefit_mean" in step_metrics else {})},
+                    step=step + 1)
+            t0, tokens0 = time.time(), tokens_seen
+
+        if (step + 1) % args.eval_every == 0 or step + 1 == total_steps:
+            val_loss = evaluate(trainer.model, cfg, val_iter, args.eval_batches)
+            pred_r2 = trainer.pred_val_r2(next(val_iter)[:, :args.r2_len]) \
+                if cfg.silence_enabled else float("-inf")
+            say(f"step {step + 1:>6}: val_loss {val_loss:.4f} "
+                f"pred_R^2 {pred_r2:.3f} (gate eta={schedule.eta_r2})")
+            if accelerator.is_main_process:
+                with open(log_path, "a") as f:
+                    json.dump({"step": step + 1, "val_loss": val_loss, "pred_r2": pred_r2}, f)
+                    f.write("\n")
+                if args.wandb:
+                    accelerator.log({"val/loss": val_loss, "val/pred_r2": pred_r2},
+                                    step=step + 1)
+            model.train()
+
+        if ((step + 1) % args.save_every == 0 or step + 1 == total_steps) \
+                and accelerator.is_main_process:
+            path = save_checkpoint(accelerator, model, optimizer, run_dir, step + 1,
+                                   trainer.stage, tokens_seen)
+            say(f"saved {path}")
+
+    bar.close()
+    accelerator.print(f"done: {tokens_seen:,} tokens, final stage {int(trainer.stage)}")
+    if args.wandb:
+        accelerator.end_training()
+
+
+if __name__ == "__main__":
+    main()

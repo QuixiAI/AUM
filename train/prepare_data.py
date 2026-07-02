@@ -10,15 +10,26 @@ separates documents with the EOS id, and writes a flat token stream into fixed-s
 packing (no fixed context baked in) lets the training loader sample any ``seq_len`` window;
 ``--seq-len`` here is only a manifest hint.
 
-Dataset repos differ in schema; loading is robust to that: configs are auto-resolved (preferring
-English variants like ``eng_Latn``/``en``), the text field is auto-detected (``text``/``content``
-/ first string column), and the split falls back to the first available one.
+The corpus is ENGLISH-ONLY by default, enforced twice: per-language repos must have their config
+pinned in the datasets file (``org/repo:eng_Latn`` — auto-resolution accepts a match against the
+English preferences but REFUSES to fall back to an arbitrary config), and any example carrying a
+language-ish field (``language``/``lang``/...) that is not English is skipped (``--language all``
+disables; skips are counted and printed, never silent). The text field is auto-detected
+(``text``/``content``/first string column) and the split falls back to the first available one.
+
+Chunking note: shards are a FLAT EOS-separated token stream — documents are NOT pre-chunked
+here. The training loader (train/train.py) reads non-overlapping ``seq_len``-token windows, so a
+book-length document is automatically split into consecutive 4k chunks without injecting fake
+document boundaries inside it; ``approx_sequences`` in the manifest counts those chunks.
+
+For faster downloads: ``pip install "huggingface_hub[hf_transfer]"`` — when the hf_transfer
+package is importable, HF_HUB_ENABLE_HF_TRANSFER=1 is set automatically.
 
     # the default corpus: 15k samples from every dataset in train/datasets -> train/data/
     python train/prepare_data.py
 
     # a single HF dataset or local files instead
-    python train/prepare_data.py --source HuggingFaceFW/fineweb-edu --streaming --out-dir train/data/fineweb-edu
+    python train/prepare_data.py --source HuggingFaceFW/finepdfs-edu:eng_Latn --out-dir train/data/finepdfs-edu
     python train/prepare_data.py --source 'corpus/*.jsonl' --out-dir train/data/mine --val-fraction 0.01
 
     # validate the packing/sharding mechanics with no external deps
@@ -66,10 +77,12 @@ def iter_local(paths, text_column):
                 yield _extract_text(json.loads(line), text_column) if is_jsonl else line
 
 
-# Config / text-field preferences for heterogeneous HF repos (fineweb-2 and friends are
+# Config / text-field preferences for heterogeneous HF repos (finepdfs-edu and friends are
 # per-language configs; books/phrase corpora use different text keys).
 _PREFERRED_CONFIGS = ("eng_Latn", "en", "eng", "english", "default", "sample-10BT")
 _TEXT_KEYS = ("text", "content", "markdown", "raw_content", "document", "chapter")
+# Example-level language metadata (fineweb: language="en"; finepdfs: eng_Latn; ...).
+_LANG_KEYS = ("language", "lang", "language_code", "language_script")
 
 
 def _require_datasets():
@@ -78,6 +91,27 @@ def _require_datasets():
         return datasets
     except ImportError as e:  # pragma: no cover
         raise SystemExit('datasets is required for HF sources: pip install "aum_ssm[data]"') from e
+
+
+def _enable_hf_transfer():
+    """Turn on hf_transfer downloads when the package is present (no-op otherwise)."""
+    try:
+        import hf_transfer  # noqa: F401
+        os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+    except ImportError:
+        pass
+
+
+def _lang_ok(example, language):
+    """True unless the example carries a language-ish field that contradicts --language.
+    Examples with no language metadata always pass (config pinning covers those repos)."""
+    if language in (None, "", "all"):
+        return True
+    for k in _LANG_KEYS:
+        v = example.get(k)
+        if isinstance(v, str) and v:
+            return v.lower().replace("-", "_").startswith(language.lower())
+    return True
 
 
 def _load_stream(name, split="train", config=None):
@@ -109,12 +143,13 @@ def _load_stream(name, split="train", config=None):
     configs = hf.get_dataset_config_names(name)
     chosen = next((p for p in _PREFERRED_CONFIGS if p in configs), None)
     if chosen is None:
-        chosen = configs[0]
-        print(f"  [{name}] WARNING: {len(configs)} configs and none matched the preferred names "
-              f"{_PREFERRED_CONFIGS}; falling back to {chosen!r} (alphabetically first — almost "
-              f"certainly NOT what you want). Pin one as '{name}:<config>' in the datasets file.")
-    else:
-        print(f"  [{name}] {len(configs)} configs; using {chosen!r}")
+        # English-only corpus: never guess a language config. An arbitrary fallback silently
+        # fills the corpus with another language — hard-fail and ask for a pin instead.
+        raise SystemExit(
+            f"[{name}] has {len(configs)} configs and none matched the English preferences "
+            f"{_PREFERRED_CONFIGS}. Pin one explicitly as '{name}:<config>' in the datasets "
+            f"file (e.g. from: {configs[:8]}{' ...' if len(configs) > 8 else ''}).")
+    print(f"  [{name}] {len(configs)} configs; using {chosen!r}")
     return _load(chosen), chosen
 
 
@@ -130,22 +165,31 @@ def _extract_text(example, text_column=None):
     return max(strings, key=len) if strings else ""
 
 
-def iter_hf(source, split, text_column, limit=0, config=None):
+def iter_hf(source, split, text_column, limit=0, config=None, language="en"):
     """Stream up to `limit` documents from a HF dataset. Streaming + the limit means only the
-    requested samples are fetched — never the full dataset."""
+    requested samples are fetched — never the full dataset. Examples whose language metadata
+    contradicts `language` are skipped BEFORE counting toward the limit (skips are reported)."""
     ds, _ = _load_stream(source, split, config)
-    n = 0
+    n = skipped = 0
     for ex in ds:
+        if not _lang_ok(ex, language):
+            skipped += 1
+            continue
         yield _extract_text(ex, text_column)
         n += 1
         if limit and n >= limit:
-            return
+            break
+    if skipped:
+        print(f"  [{source}] skipped {skipped:,} non-{language} documents (language filter)")
 
 
-def iter_documents(source, split, text_column, limit):
+def iter_documents(source, split, text_column, limit, language="en"):
     matches = glob.glob(source)
-    it = iter_local(sorted(matches), text_column) if matches else \
-        iter_hf(source, split, text_column, limit)
+    if matches:
+        it = iter_local(sorted(matches), text_column)
+    else:
+        name, _, config = source.partition(":")
+        it = iter_hf(name, split, text_column, limit, config=config or None, language=language)
     for i, doc in enumerate(it):
         if limit and i >= limit:
             return
@@ -277,9 +321,10 @@ def _finish(args, vocab_size, eos_id, writers, source, n_docs):
 
 
 def run(args):
-    """Single-source mode: one HF dataset id or a local path/glob."""
+    """Single-source mode: one HF dataset id (optionally `:config`) or a local path/glob."""
     vocab_size, eos_id, encode_fn, writers, writer_for = _setup(args)
-    docs = iter_documents(args.source, args.split, args.text_column, args.limit_docs)
+    docs = iter_documents(args.source, args.split, args.text_column, args.limit_docs,
+                          language=args.language)
     n_docs = pack(docs, encode_fn, eos_id, writer_for, args.batch_docs)
     _finish(args, vocab_size, eos_id, writers, args.source, n_docs)
 
@@ -300,7 +345,7 @@ def run_mix(args):
         print(f"[{si + 1}/{len(names)}] {label}")
         before = {s: w.total for s, w in writers.items()}
         docs = iter_hf(name, args.split, args.text_column,
-                       limit=args.samples_per_dataset, config=config)
+                       limit=args.samples_per_dataset, config=config, language=args.language)
         n = pack((d for d in docs if d), encode_fn, eos_id, writer_for, args.batch_docs)
         tokens = {s: writers[s].total - before[s] for s in writers}
         per_source[label] = {"documents": n, "tokens": tokens}
@@ -364,6 +409,9 @@ def main():
     ap.add_argument("--split", default="train", help="HF split name (auto-falls back)")
     ap.add_argument("--text-column", default=None,
                     help="document text field (default: auto-detect text/content/...)")
+    ap.add_argument("--language", default="en",
+                    help="skip examples whose language metadata does not match this prefix "
+                         "(en matches en/eng/eng_Latn/english; 'all' disables the filter)")
     ap.add_argument("--tokenizer", default="HuggingFaceTB/SmolLM2-135M")
     ap.add_argument("--config", default=None, help="model config.json to verify vocab against")
     ap.add_argument("--vocab-size", type=int, default=49152)
@@ -377,6 +425,7 @@ def main():
 
     if args.self_test:
         return self_test()
+    _enable_hf_transfer()
     if args.source:
         run(args)
     else:

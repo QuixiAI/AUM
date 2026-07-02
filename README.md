@@ -68,7 +68,9 @@ kernels/metal/        self-contained Metal build: MSL substrate + mamba2 (SSD fw
 train/
   init.py             materialize the randomly-initialized Tiny v6 checkpoint (~78M)
   tokenizer.py        SmolLM2 tokenizer (49152-vocab BPE — matches the spec exactly) + verify
-  prepare_data.py     tokenize a corpus into packed uint16 shards + manifest
+  prepare_data.py     stream + tokenize the English corpus into packed uint16 shards + manifest
+  train.py            the training driver: Accelerate + Muon + the staged §12 schedule,
+                      4k-chunk loader, tqdm progress, JSONL + optional wandb logging
   muon.py             Muon optimizer (vendored) + the AUM parameter partition (§13 recipe)
 tests/                the full suite (decode parity, kernel-vs-oracle, gate machinery, ...)
 ```
@@ -90,10 +92,12 @@ python train/init.py
 # 2. verify the tokenizer against the model config (SmolLM2, vocab 49152 — an exact match)
 python train/tokenizer.py --config train/checkpoints/aum-tiny-v6-init/config.json
 
-# 3. tokenize a corpus into packed uint16 shards
-python train/prepare_data.py --source HuggingFaceFW/fineweb-edu --streaming \
-    --out-dir train/data/fineweb-edu --val-fraction 0.01 \
-    --config train/checkpoints/aum-tiny-v6-init/config.json
+# 3. stream + tokenize the corpus (train/datasets list, English-pinned) into packed shards
+python train/prepare_data.py
+
+# 4. train (Accelerate + Muon + the staged §12 schedule; --wandb to report to W&B)
+python train/train.py --run-name aum-tiny-v6
+#    laptop smoke: python train/train.py --total-tokens 500000 --seq-len 512 --batch-size 1
 
 # run the test suite
 pytest tests/

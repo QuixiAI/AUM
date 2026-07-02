@@ -1,6 +1,8 @@
+# One dataset per line: org/repo or org/repo:config. Configs are PINNED to English variants —
+# prepare_data.py refuses to guess when a repo has language configs and none is pinned.
 HuggingFaceFW/fineweb
-HuggingFaceFW/finepdfs
-HuggingFaceFW/finewiki
-HuggingFaceFW/finephrase
+HuggingFaceFW/finepdfs-edu:eng_Latn
+HuggingFaceFW/finewiki:en
+HuggingFaceFW/finephrase:all
 suolyer/pile_books3
 QuixiAI/fp_pt

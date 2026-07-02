@@ -9,7 +9,8 @@ from aum_ssm.training.counterfactual import rollout_benefit
 
 
 class AumTrainer:
-    def __init__(self, model, optimizer, config, schedule: ScheduleConfig = None):
+    def __init__(self, model, optimizer, config, schedule: ScheduleConfig = None,
+                 accelerator=None):
         self.model = model
         self.opt = optimizer
         self.config = config
@@ -17,6 +18,10 @@ class AumTrainer:
         self.stage = Stage.EVIDENCE_CORE
         self.max_grad_norm = 1.0
         self.force_ablation = None   # set by the gate harness to pin an ablation across all stages
+        # Optional HF Accelerate integration (train/train.py): backward/clip go through the
+        # accelerator (mixed precision, gradient accumulation); step/zero_grad are the prepared
+        # optimizer's, which no-op on non-sync accumulation steps.
+        self.accelerator = accelerator
 
     def _ablation_for_stage(self):
         # Stage 1 trains A,U,M + the prediction head with J=0 -> every candidate output is sigma^0's.
@@ -68,10 +73,17 @@ class AumTrainer:
             parts["lm"] = L.lm_loss(logits[:, :-1], input_ids[:, 1:])
 
         total, used = L.total_loss(parts, terms)
-        self.opt.zero_grad()
-        total.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+        # backward -> clip -> step -> zero_grad: zeroing AFTER the step keeps this correct under
+        # gradient accumulation (zeroing first would wipe the accumulated grads on the sync step).
+        if self.accelerator is not None:
+            self.accelerator.backward(total)
+            if self.accelerator.sync_gradients:
+                self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+        else:
+            total.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
         self.opt.step()
+        self.opt.zero_grad()
         metrics = {"loss": float(total.detach()), "parts": used, "stage": int(self.stage)}
         if benefit is not None:
             metrics["benefit_mean"] = float(benefit.mean())
