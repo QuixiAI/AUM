@@ -231,6 +231,10 @@ def main():
     ap.add_argument("--log-every", type=int, default=1,
                     help="optimizer steps between log lines / wandb points (steps are minutes "
                          "at 4k context on MPS — log every one)")
+    ap.add_argument("--empty-cache-every", type=int, default=10,
+                    help="release the MPS allocator cache every N optimizer steps (0 = never). "
+                         "The cache otherwise grows monotonically (~85GB/step peak at 8x4096), "
+                         "gets paged out, and step time decays as pages fault back in")
     ap.add_argument("--no-tqdm", action="store_true", help="plain-print progress (logs/CI)")
     ap.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=None,
                     help="report to Weights & Biases (default: ON when the wandb package is "
@@ -379,6 +383,9 @@ def main():
                 batch = next(train_iter)
                 step_metrics, _ = trainer.train_step(batch, p_explore=p_explore)
         tokens_seen += tokens_per_step
+        if args.empty_cache_every and (step + 1) % args.empty_cache_every == 0 \
+                and torch.backends.mps.is_available():
+            torch.mps.empty_cache()                      # stop allocator-cache -> swap creep
         bar.update(1)
         bar.set_postfix(loss=f"{step_metrics['loss']:.3f}", stage=int(trainer.stage),
                         lr=f"x{scale:.2f}", refresh=False)
