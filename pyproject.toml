@@ -14,16 +14,28 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: Unix"
 ]
+# The reference backend is pure PyTorch (CPU / Apple MPS / CUDA). triton is only needed for the
+# NVIDIA kernel backend; transformers only for HF checkpoint/generation conveniences and data
+# prep. All such imports are lazy — the package, tests, and Metal backend run without them.
 dependencies = [
     "torch",
-    "triton>=3.5.0",
     "einops",
-    "transformers",
     "packaging",
     "setuptools>=61.0.0",
 ]
 
 [project.optional-dependencies]
+triton = [
+    "triton>=3.5.0"
+]
+hf = [
+    "transformers"
+]
+data = [
+    "transformers",
+    "datasets",
+    "numpy",
+]
 causal-conv1d = [
     "causal-conv1d>=1.4.0"
 ]

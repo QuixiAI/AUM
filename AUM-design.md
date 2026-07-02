@@ -1,210 +1,176 @@
-# AUM-Ø Implementation Design — Forking the Mamba codebase
+# AUM-Ø Implementation Design — the Mamba fork, as built
 
-Implementation plan for forking [`state-spaces/mamba`](https://github.com/state-spaces/mamba)
-into **`aum_ssm`**, the reference implementation of **AUM-Ø v5.3** (see `AUM-Ø.md`).
+Design record for the fork of [`state-spaces/mamba`](https://github.com/state-spaces/mamba)
+into **`aum_ssm`**, the reference implementation of **AUM-Ø v6** (see `AUM-Ø.md`).
 
-This document records the repo survey, the keep/remove decisions, and the
-high-level map of what each surviving file becomes. It is the build plan, not
-the architecture spec — the architecture lives in `AUM-Ø.md`.
+This document records the repo survey, the keep/remove decisions, what each surviving file
+became, and the design consequences discovered during the build. It is the build record, not the
+architecture spec — the architecture lives in `AUM-Ø.md`, whose Appendix A is verified
+tensor-for-tensor against the built checkpoint. **Status: executed.** The v6 reference model
+(78,255,136 params) is implemented, tested (decode ≡ forward, kernel ≡ oracle, the §14/§15 gate
+machinery), and trains fwd+bwd on CPU and Apple MPS.
 
-## Decisions (settled)
+## Decisions (settled, executed)
 
-1. **Kernels: SISO + Triton-only.** Keep only the Mamba-3 SISO Triton kernels.
-   Delete the Mamba-1 CUDA build (`csrc/`), all TileLang/CuTe, and all MIMO.
-   Matches the v5.3 reference (`mimo_rank=1`). Drops the
-   `tilelang` / `apache-tvm-ffi` / `quack-kernels` dependencies and the CUDA
-   compile step.
-2. **Reference modules: keep `ssd_minimal` only.** Delete Mamba-1 and the
-   Mamba-2 SSD kernels; keep `ssd_minimal.py` as a readable pure-PyTorch
-   reference to validate the U-phase kernel against.
-3. **Package identity: rename to `aum_ssm`.** Rewrite imports and metadata to
-   the new architecture.
+1. **Kernels: SISO scaffolding + pluggable backends.** The Mamba-1 CUDA build (`csrc/`), all
+   TileLang/CuTe, and all MIMO were deleted. The U phase dispatches on
+   `AumConfig.kernel_backend ∈ {auto, reference, metal, triton}`: `reference` is the
+   pure-PyTorch oracle (CPU/MPS/CUDA), `metal` is the self-contained Apple-Silicon backend
+   (see `AUM-metal-plan.md`), `triton` is deferred to the NVIDIA production bring-up.
+2. **Reference module: `ssd_minimal` → `ssd_reference.py`.** Extended into the full AUM oracle:
+   the affine recurrence in serial (`aum_unfold_step_ref`) and chunk-parallel
+   (`aum_unfold_chunk_ref`) forms, the swapped-query readout (`aum_state_readout_ref`), the
+   dynamics (`aum_dynamics`), and the §4 rotation ladder (`ladder_freqs`, `_rotate_ladder`).
+   Step ≡ chunk to 1e-9 in float64 is a standing test.
+3. **Package identity: `aum_ssm`.** Imports, metadata, and packaging rewritten; pure-Python
+   package (the CUDA extension and the `tilelang`/`apache-tvm-ffi`/`quack-kernels` dependencies
+   are gone).
 
 ---
 
-## Top-line finding
+## Top-line finding (held up in practice)
 
-AUM-Ø decomposes into three tiers, unevenly covered by the repo:
+AUM-Ø decomposes into three tiers, unevenly covered by the original repo:
 
-| Tier | What it is | Repo coverage |
+| Tier | What it is | Repo coverage (as experienced) |
 |---|---|---|
-| **Evidence core** (12× A→U→M→MLP) | the token-clock recurrent stack | **~70% reusable** — essentially **Mamba-3** + GQA + a small precision adapter |
-| **Global silence block** (`model.silence.*`) | hypothesis register, predictive grounding, pressure, halting | **0% — net-new**, no analog in the repo |
-| **Training harness** (§17–20) | 4-stage schedule, counterfactual-benefit rollout, the 7-term loss | **0% — net-new**; the repo has no trainer at all |
+| **Evidence core** (12× A→U→M→MLP) | the token-clock recurrent stack | **~70% reused** — Mamba scaffolding + GQA + a small precision adapter |
+| **Global silence block** (`model.silence.*`) | hypothesis register, predictive grounding, pressure, halting | **net-new**, no analog in the repo |
+| **Training harness** (§10–§12, §14–§16) | 4-stage schedule, counterfactual-benefit labels, the 7-term loss, the gate | **net-new**; the repo has no trainer at all |
 
-**Key discovery: the U phase is Mamba-3, almost line-for-line.**
-- `modules/mamba3.py:27` `heavy_tail_activation` is *exactly* the dissolution
-  `f(x)` from §6.
-- `ops/triton/mamba3/angle_dt.py:94-107` computes `tanh(angle)·π · dt`, cumsum,
-  `mod 2π` — *literally* the resonance-phase recurrence
-  `φ_t = (φ_{t-1} + π·tanh(θ_t)·τ_t) mod 2π`.
-- Rotary `R(φ)` on q/k, gated RMSNorm readout, data-dependent decay, the SSD
-  chunk-scan — all already present.
+**The key identity that carried the whole kernel strategy:** the U-phase readout
 
-So the evidence core is "Mamba-3 SISO + a write-gate + key/value normalization,"
-not a from-scratch kernel. The **affine invariant** committed in §0.2 is exactly
-what keeps the chunk-scan kernel applicable.
+$$S_t\,\tilde q_t \;=\; \big((C B^\top)\odot e^{\,\mathrm{cumlog}_i-\mathrm{cumlog}_j}\odot\text{causal}\big)X
+\quad\text{with}\quad C=R(\phi)q,\; B=R(\phi)\hat k,\; X=\rho\tau\hat v,\; \mathrm{cumlog}=\mathrm{cumsum}(-\lambda\tau)$$
 
-**Cost note:** the **silence block needs no custom kernel.** With `J_max=2` and
-frozen `S_t`, it is a tiny fixed unroll of 128-dim GEMMs, vectorizable across
-`(B,T)` in plain PyTorch. The only heavy kernel is the U-phase scan.
+is *exactly* the Mamba-2 SSD numerator. Every AUM-specific transform (rotation ladder, L2
+normalization, write gate, dynamics) folds into the kernel's **operands**, computed host-side.
+This is why the same SSD core serves the reference, Metal, and (eventually) Triton backends
+unchanged — and why v6's multi-frequency ladder (§4) required **zero kernel changes**.
 
----
+**Mamba-3 correspondence — a v5.3-era note, corrected for v6.** Mamba-3's
+`heavy_tail_activation` is the dissolution `f(x)` (reused as `heavy_tail`), and its angle/dt
+machinery matches the phase-velocity recurrence. But two v6 deltas break line-for-line reuse:
+v6's φ is an **unbounded accumulated position, never wrapped mod 2π** (the wrap is harmless under
+a single frequency, aliasing-relevant under the ladder), and the rotation applies **B = d_h/2
+geometric frequencies per head**, not one. The Triton `angle_dt.py` kernel therefore needs those
+two edits at NVIDIA bring-up time; the reference and Metal paths already implement v6 semantics.
 
-## Spec → file correspondence
-
-| Spec component | Closest existing file | Action |
-|---|---|---|
-| A — bounded GQA grounding | `modules/mha.py` | adapt: local/windowed causal + QK-norm |
-| U — resonant affine recurrence | `modules/mamba3.py` + `ops/triton/mamba3/*` (SISO) | fork as the U core |
-| φ resonance recurrence | `ops/triton/mamba3/angle_dt.py` | reuse ~as-is |
-| heavy-tail `f(x)` | `modules/mamba3.py:27` | reuse verbatim |
-| gated readout / B,C norm | `ops/triton/layernorm_gated.py` | keep |
-| M — precision adapter | *(none — small low-rank module)* | new |
-| MLP (SwiGLU) | `modules/mlp.py` | keep, minor reconcile |
-| Block / residual stream | `modules/block.py` | restructure to host A/U/M/MLP |
-| Backbone + LM head + init/save | `models/mixer_seq_simple.py` | adapt |
-| **Silence block (all of it)** | *(none)* | **new `modules/silence.py`** |
-| Generation / inference cache | `utils/generation.py` | adapt for σ/φ state + silence loop |
-| Paired determinism (§17) | `utils/determinism.py` | reuse — helps the counterfactual rollout |
-| **Trainer (§17–20)** | *(none)* | **net-new** |
+**Cost note, revised by v6.** The v5.3 claim "the silence block needs no kernel — a tiny unroll
+vectorizable across (B,T)" died with the two-pass carry. v6's global block is a **true sequential
+recurrence over tokens** (C7) that steps the top layer's S alongside σ to serve its reads. It is
+implemented as a per-token loop under **exact-gradient segment checkpointing**
+(`config.silence_segment`, boundary carries only, pre-drawn `halt_u` uniforms so the Categorical
+j* reproduces under recompute) — memory-solved; the fused sequential kernel remains the
+wall-clock optimization (see `AUM-metal-plan.md`).
 
 ---
 
-## Target fork layout: `aum_ssm/`
+## As-built layout
 
 ```
 aum_ssm/
-  __init__.py                    ← exports AumLMHeadModel, AumConfig
+  __init__.py                  exports AumLMHeadModel, AumConfig (lazy, PEP 562 — importing the
+                               package never requires Triton/Metal)
   models/
-    config_aum.py                ← was config_mamba.py  (extend: d_sigma, J_max, λ's, β, δ, p_explore)
-    aum_lm.py                    ← was mixer_seq_simple.py  (12 evidence layers + silence block + LM head)
+    config_aum.py              defaults ARE the Tiny v6 reference (§13)
+    aum_lm.py                  backbone: 12 evidence layers -> the sequential global recurrence
+                               (segment-checkpointed) -> tied LM head; decode is one more step of
+                               the same recurrence
   modules/
-    evidence_layer.py            ← was block.py        (restructure to host A→U→M→MLP)
-    ground_attn.py               ← was mha.py          (A: local/windowed GQA + QK-norm)
-    unfold.py                    ← was mamba3.py        (U: resonant affine + write-gate + k/v norm)
-    modulate.py                  ← NEW                  (M: low-rank precision adapter)
-    silence.py                   ← NEW                  (the entire global silence block)
-    mlp.py                       ← kept (SwiGLU, minor reconcile to 3-matrix form)
-    ssd_reference.py             ← was ssd_minimal.py   (read-only crutch for kernel validation)
-  ops/triton/
-    unfold/                      ← was mamba3/ (SISO only)
-      siso_fwd.py  siso_bwd.py  siso_combined.py  siso_step.py
-      angle_dt.py  grouped_head_reduction.py  utils.py
-    layer_norm.py  layernorm_gated.py  k_activations.py  softplus.py
-  utils/
-    generation.py  hf.py  torch.py  determinism.py
-  training/                      ← NEW (none of this exists in the repo)
-    trainer.py  losses.py  schedule.py  counterfactual.py
-    tasks/                       ← synthetic §22 generators
-tests/                           ← adapt test_mamba3_siso + test_layernorm_gated; add AUM tests
-setup.py  pyproject.toml  README.md  LICENSE  ...
+    evidence_layer.py          A -> U -> M -> MLP around the prenorm residual stream; stashes the
+                               per-layer mu^l for the §10 scoped l1
+    ground_attn.py             A: windowed causal GQA (8/2 x 64, w=256) + QK-norm + KV-cache decode
+    unfold.py                  U: controller/projections/conv, backend dispatch, the rope_freqs
+                               ladder buffer, prefill state capture, decode step, and the
+                               write-pack the global recurrence consumes
+    modulate.py                M: low-rank U.diag(mu).V precision adapter
+    silence.py                 the entire global block (§5-§9): predict, precision, register,
+                               consistency (detached-mu), pressure (no H_t), loss-mixture halting
+                               (o_stack + one carried sigma^{j*}), J(pi) policy, ablations,
+                               Top-GRU baseline with the learned pool-query head
+    mlp.py                     SwiGLU (fused fc1 = [gate; up] — Appendix A matches this layout)
+    ssd_reference.py           the pure-PyTorch oracle (see Decisions #2)
+    norm.py                    RMSNorm (pure PyTorch; CPU/MPS/CUDA)
+  ops/
+    metal/unfold_metal.py      the metal backend: autograd.Function over the self-contained
+                               kernels (fwd mamba2, fused bwd mamba2_bwd + the dcumlog host
+                               identity, decode step aum_decode)
+    triton/                    layer_norm, layernorm_gated, k_activations, softplus + unfold/
+                               (SISO kernels, DEFERRED to NVIDIA bring-up; imports are lazy)
+  training/
+    losses.py                  the §10 objective incl. the §8 LM mixture; per-layer-only mu l1
+    counterfactual.py          fixed-K labels (§11) + the on-policy gauge
+    schedule.py                stages, the scale-free R^2 pressure gate, p_explore floor
+    trainer.py                 stage-aware step tying all of it together
+    tasks/synthetic.py         §14 families with held-out generators (disjoint value ranges)
+    diagnostics.py             corr(pi,b), Delta-sigma quartet, sigma-decode, sigma-relevance,
+                               phase-velocity stats
+    gate.py                    the §14/§15 harness: variants, controls, the phase-distance
+                               falsifier, evidence-survival probe, the MVP table checks
+  utils/                       generation (prefill+decode driver, transformers-optional), hf,
+                               determinism, torch helpers
+  distributed/                 kept (tensor-parallel helpers for the NVIDIA bring-up)
+kernels/metal/                 self-contained Metal build — no external kernel repo (see
+                               AUM-metal-plan.md)
+train/                         init.py (the ~78M checkpoint), tokenizer.py (SmolLM2, 49152),
+                               prepare_data.py (uint16 shards), muon.py (§13 optimizer recipe)
+tests/                         71 tests: oracle equivalences, rotation-ladder anti-aliasing,
+                               silence semantics, decode==forward (CPU+MPS, silence on/off),
+                               metal==reference (both head dims, fwd/bwd/decode), checkpointing
+                               exactness, trainer/gate machinery, optimizer partition
 ```
 
 ---
 
-## Keep / Adapt / Remove
+## What each kept file became (work map, closed out)
 
-### KEEP & ADAPT (the spine)
-- `models/mixer_seq_simple.py`, `models/config_mamba.py`
-- `modules/block.py`, `modules/mlp.py`, `modules/mamba3.py`, `modules/mha.py`
-- `ops/triton/mamba3/` — **SISO only**: `mamba3_siso_fwd/bwd/combined/step.py`,
-  `angle_dt.py`, `grouped_head_reduction.py`, `utils.py`
-- `ops/triton/layer_norm.py`, `ops/triton/layernorm_gated.py`,
-  `ops/triton/k_activations.py`, `ops/triton/softplus.py`
-- `utils/generation.py`, `utils/hf.py`, `utils/torch.py`, `utils/determinism.py`
-- `setup.py` (gut the CUDAExtension), `pyproject.toml`, packaging files,
-  `LICENSE` / `README` (rewrite)
-
-### KEEP AS REFERENCE (read-only crutches)
-- `modules/ssd_minimal.py` — readable pure-PyTorch SSD; template for a non-kernel
-  AUM-Ø reference forward to test kernels against.
-- `tests/ops/triton/test_mamba3_siso.py`, `tests/ops/triton/test_layernorm_gated.py`
-  — adapt into AUM kernel tests.
-
-### REMOVE
-```
-csrc/                                       # entire Mamba-1 CUDA tree → also gut CUDAExtension in setup.py
-mamba_ssm/modules/mamba_simple.py
-mamba_ssm/modules/mamba2.py
-mamba_ssm/modules/mamba2_simple.py
-mamba_ssm/ops/selective_scan_interface.py
-mamba_ssm/ops/triton/selective_state_update.py
-mamba_ssm/ops/triton/ssd_bmm.py  ssd_chunk_scan.py  ssd_chunk_state.py  ssd_combined.py  ssd_state_passing.py
-mamba_ssm/ops/tilelang/                     # all MIMO TileLang
-mamba_ssm/ops/cute/                         # all CuTe
-mamba_ssm/ops/triton/mamba3/mamba3_mimo_*.py   (fwd_varlen, bwd, bwd_varlen, rotary_step, mimo_utils)
-mamba_ssm/distributed/                      # defer scaling (re-add later if needed)
-evals/  benchmarks/                         # defer (first eval is §22 synthetic, not lm-harness)
-tests/ops/test_selective_scan.py  tests/ops/tilelang/  tests/ops/cute/  tests/modules/test_mamba3_varlen.py
-```
-
-**Dependency fallout (the payoff):** dropping CUDA + TileLang lets
-`pyproject.toml` lose `tilelang==0.1.8`, `apache-tvm-ffi`, `quack-kernels`, and
-`setup.py` becomes a pure-Python package (no `--no-build-isolation` dance).
-Runtime deps shrink to `torch, triton, einops, transformers` + optional
-`causal-conv1d`.
-
----
-
-## What each KEPT file becomes (work map)
-
-| File | Becomes | Effort |
+| Origin | Became | Notes |
 |---|---|---|
-| `mixer_seq_simple.py` → `aum_lm.py` | Backbone loop changes from "N identical blocks" to "12 evidence layers (residual stream of `h^M`) → **one silence block** → norm → tied LM head." Preserve `_init_weights` incl. the `_no_reinit` hooks (matters for `dt_bias`/`A_log` init), `from_pretrained`/`save_pretrained`. | Med |
-| `block.py` → `evidence_layer.py` | Restructure the single-mixer wrapper into the A→U→M ordering, where `h^{M,ℓ}=h^A+h^U+Δh` feeds the residual stream (§8). Top layer additionally emits `g_t`. | Med |
-| `mha.py` → `ground_attn.py` | Add **QK-norm** (`q_norm/k_norm[64]`) and **bounded/windowed causal** attention (SDPA mask or flash local window). Strip the generation rotary-cache complexity not needed. | Med |
-| `mamba3.py` → `unfold.py` | Fork the SISO path. Reuse `heavy_tail_activation` verbatim (= `f(x)`). **Add** write-gate `ρ_t=σ(r_t)` and L2-normalized `k̂,v̂` (B_norm/C_norm get close). Drop MIMO/tilelang/cute imports. | **High** |
-| `ops/triton/mamba3/*` (SISO) → `ops/triton/unfold/` | `angle_dt.py` reused ~as-is (it *is* the φ recurrence). `siso_fwd/bwd` need the write-gate term threaded through fwd + grad. One extraction job: pull the rotary-step helper from `mamba3_mimo_rotary_step.py` into `siso_step.py` so the deleted MIMO file isn't referenced. | **High** |
-| `layernorm_gated.py`, `layer_norm.py`, `k_activations.py`, `softplus.py` | Keep as-is (gated RMSNorm readout, fused add-norm, Triton helpers). | None |
-| `mlp.py` | Keep; optionally split fused `fc1` into `gate_proj/up_proj` to match Appendix-A param names. | Low |
-| `ssd_minimal.py` → `ssd_reference.py` | Golden pure-PyTorch reference: extend to the affine `S_t=α_t S_{t-1}+ρ_tτ_t(v̂⊗k̂)` form to unit-test the U kernel. | Low |
-| `utils/generation.py` | Adapt the inference-cache loop to carry `(φ_t, S_t, σ_t)` and run the per-token silence unroll at decode. | Med |
-| `utils/determinism.py` | Reuse directly for §17 **paired-determinism** counterfactual benefit (shared dropout masks / precision path). | None |
+| `mixer_seq_simple.py` | `models/aum_lm.py` | backbone loop + the v6 sequential global recurrence; `_init_weights` with `_no_reinit`/`_no_weight_decay` hooks preserved (they carry the `dt_bias`/`A_log` priors) |
+| `block.py` | `modules/evidence_layer.py` | A→U→M ordering, `h^M` into the residual stream, top layer exposes the silence ctx |
+| `mha.py` | `modules/ground_attn.py` | QK-norm + windowed causal + KV-cache decode |
+| `mamba3.py` | `modules/unfold.py` | Appendix-A layout; `heavy_tail` reused; write gate + k/v L2-norm added; backend dispatch; `rope_freqs` buffer |
+| `ssd_minimal.py` | `modules/ssd_reference.py` | grew into the full oracle |
+| `ops/triton/mamba3/` (SISO) | `ops/triton/unfold/` | parked for NVIDIA bring-up (needs the v6 ladder + unwrapped φ edits) |
+| `utils/generation.py` | kept | decode driver carries (φ, S, σ) via the inference cache; CUDA-graph path CUDA-only; transformers optional |
+| `utils/determinism.py` | kept | serves §11 paired determinism |
+| `mlp.py` | kept | fused `fc1`/`fc2`; Appendix A was regenerated to match the build rather than splitting the weights |
 
----
+Everything on the v5.3 REMOVE list was removed; `distributed/` was retained (deferred, not
+deleted). Dependency fallout as predicted: runtime deps are `torch, einops` (+ optional
+`transformers` for generation conveniences, `triton` only on NVIDIA).
 
-## Net-new (no file to fork — the bulk of the project)
+## Net-new (was the bulk of the project; all landed)
 
-- **`modules/silence.py`** — predict (`q^pred`, ĝ_t, e_t) · error-fed precision
-  (μ_t, ẽ_t) · register init + the `J_max=2` revision loop · consistency `E_t` ·
-  pressure `π_t` · soft halting `w_j` · condition output. All plain PyTorch, no
-  kernel (frozen `S_t`, tiny unroll). Maps 1:1 to `model.silence.*` in Appendix A.
-- **`modules/modulate.py`** — the M-phase low-rank `U·diag(μ)·V` precision adapter.
-- **`training/`** — the 4-stage schedule (§20) with the pred-loss gate, the
-  frozen-downstream benefit rollout (§17), the 7-term loss (§18),
-  forced-exploration (§19), and the σ-decode/σ-intervention diagnostics (§21).
-  **None of this exists** in the repo.
-- **`training/tasks/`** — the four §22 synthetic generators with controlled
-  evidence-age (branch reversal, binding swap, delayed correction, flat null).
+`modules/silence.py`, `modules/modulate.py`, the whole `training/` tree (schedule, losses,
+counterfactual, trainer, tasks, diagnostics, gate), the decode paths, the Metal backend and the
+self-contained `kernels/metal` build, and the `train/` pipeline front-end (init → tokenizer →
+data prep → Muon).
 
----
+## Gotchas that materialized (and their resolutions)
 
-## Known gotchas to handle during the port
+- **The two-pass σ-carry was a dead end.** v5.3's TBPTT-1 two-pass enabled chunk-parallel
+  silence reads but blended trained σ-dynamics with an approximation the spec never committed
+  to; v6 replaced it with the true sequential recurrence + segment checkpointing. Decode and
+  training now run literally the same per-token step — the strongest parity invariant in the
+  test suite.
+- **The predictive read's phase.** The v5.3-era read closure rotated the §5 predictive query at
+  φ_t; the spec says φ_{t−1}. Caught and fixed when the sequential loop made the read explicit.
+- **Lazy imports everywhere.** Eager package imports pulled Triton on machines without it;
+  `__getattr__` (PEP 562) at the package root and lazy backend imports keep `reference` usable
+  with zero GPU deps.
+- **Manifest drift.** Appendix A had accumulated seven divergences from the build (fused MLP,
+  silence module paths, LN biases, `conv1d.bias`, `condition_norm`, `pressure_out` as a bare
+  vector, approximate counts). Resolved by regenerating the appendix from the real state dict
+  and adding a programmatic 331-entry equality check.
 
-- **U-kernel modifications.** The U phase adds two things Mamba-3 SISO lacks: the
-  per-step sigmoid **write-gate** `ρ_t=σ(r_t)` and **L2-normalized** `k̂,v̂`.
-  `B_norm`/`C_norm` approximate the normalization; the write-gate is a real (small)
-  change to `siso_fwd/bwd`.
-- **Rotary-step extraction.** `mamba3.py` imports `apply_rotary_qk_inference_fwd`
-  from the (to-be-deleted) `mamba3_mimo_rotary_step.py`. Extract the SISO rotary
-  step into `siso_step.py` before deleting the MIMO files.
-- **Init hooks.** Preserve the `_no_reinit` / `_no_weight_decay` markers on
-  `dt_bias` and `A_log` — they encode the targeted Δ/A initialization the spec
-  relies on; a generic trainer that re-zeros biases would break them.
+## What remains
 
----
-
-## Scoping read
-
-The repo hands over a working, well-tested **evidence core** cheaply (especially
-the U-phase kernel), but the **silence block** and the **entire training/eval
-harness** are greenfield — and the harness is where the falsifiable claims in
-§22–23 actually get tested.
-
-## Suggested first execution step
-
-On a fresh branch: do the `git mv`/renames and deletions, rewrite imports, gut
-the CUDA build from `setup.py`, trim `pyproject.toml` deps, and stub out
-`silence.py` / `modulate.py` / `training/` with signatures from Appendix A so the
-package imports and compiles as a skeleton.
+- `train/train.py` — the pretraining loop (memmap shard loader, Muon + warmup/cosine, the §12
+  staged schedule, checkpoint/resume). Everything it needs already exists.
+- Triton/NVIDIA bring-up (`ops/triton/unfold/`): thread the write gate + k/v norms through
+  `siso_fwd/bwd`, switch `angle_dt` to unwrapped φ, apply the rotation ladder host-side exactly
+  as the Metal backend does.
+- The two remaining Metal kernels (fused bespoke U-phase, fused sequential global block) — see
+  `AUM-metal-plan.md`.
