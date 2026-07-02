@@ -2,13 +2,14 @@
 """Tokenize the AUM-Ø training corpus into packed uint16 token shards.
 
 Default mode reads the HuggingFace dataset list from ``train/datasets`` (one ``org/repo`` or
-``org/repo:config`` per line), STREAMS ``--samples-per-dataset`` (default 15 000) documents from
-each — streaming + the limit means only the requested samples are ever fetched, never a full
-dataset — tokenizes them with the AUM-Ø tokenizer (SmolLM2, vocab 49152 -> fits uint16),
-separates documents with the EOS id, and writes a flat token stream into fixed-size
-``<split>_NNNNN.bin`` shards + a ``manifest.json`` under ``train/data/`` (gitignored). Flat
-packing (no fixed context baked in) lets the training loader sample any ``seq_len`` window;
-``--seq-len`` here is only a manifest hint.
+``org/repo:config`` per line) and STREAMS documents from each until a per-dataset TOKEN budget
+is met: ``--chunks-per-dataset`` (default 15 000) training chunks of ``--seq-len`` (default
+4096) tokens, i.e. ~61M tokens per source regardless of how long its documents are. Streaming +
+the budget means only the needed samples are ever fetched, never a full dataset. Documents are
+tokenized with the AUM-Ø tokenizer (SmolLM2, vocab 49152 -> fits uint16), separated by the EOS
+id, and written as a flat token stream into fixed-size ``<split>_NNNNN.bin`` shards + a
+``manifest.json`` under ``train/data/`` (gitignored). Flat packing (no fixed context baked in)
+lets the training loader sample any ``seq_len`` window.
 
 The corpus is ENGLISH-ONLY by default, enforced twice: per-language repos must have their config
 pinned in the datasets file (``org/repo:eng_Latn`` — auto-resolution accepts a match against the
@@ -239,14 +240,22 @@ class ShardWriter:
         self._flush()
 
 
-def pack(doc_iter, encode_fn, eos_id, writer_for, batch_docs):
-    """Tokenize documents (batched), append EOS to each, and route them to a ShardWriter."""
-    idx_buf, txt_buf, n_docs = [], [], 0
+def pack(doc_iter, encode_fn, eos_id, writer_for, batch_docs, token_budget=0, progress=None):
+    """Tokenize documents (batched), append EOS to each, and route them to a ShardWriter.
+
+    token_budget > 0 stops consuming the iterator once that many tokens have been written for
+    THIS source (checked after each flush; a flush is also forced when the buffered text grows
+    large, so the overshoot stays small even for book-sized documents). progress, if given, is
+    called with the token count of each flush (e.g. tqdm.update).
+    """
+    idx_buf, txt_buf, buf_chars, n_docs, n_tokens = [], [], 0, 0, 0
+    max_buf_chars = 16_000_000                           # ~4M tokens per flush at ~4 chars/token
 
     def flush():
-        nonlocal n_docs
+        nonlocal n_docs, n_tokens, buf_chars
         if not txt_buf:
             return
+        before = n_tokens
         for i, ids in zip(idx_buf, encode_fn(txt_buf)):
             if not len(ids):
                 continue
@@ -256,14 +265,19 @@ def pack(doc_iter, encode_fn, eos_id, writer_for, batch_docs):
             a = np.append(a, eos_id)                     # EOS document separator
             writer_for(i).add(a.astype(DTYPE))
             n_docs += 1
-        idx_buf.clear(); txt_buf.clear()
+            n_tokens += a.size
+        idx_buf.clear(); txt_buf.clear(); buf_chars = 0
+        if progress is not None:
+            progress(n_tokens - before)
 
     for i, doc in enumerate(doc_iter):
-        idx_buf.append(i); txt_buf.append(doc)
-        if len(txt_buf) >= batch_docs:
+        idx_buf.append(i); txt_buf.append(doc); buf_chars += len(doc)
+        if len(txt_buf) >= batch_docs or buf_chars >= max_buf_chars:
             flush()
+            if token_budget and n_tokens >= token_budget:
+                break
     flush()
-    return n_docs
+    return n_docs, n_tokens
 
 
 def write_manifest(out_dir, tokenizer, vocab_size, eos_id, seq_len, source, writers):
@@ -323,21 +337,30 @@ def _finish(args, vocab_size, eos_id, writers, source, n_docs):
 def run(args):
     """Single-source mode: one HF dataset id (optionally `:config`) or a local path/glob."""
     vocab_size, eos_id, encode_fn, writers, writer_for = _setup(args)
+    budget = args.chunks_per_dataset * args.seq_len if args.chunks_per_dataset else 0
     docs = iter_documents(args.source, args.split, args.text_column, args.limit_docs,
                           language=args.language)
-    n_docs = pack(docs, encode_fn, eos_id, writer_for, args.batch_docs)
+    n_docs, _ = pack(docs, encode_fn, eos_id, writer_for, args.batch_docs, token_budget=budget)
     _finish(args, vocab_size, eos_id, writers, args.source, n_docs)
 
 
 def run_mix(args):
-    """Default mode: N samples from every HF dataset listed in --datasets-file, one shard
-    stream, with per-source document/token accounting in the manifest."""
+    """Default mode: a TOKEN budget from every HF dataset listed in --datasets-file — 15 000
+    seq_len-token training chunks each (docs are streamed until the budget is met or the stream
+    ends) — one shard stream, with per-source accounting in the manifest."""
     names = read_dataset_list(args.datasets_file)
     if not names:
         raise SystemExit(f"no datasets listed in {args.datasets_file}")
     vocab_size, eos_id, encode_fn, writers, writer_for = _setup(args)
-    print(f"corpus: {args.samples_per_dataset:,} samples from each of {len(names)} datasets "
+    budget = args.chunks_per_dataset * args.seq_len
+    print(f"corpus: {args.chunks_per_dataset:,} x {args.seq_len}-token chunks "
+          f"(~{budget / 1e6:.0f}M tokens) from each of {len(names)} datasets "
           f"({args.datasets_file}) -> {args.out_dir}")
+
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        tqdm = None
 
     per_source, n_total = {}, 0
     for si, (name, config) in enumerate(names):
@@ -346,14 +369,21 @@ def run_mix(args):
         before = {s: w.total for s, w in writers.items()}
         docs = iter_hf(name, args.split, args.text_column,
                        limit=args.samples_per_dataset, config=config, language=args.language)
-        n = pack((d for d in docs if d), encode_fn, eos_id, writer_for, args.batch_docs)
+        bar = tqdm(total=budget, unit="tok", unit_scale=True, desc=label,
+                   dynamic_ncols=True) if tqdm is not None else None
+        n, n_tok = pack((d for d in docs if d), encode_fn, eos_id, writer_for, args.batch_docs,
+                        token_budget=budget, progress=bar.update if bar else None)
+        if bar:
+            bar.close()
         tokens = {s: writers[s].total - before[s] for s in writers}
         per_source[label] = {"documents": n, "tokens": tokens}
         n_total += n
-        print(f"  {n:,} docs, {sum(tokens.values()):,} tokens")
+        short = f"  (stream ended below the {budget / 1e6:.0f}M-token budget)" \
+            if budget and n_tok < budget else ""
+        print(f"  {n:,} docs, {sum(tokens.values()):,} tokens{short}")
 
-    source = {"datasets_file": args.datasets_file, "samples_per_dataset": args.samples_per_dataset,
-              "per_source": per_source}
+    source = {"datasets_file": args.datasets_file, "chunks_per_dataset": args.chunks_per_dataset,
+              "token_budget_per_dataset": budget, "per_source": per_source}
     _finish(args, vocab_size, eos_id, writers, source, n_total)
 
 
@@ -372,7 +402,8 @@ def self_test():
     writers = {"train": ShardWriter(tmp, "train", shard_size=4000),
                "val": ShardWriter(tmp, "val", shard_size=4000)}
     every = 20
-    n = pack(iter(docs), enc, eos, lambda i: writers["val" if i % every == 0 else "train"], batch_docs=64)
+    n, n_tok = pack(iter(docs), enc, eos, lambda i: writers["val" if i % every == 0 else "train"],
+                    batch_docs=64)
     for w in writers.values():
         w.close()
     m = write_manifest(tmp, "self-test-fake", vocab, eos, seq_len=128, source="synthetic", writers=writers)
@@ -388,7 +419,13 @@ def self_test():
         win = stream[:128]
         assert win.size == 128 and win.dtype == DTYPE
     assert m["splits"]["train"]["total_tokens"] > m["splits"]["val"]["total_tokens"] > 0
-    assert n == 500
+    assert n == 500 and n_tok == sum(w.total for w in writers.values())
+
+    # token-budget stop: a small budget must halt the stream early (post-flush check)
+    wb = ShardWriter(tmp, "budget", shard_size=4000)
+    nb, tb = pack(iter(docs), enc, eos, lambda i: wb, batch_docs=8, token_budget=500)
+    wb.close()
+    assert nb < 500 and tb >= 500, (nb, tb)
     shutil.rmtree(tmp)
     print(f"self-test OK: packed {n} synthetic docs -> "
           f"train {writers['train'].total} + val {writers['val'].total} tokens, "
@@ -403,8 +440,12 @@ def main():
                          "omit to use --datasets-file")
     ap.add_argument("--datasets-file", default=os.path.join(here, "datasets"),
                     help="file listing HF dataset ids, one per line (default mode)")
-    ap.add_argument("--samples-per-dataset", type=int, default=15_000,
-                    help="documents streamed from EACH listed dataset")
+    ap.add_argument("--chunks-per-dataset", type=int, default=15_000,
+                    help="TOKEN budget per dataset, expressed in seq-len-token training chunks "
+                         "(default: 15000 x 4096 ~ 61M tokens each; 0 = no budget)")
+    ap.add_argument("--samples-per-dataset", type=int, default=0,
+                    help="optional additional DOCUMENT cap per dataset (0 = uncapped; the token "
+                         "budget is what stops a stream)")
     ap.add_argument("--out-dir", default=os.path.join(here, "data"))
     ap.add_argument("--split", default="train", help="HF split name (auto-falls back)")
     ap.add_argument("--text-column", default=None,
