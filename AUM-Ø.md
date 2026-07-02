@@ -36,7 +36,7 @@ Six structural corrections, found by re-deriving the mechanics rather than revie
 
 **(5) The parallelism claim is stated truthfully.** The affine invariant makes the *evidence core* scan-parallel. The global block is a sequential nonlinear recurrence over tokens ($\sigma_{t-1}\to e_t \to \mu_t \to \sigma_t^0$) and does not scan. Its state is small ($d_\sigma{=}128$), so at reference scale it is a fused sequential kernel with negligible cost — but the document no longer advertises full-model scannability it does not have. (§2, §12)
 
-**(6) Two evaluation fixes.** The Top-GRU baseline now keeps a pooled-evidence prediction head, so the ablated factor is *precisely* the silent evidence read (not prediction quality). Full-vocabulary predictive entropy is removed from the base pressure features — it put a 49k-softmax on the critical path twice per token — and demoted to a registered optional-feature ablation. (§9, §15)
+**(6) Two evaluation fixes.** The Top-GRU baseline now keeps a pooled-evidence prediction head, so the ablated factor is *precisely* the silent evidence read (not prediction quality). Full-vocabulary predictive entropy is removed from the base pressure features — it put a 49k-softmax on the critical path twice per token — and demoted to a registered optional-feature ablation. (§9, §14)
 
 Also folded in: the per-head silent read is defined (§8); an evidence-survival probe separates decay from addressing on old-evidence tasks (§16); a σ-relevance check guards against the prediction head learning to ignore the register (§16); the pressure-training gate is scale-free (§12); and the training recipe lives in the spec (§13, Appendix B).
 
@@ -58,7 +58,7 @@ These forks are settled. They are the architecture's rationale, recorded so futu
 
 **C6 — Phase-locked silent read with a frequency ladder.** The silent read uses the current phase under the multi-frequency rotation, giving graded recency-selective retrieval and the registered differential prediction of §14. Temporal search is excluded from v6 by design.
 
-**C7 — Honest parallelism.** The evidence core trains as a parallel scan. The global block is a sequential nonlinear token recurrence with $O(d_\sigma+d)$ state, implemented as a fused sequential kernel; at reference scale its wall-clock cost is small, and at larger scales it is a known, stated bottleneck — not a surprise.
+**C7 — Honest parallelism.** The evidence core trains as a parallel scan. The global block is a sequential nonlinear token recurrence whose working state is $O(d_\sigma + d + H_U d_h^2)$ per batch row — the register, the grounded summary, and the top layer's evidence state $S$, which the block must step alongside $\sigma$ to serve its reads (≈ 66 K floats at Tiny scale; SRAM-resident for a fused kernel, but not "small" and never claimed scannable). Training memory is handled by exact-gradient segment checkpointing: only segment-boundary carries $(S, \sigma)$ are stored and in-segment states are recomputed on backward, so the recurrence trains at full sequence length without materializing the per-token $S$ chain (§12). At reference scale the wall-clock cost is small; at larger scales it is a known, stated bottleneck — not a surprise.
 
 **C8 — Benefit-gated silence with a policy-independent label.** Pressure is trained to predict measured counterfactual benefit on a fixed calibrated scale, with the label computed at fixed depth on an exploration subset and downstream silence frozen in both branches. Silence is allocated by learned usefulness, not by uncertainty.
 
@@ -239,9 +239,11 @@ $$
 **Halting: mix losses, never states.** At each step a halting probability
 
 $$
-p_j=H_\theta\big(\sigma_t^j,\ g_t,\ \pi_t,\ \mathcal{E}_t(\sigma_t^j)\big),\qquad p_{J_{\max}}\equiv 1,\qquad
+p_j=H_\theta\big(\sigma_t^j,\ \pi_t,\ \mathcal{E}_t(\sigma_t^j)\big),\qquad p_{J_{\max}}\equiv 1,\qquad
 w_j=p_j\prod_{i<j}(1-p_i),\qquad \textstyle\sum_j w_j=1
 $$
+
+$H_\theta$ deliberately does **not** consume raw $g_t$: the grounding already reaches the decision through all three of its inputs ($\sigma^j$ is initialized and revised from $g_t$; $\mathcal{E}$'s $d_G$ term compares against $g_t$; $\pi$'s features include $g_t$), and the tiny head keeps halting driven by hypothesis-quality signals rather than re-derived evidence.
 
 Each candidate register produces its **own coherent output**:
 
@@ -257,7 +259,7 @@ $$
 \qquad \mathbb{E}[J_t]=\sum_j j\,w_j
 $$
 
-and the register **carried into $t{+}1$ is a single candidate**, $\sigma_t=\sigma_t^{j^*}$: during training $j^*\!\sim\!\operatorname{Categorical}(w)$ (the halting head receives gradient through the loss mixture, so no straight-through estimator is needed); at inference $j^*=\min\{j:p_j\ge\delta\}$ or $j^*=\mathcal{J}(\pi_t)$. No convex blend of hypotheses ever exists in the state: every $\sigma^j$ the probe sees, the intervention edits, or the next token inherits is a coherent interpretation. This is what makes the σ-diagnostics of §16 mean what they claim to mean, and it removes the soft-train/hard-infer mismatch. With $J_{\max}=2$, the cost is at most three output-head evaluations on tokens where silence fires — cheap at reference scale and payable only where $\pi$ spends it.
+and the register **carried into $t{+}1$ is a single candidate**, $\sigma_t=\sigma_t^{j^*}$: during training $j^*\!\sim\!\operatorname{Categorical}(w)$ (the halting head receives gradient through the loss mixture, so no straight-through estimator is needed); at inference $j^*=\min\{j:p_j\ge\delta\}$, or under the stage-4 pressure-triggered policy $j^*=\mathcal{J}(\pi_t)$ — run to depth $K$ only when $\pi_t$ clears a threshold, else $j^*=0$ (§12). No convex blend of hypotheses ever exists in the state: every $\sigma^j$ the probe sees, the intervention edits, or the next token inherits is a coherent interpretation. This is what makes the σ-diagnostics of §16 mean what they claim to mean, and it removes the soft-train/hard-infer mismatch. With $J_{\max}=2$, the cost is at most three output-head evaluations on tokens where silence fires — cheap at reference scale and payable only where $\pi$ spends it.
 
 ---
 
@@ -271,13 +273,13 @@ $$
 r_t^0=S_tR(\phi_t)W_q^\sigma\sigma_t^0
 $$
 
-Summary $\zeta_t=\operatorname{Pool}_\zeta(g_t,\sigma_t^0,\tilde e_t,\mu_t)\in\mathbb{R}^d$; with the top layer's pressure drive $s_t$:
+Summary $\zeta_t = g_t$ (parameter-free — the manifest carries no pooling weights; $\sigma^0$, $\tilde e$, and $\mu$ reach the pressure decision through $\Delta^{\sigma R}$, $\Delta^e$, and the halting head's $\mathcal{E}$); with the top layer's pressure drive $s_t$:
 
 $$
 \pi_t=\operatorname{softplus}\!\Big(w_\pi^\top\tanh\!\big(W_\pi[\,\zeta_t,\ \Delta_t^{e},\ \Delta_t^{\sigma R},\ s_t\,]\big)\Big)
 $$
 
-Full predictive entropy $H_t$ is **not** a base feature: it costs a 49k softmax before every halting decision. A registered week-one ablation (§15) tests whether adding an entropy signal (true $H_t$, or a small proxy head regressed onto it) improves $\operatorname{corr}(\pi,b)$ enough to pay for itself; the default assumption is that $\Delta^e$ and $\Delta^{\sigma R}$ carry the signal.
+Full predictive entropy $H_t$ is **not** a base feature: it costs a 49k softmax before every halting decision. A registered week-one ablation (§14) tests whether adding an entropy signal (true $H_t$, or a small proxy head regressed onto it) improves $\operatorname{corr}(\pi,b)$ enough to pay for itself; the default assumption is that $\Delta^e$ and $\Delta^{\sigma R}$ carry the signal.
 
 ---
 
@@ -307,7 +309,7 @@ $$
 \ell_0=-\log p^{(0)}(x_{t+1}),\qquad \ell_K=-\log p^{(K)}(x_{t+1}),\qquad b_t=\ell_0-\ell_K
 $$
 
-Short-horizon variant for tasks whose payoff is downstream: $b_t^{(K,H)}=\sum_{r=1}^{H}\omega_r(\ell_{0,t+r}-\ell_{K,t+r})$, with **downstream silence frozen off in both branches** over the window — the label is the marginal causal value of the single decision at $t$, uncontaminated by cascades.
+Short-horizon variant for tasks whose payoff is downstream: $b_t^{(K,H)}=\sum_{r=1}^{H}\omega_r(\ell_{0,t+r}-\ell_{K,t+r})$, with $\omega_r$ fixed before training (uniform or exponentially decaying; never learned — the label scale must stay interpretable) and **downstream silence frozen off in both branches** over the window — the label is the marginal causal value of the single decision at $t$, uncontaminated by cascades.
 
 > **Policy-independent label (committed).** The with-silence branch always runs **fixed depth $K$** (the forced-exploration depth), never the live halting policy. The halting head consumes $\pi_t$; if the label were computed under the policy, $\pi$ would be regressed onto a target that moves with $\pi$. Fixing $K$ makes the target a property of the *mechanism*, not the *policy*. The residual policy-gap is measured, not ignored: after training, report $\operatorname{corr}(\pi_t,\ b_t^{\text{on-policy}})$ beside the fixed-$K$ correlation.
 
@@ -338,7 +340,7 @@ $$
 
 **Stage 4 — event-triggered inference:** hard or pressure-triggered halting; silence fires only at high expected benefit.
 
-**Parallelism profile (C7, stated once, honestly).** Stage-1 training of the core is a chunked parallel scan. From Stage 2 on, the global block introduces a strict sequential dependency across tokens ($\sigma_{t-1}\!\to\!\hat g_t\!\to\!e_t\!\to\!\mu_t\!\to\!\sigma_t^0\!\to\!\sigma_t$). Its state is $[B,d_\sigma{+}d]$-small; implement it as one fused sequential kernel over the sequence after the core's scan completes. At $d_\sigma{=}128$, seq 2048, this is minutes-per-epoch overhead at Tiny scale — acceptable, measured, and *declared*, rather than an undisclosed violation of a scannability claim.
+**Parallelism profile (C7, stated once, honestly).** Stage-1 training of the core is a chunked parallel scan. From Stage 2 on, the global block introduces a strict sequential dependency across tokens ($\sigma_{t-1}\!\to\!\hat g_t\!\to\!e_t\!\to\!\mu_t\!\to\!\sigma_t^0\!\to\!\sigma_t$). Its working state is $[B,\ d_\sigma + d + H_U d_h^2]$ — the block steps the top layer's evidence state $S$ alongside $\sigma$ to serve the predictive read ($S_{t-1}$ at $\phi_{t-1}$) and the silent read ($S_t$ at $\phi_t$) from the per-token write tensors the core scan already produced. **Training memory:** the token loop runs under exact-gradient segment checkpointing (reference segment 64) — only segment-boundary carries $(S,\sigma)$ are stored, in-segment states are recomputed on backward, and the Categorical draw for $j^*$ uses pre-drawn uniforms so recomputation reproduces the same sample; gradients are exact, so seq-2048 training never materializes the per-token $S$ chain. **Wall-clock:** implement the loop as one fused sequential kernel after the core's scan completes; at $d_\sigma{=}128$, seq 2048, this is minutes-per-epoch overhead at Tiny scale — acceptable, measured, and *declared*, rather than an undisclosed violation of a scannability claim.
 
 ---
 
@@ -357,7 +359,7 @@ $$
 
 **Data.** ~20 B tokens: filtered web/edu mix, ~10 % code, and **5 % synthetic structured tasks** generated programmatically with known latent hypotheses (branch reversal, binding swap, delayed correction, flat null — §14), with *held-out generators* so probe and calibration numbers are measured on unseen task structure. The synthetic fraction is not optional garnish; the σ-decode probe and the recency falsifier are computed on it.
 
-**Optimization.** AdamW $\beta{=}(0.9,0.95)$, wd 0.1 (none on norms/`A_log`/`dt_bias`/$D$/biases); peak LR $6\times10^{-4}$, 1500-step warmup, cosine to 10 %; grad-clip 1.0; batch ≈ 0.5 M tokens; BF16 with FP32 optimizer states, `A_log`, and state-norm accumulators; init $\mathcal{N}(0,0.02)$ with `A_log`, `dt_bias` set for $\alpha\approx0.99$, $\tau\approx1$ at init. Stage split over the 20 B: 60 / 20 / 15 / 5 %. Loss weights (reference): $\lambda_P{=}0.5$, $\lambda_E{=}0.1$, $\lambda_\mu{=}10^{-3}$, $\lambda_S{=}10^{-4}$, $\lambda_C: 0\!\to\!5\times10^{-3}$ ramped in Stage 3; $\beta{=}0.02$, $\eta_{R^2}{=}0.15$, $K{\in}\{1,2\}$, $p_{\text{explore}}:0.2\!\to\!0.02$ floor, $\delta{=}0.5$.
+**Optimization.** Muon (momentum 0.95, 5 Newton–Schulz steps, LR 0.02 in spectral-norm units, wd 0.1) on the 2D hidden weight matrices; AdamW $\beta{=}(0.9,0.95)$, peak LR $6\times10^{-4}$, no weight decay, for the tied embedding/classifier and all scalars (norms, gains, `A_log`, `dt_bias`, $D$, biases, the depthwise conv). Both groups share a 1500-step warmup and cosine to 10 %; grad-clip 1.0; batch ≈ 0.5 M tokens; BF16 with FP32 optimizer states, `A_log`, and state-norm accumulators; init $\mathcal{N}(0,0.02)$ with `A_log`, `dt_bias` set for $\alpha\approx0.99$, $\tau\approx1$ at init. Stage split over the 20 B: 60 / 20 / 15 / 5 %. Loss weights (reference): $\lambda_P{=}0.5$, $\lambda_E{=}0.1$, $\lambda_\mu{=}10^{-3}$, $\lambda_S{=}10^{-4}$, $\lambda_C: 0\!\to\!5\times10^{-3}$ ramped in Stage 3; $\beta{=}0.02$, $\eta_{R^2}{=}0.15$, $K{\in}\{1,2\}$, $p_{\text{explore}}:0.2\!\to\!0.02$ floor, $\delta{=}0.5$.
 
 Wall-clock at 8×H100, ~40 % MFU: order of a day, dominated by the core scan; the global block's sequential kernel and the ≤3 output-head passes on silence-fired tokens are second-order.
 
@@ -381,7 +383,7 @@ with token-age as the secondary covariate. Under the frequency ladder, retrieval
 
 **Named baselines** (parameter- and compute-matched):
 **Evidence-core** (~76.5 M): silence ablated, $g_t$-only output — the capacity floor.
-**Top-GRU adapter** (~1.8 M top block): identical access to $g_t,e_t,\mu_t$, identical halting machinery, **no evidence read** — $\sigma^{j+1}=\operatorname{GRU}(\sigma^j,[g_t,e_t,\mu_t])$ — and, critically, a **pooled-evidence prediction head** $\hat g_t = W_P\operatorname{LN}(W_S\operatorname{Pool}(S_{t-1})+W_\sigma\sigma_{t-1}+W_\phi\Phi(\phi_{t-1}))$, so its $e_t$ is not handicapped and the single ablated factor is the silent read of $S$ through $\sigma$. If full AUM-Ø does not beat this per compute, the evidence-read mechanism has not earned its complexity.
+**Top-GRU adapter** (~1.8 M top block): identical access to $g_t,e_t,\mu_t$, identical halting machinery, **no evidence read** — $\sigma^{j+1}=\operatorname{GRU}(\sigma^j,[g_t,e_t,\mu_t])$ — and, critically, a **pooled-evidence prediction head** $\hat g_t = W_P\operatorname{LN}(W_S\operatorname{Pool}(S_{t-1})+W_\sigma\sigma_{t-1}+W_\phi\Phi(\phi_{t-1}))$, with $\operatorname{Pool}(S)=S\,q_{\text{pool}}$ per head — a **learned static query** ($q_{\text{pool}}\in\mathbb{R}^{d}$, phase-free, $\sigma$-free; mean pooling is its uniform special case). The pool is deliberately the strongest evidence summary available *without* hypothesis- or phase-conditioned addressing (C9: the baseline is generous to the null), so its $e_t$ is not handicapped and the single ablated factor is the silent read of $S$ through $\sigma$. If full AUM-Ø does not beat this per compute, the evidence-read mechanism has not earned its complexity.
 
 **Mechanism-isolating controls** (on the full model): **no-op silence** (loop runs, register frozen at $\sigma^0$ — is it *revision* or compute?); **no-read silence** ($r^j{=}0$ — is *reading $S$* necessary?); **phase-scrambled silence** ($q^j_\sigma=R(\phi_t+\epsilon_t)W_q^\sigma\sigma^j$, $\epsilon_t$ shuffled across tokens — is *phase-aligned* reading, not $\alpha$-decay, the cause?); **random silence** (matched $\mathbb{E}[J]$, random tokens — does *allocation* matter?).
 
@@ -463,14 +465,15 @@ $$
 
 ---
 
-## Appendix A. Physical Layout — AUM-Ø-Tiny v6 (≈ 78 M)
+## Appendix A. Physical Layout — AUM-Ø-Tiny v6 (78,255,136 params)
 
-Format: `name,[shape],dtype`. Evidence layers `[0-11]`; silence subsystem a single top-level block. The ladder $R(\phi)$ and $\Phi$ frequencies are fixed buffers, not parameters.
+Format: `name,[shape],dtype` — these are the reference implementation's **actual state-dict keys** (the `backbone.` prefix written as `model.`; `lm_head.weight` is tied to the embedding and stored once), so the manifest is checkable against a checkpoint with one line of code. Evidence layers `[0-11]`; silence subsystem a single top-level block. Exact totals: **78,255,136** parameters; silence block **1,769,408**; silence-ablated evidence core **76,485,728**. The ladder buffer `rope_freqs` is fixed, non-trainable, and excluded from the counts.
 
 ```
-model.embed_tokens.weight,[49152,512],BF16
+model.embedding.weight,[49152,512],BF16                  # tied to lm_head.weight
 
 # ---- A: bounded local GQA grounding (all evidence layers) ----
+model.layers.[0-11].input_layernorm.weight,[512],BF16
 model.layers.[0-11].ground_attn.q_proj.weight,[512,512],BF16
 model.layers.[0-11].ground_attn.k_proj.weight,[128,512],BF16
 model.layers.[0-11].ground_attn.v_proj.weight,[128,512],BF16
@@ -479,29 +482,28 @@ model.layers.[0-11].ground_attn.q_norm.weight,[64],BF16
 model.layers.[0-11].ground_attn.k_norm.weight,[64],BF16
 
 # ---- U: resonant AFFINE evidence recurrence + output gate (all layers) ----
+model.layers.[0-11].unfold.dt_bias,[4],BF16
+model.layers.[0-11].unfold.A_log,[4],F32
+model.layers.[0-11].unfold.D,[512],BF16
+model.layers.[0-11].unfold.rope_freqs,[64],F32           # BUFFER: the fixed geometric ladder
 model.layers.[0-11].unfold.controller.weight,[128,512],BF16
 model.layers.[0-11].unfold.in_proj_qkv.weight,[1536,512],BF16
 model.layers.[0-11].unfold.in_proj_z.weight,[512,512],BF16
 model.layers.[0-11].unfold.in_proj_dyn.weight,[49,128],BF16
 model.layers.[0-11].unfold.conv1d.weight,[1536,1,4],BF16
-model.layers.[0-11].unfold.A_log,[4],F32
-model.layers.[0-11].unfold.dt_bias,[4],BF16
-model.layers.[0-11].unfold.D,[512],BF16
+model.layers.[0-11].unfold.conv1d.bias,[1536],BF16
 model.layers.[0-11].unfold.norm.weight,[128],F32
 model.layers.[0-11].unfold.out_proj.weight,[512,512],BF16
-model.layers.[0-11].unfold.rope_freqs,[64],F32          # buffer, non-trainable ladder
 
 # ---- M: error-free precision (all evidence layers) ----
 model.layers.[0-11].modulate.in_proj_mu.weight,[32,1056],BF16
-model.layers.[0-11].modulate.up.weight,[512,32],BF16
 model.layers.[0-11].modulate.down.weight,[32,512],BF16
+model.layers.[0-11].modulate.up.weight,[512,32],BF16
 
-# ---- MLP + norms (all evidence layers) ----
-model.layers.[0-11].mlp.gate_proj.weight,[1408,512],BF16
-model.layers.[0-11].mlp.up_proj.weight,[1408,512],BF16
-model.layers.[0-11].mlp.down_proj.weight,[512,1408],BF16
-model.layers.[0-11].input_layernorm.weight,[512],BF16
+# ---- MLP + post-norm (all evidence layers; fc1 fuses [gate; up]) ----
 model.layers.[0-11].post_attention_layernorm.weight,[512],BF16
+model.layers.[0-11].mlp.fc1.weight,[2816,512],BF16       # SwiGLU: rows 0-1407 gate, 1408-2815 up
+model.layers.[0-11].mlp.fc2.weight,[512,1408],BF16       # down projection
 
 # ---- Global block: hypothesis-conditioned predictive grounding ----
 model.silence.predict.query_proj.weight,[512,128],BF16   # W_q^pred: sigma -> state-key
@@ -509,18 +511,20 @@ model.silence.predict.read_proj.weight,[512,512],BF16    # W_R
 model.silence.predict.hyp_proj.weight,[512,128],BF16     # W_sigma^P
 model.silence.predict.phase_proj.weight,[512,32],BF16    # W_phi
 model.silence.predict.out_proj.weight,[512,512],BF16     # W_P
-model.silence.predict.norm.weight,[512],BF16
+model.silence.predict.norm.weight,[512],BF16             # LayerNorm (with bias)
+model.silence.predict.norm.bias,[512],BF16
 
 # ---- Global block: error-fed precision (precision only; no adapter, no L1) ----
 model.silence.modulate.err_proj.weight,[32,512],BF16     # W_e
 model.silence.modulate.in_proj_mu.weight,[32,1184],BF16  # W_mu
 
 # ---- Global block: register + revision ----
-model.silence.init_proj.weight,[128,704],BF16
-model.silence.read_proj.weight,[512,128],BF16            # W_q^sigma (split per U-head)
-model.silence.update_gate.weight,[128,1216],BF16
-model.silence.update_cand.weight,[128,1216],BF16
-model.silence.norm.weight,[128],BF16
+model.silence.register.init_proj.weight,[128,704],BF16   # W_sigma0
+model.silence.register.read_proj.weight,[512,128],BF16   # W_q^sigma (split per U-head)
+model.silence.register.update_gate.weight,[128,1216],BF16
+model.silence.register.update_cand.weight,[128,1216],BF16
+model.silence.register.norm.weight,[128],BF16            # shared by init (LN) + revise
+model.silence.register.norm.bias,[128],BF16
 
 # ---- Global block: consistency ----
 model.silence.consistency.P_G.weight,[128,512],BF16
@@ -531,19 +535,21 @@ model.silence.consistency.prec_G.weight,[128,32],BF16
 model.silence.consistency.prec_R.weight,[128,32],BF16
 
 # ---- Global block: pressure + halting ----
-model.silence.pressure_in.weight,[128,515],BF16          # zeta(512)+d_e+d_sigmaR+s_t
-model.silence.pressure_out.weight,[128],BF16
-model.silence.halt_1.weight,[64,130],BF16                # sigma(128)+pi+E
-model.silence.halt_2.weight,[1,64],BF16
+model.silence.pressure_halt.pressure_in.weight,[128,515],BF16  # zeta(512)+d_e+d_sigmaR+s_t
+model.silence.pressure_halt.pressure_out,[128],BF16      # w_pi (bare vector parameter)
+model.silence.pressure_halt.halt_1.weight,[64,130],BF16  # sigma(128)+pi+E
+model.silence.pressure_halt.halt_2.weight,[1,64],BF16
 
 # ---- Global block: output / condition projection ----
 model.silence.condition_out.weight,[512,512],BF16        # W_o
-model.silence.condition_out.sigma_proj.weight,[512,128],BF16  # W_sigma
+model.silence.condition_out_sigma.weight,[512,128],BF16  # W_sigma
+model.silence.condition_norm.weight,[512],BF16
+model.silence.condition_norm.bias,[512],BF16
 
-model.norm.weight,[512],BF16
+model.norm_f.weight,[512],BF16
 ```
 
-**Shape notes.** `rope_freqs,[64]` is the per-head geometric ladder ($B{=}64$ blocks of 2 over $d_h{=}128$), fixed. `in_proj_z` is the U output gate ($\operatorname{silu}(z)\odot\cdot$). `in_proj_dyn,[49,128]` packs $(\bar\tau,\bar\lambda,r,\theta)$ per U-head $(4{\times}4)$ + $m(32)$ + $s(1)$. `read_proj` output (512) splits into 4 head-slices of 128, each rotated by that head's ladder at that head's $\phi$. `init_proj` in: $704=\sigma(128){+}g(512){+}\tilde e(32){+}\mu(32)$; `update_*` in: $1216=704{+}r^j(512)$; `modulate.in_proj_mu` in: $1184=g(512){+}e(512){+}\sigma(128){+}m(32)$; `pressure_in` in: $515=\zeta(512){+}\Delta^e{+}\Delta^{\sigma R}{+}s_t$ (add 1 if the optional entropy feature is enabled for its ablation); `halt_1` in: $130=\sigma(128){+}\pi{+}\mathcal{E}$. Embeddings tied to the classifier. Loss-mixture halting adds no parameters — only up to $J_{\max}{+}1$ output-head evaluations on silence-fired tokens.
+**Shape notes.** `rope_freqs,[64]` is the per-head geometric ladder ($B{=}64$ blocks of 2 over $d_h{=}128$), fixed. `in_proj_z` is the U output gate ($\operatorname{silu}(z)\odot\cdot$). `in_proj_dyn,[49,128]` packs $(\bar\tau,\bar\lambda,r,\theta)$ per U-head $(4{\times}4)$ + $m(32)$ + $s(1)$. `register.read_proj` output (512) splits into 4 head-slices of 128, each rotated by that head's ladder at that head's $\phi$. `register.init_proj` in: $704=\sigma(128){+}g(512){+}\tilde e(32){+}\mu(32)$; `register.update_*` in: $1216=704{+}r^j(512)$; `modulate.in_proj_mu` in: $1184=g(512){+}e(512){+}\sigma(128){+}m(32)$; `pressure_in` in: $515=\zeta(512){+}\Delta^e{+}\Delta^{\sigma R}{+}s_t$ (516 when the optional entropy feature is enabled for its ablation); `halt_1` in: $130=\sigma(128){+}\pi{+}\mathcal{E}$ (no raw $g$ — see §8). Embeddings tied to the classifier. Loss-mixture halting adds no parameters — only up to $J_{\max}{+}1$ output-head evaluations on silence-fired tokens. The Top-GRU baseline additionally carries `silence.gru.*`, `silence.pool_proj.weight,[512,512]`, and `silence.pool_query,[512]` (§14) — baseline-only tensors, not part of this reference manifest. In the BF16 training configuration, `A_log`, `unfold.norm.weight`, and `rope_freqs` stay F32.
 
 ## Appendix B. Run Checklist
 

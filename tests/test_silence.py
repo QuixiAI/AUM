@@ -19,8 +19,7 @@ def _stub_read(d_model):
     W = torch.randn(d_model, d_model)
 
     def read(q, phi=None, exclude_current=False, pooled=False):
-        if pooled:                       # query-free Pool(S) stand-in for the Top-GRU baseline
-            return W.sum(0).expand(2, 6, d_model)
+        # pooled=True is the §14 phase-free read Pool(S) = S q_pool (query given, no rotation)
         return q @ W
     return read
 
@@ -150,12 +149,15 @@ def test_entropy_feature_flag():
 
 
 def test_top_gru_pooled_prediction_head():
-    # §14: the Top-GRU baseline predicts from Pool(S_{t-1}) — no sigma-conditioned read anywhere,
-    # but g_hat is real (not handicapped) so the ablated factor is precisely the silent read.
+    # §14: the Top-GRU baseline predicts from Pool(S_{t-1}) = S q_pool (a LEARNED static,
+    # phase-free query) — no sigma-conditioned read anywhere, but g_hat is real (not handicapped)
+    # so the ablated factor is precisely the silent read.
     blk, g, o, aux = _run(top_gru=True)
     assert torch.isfinite(aux.g_hat).all()
     assert all(float(r.abs().max()) == 0.0 for r in aux.r_traj)   # no S read in the loop
     assert o.shape == g.shape
+    (aux.g_hat - aux.g.detach()).pow(2).mean().backward()          # the head trains its pool query
+    assert blk.pool_query.grad is not None and torch.isfinite(blk.pool_query.grad).all()
 
 
 if __name__ == "__main__":

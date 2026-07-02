@@ -151,14 +151,19 @@ class SilenceBlock(nn.Module):
             #          and the single ablated factor is the silent read of S through sigma.
             self.gru = nn.GRUCell(d_model + 2 * d_mu, d_sigma, **kw)
             self.pool_proj = nn.Linear(d_model, d_model, bias=False, **kw)        # W_S
+            # Pool(S) = S q_pool with a LEARNED static per-head query — phase-free and sigma-free,
+            # the strongest evidence summary available without the ablated addressing (C9: the
+            # baseline is generous to the null). Mean pooling is its uniform-query special case.
+            self.pool_query = nn.Parameter(torch.randn(d_model, **kw) / d_model ** 0.5)
 
     # ---- §5-§9 helpers (batch-agnostic; operate over any leading (B,L) dims) ----
     def _predict(self, g_t, sigma_prev, phi_prev, evidence_read, no_read):
         if self.top_gru:
-            # §14 Top-GRU baseline: pooled-evidence prediction head — Pool(S_{t-1}) replaces the
-            # sigma-conditioned read, so e_t is not handicapped and the ablated factor is
-            # precisely the silent read of S through sigma. (Pool = mean over the key axis.)
-            pooled = evidence_read(None, phi_prev, exclude_current=True, pooled=True)
+            # §14 Top-GRU baseline: pooled-evidence prediction head — Pool(S_{t-1}) = S q_pool
+            # replaces the sigma-conditioned read, so e_t is not handicapped and the ablated
+            # factor is precisely the silent read of S through sigma.
+            q = self.pool_query.expand(*sigma_prev.shape[:-1], -1)
+            pooled = evidence_read(q, phi_prev, exclude_current=True, pooled=True)
             pre = (self.pool_proj(pooled) + self.predict.hyp_proj(sigma_prev)
                    + self.predict.phase_proj(_phase_embed(phi_prev, self.d_phase)))
         else:
@@ -192,7 +197,7 @@ class SilenceBlock(nn.Module):
 
     def forward(self, g_t, evidence_read, phi_t, phi_prev=None, sigma_prev=None,
                 m_t=None, s_t=None, logits_fn=None, ablation: Optional[str] = None,
-                forced_depth: Optional[int] = None):
+                forced_depth: Optional[int] = None, halt_u: Optional[torch.Tensor] = None):
         """Revise the hypothesis register and emit the conditioned output o_t (§5-§9).
 
         g_t: (B,L,d_model). evidence_read(query_512, phi, exclude_current, pooled) -> (B,L,d_model).
@@ -296,8 +301,14 @@ class SilenceBlock(nn.Module):
             j_star = torch.full(lead, int(forced_depth), device=w.device, dtype=torch.long)
             w = F.one_hot(j_star, self.j_max + 1).to(w.dtype)
         elif self.training:                                     # j* ~ Categorical(w); gradient flows
-            j_star = torch.multinomial(                         # through the loss mixture, not j*
-                w.reshape(-1, self.j_max + 1), 1).reshape(lead)
+            if halt_u is not None:                              # through the loss mixture, not j*.
+                # externally-drawn uniform -> inverse-CDF sample: deterministic given halt_u, so
+                # gradient-checkpoint recompute reproduces the same j* exactly.
+                hit = (w.cumsum(-1) >= halt_u.unsqueeze(-1)).to(torch.uint8)
+                j_star = hit.argmax(dim=-1)
+            else:
+                j_star = torch.multinomial(
+                    w.reshape(-1, self.j_max + 1), 1).reshape(lead)
         else:                                                   # inference: j* = min{j: p_j >= delta}
             hit = (torch.stack(ps, dim=-1) >= self.halt_delta).to(torch.uint8)
             j_star = hit.argmax(dim=-1)                         # first j whose p clears delta

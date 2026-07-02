@@ -45,6 +45,8 @@ class AumConfig:
     j_max: int = 2                    # forced final halt depth (§8)
     kappa: float = 0.1                # consistency register-inertia weight (§7)
     entropy_feature: bool = False     # optional H_t pressure feature — the registered §14 ablation
+    silence_segment: int = 64         # C7: checkpoint the global recurrence every N tokens during
+                                      # training (exact gradients, boundary states only; 0 = off)
 
     # ---- Loss weights (§10, §13 reference values) ----
     lambda_pred: float = 0.5          # lambda_P: prediction-head objective

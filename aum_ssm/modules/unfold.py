@@ -168,8 +168,12 @@ class Unfold(nn.Module):
 
             def read_fn(query, phi_arg=None, exclude_current=False, pooled=False):
                 S = S_pre if exclude_current else S_new
-                if pooled:                                     # Pool(S) = mean over the key axis (§14)
-                    return rearrange(S.mean(-1), "b h p -> b (h p)").unsqueeze(1)
+                if pooled:                                     # Pool(S) = S q_pool: phase-free learned
+                    if query is None:                          # static query (§14); None -> mean pool
+                        return rearrange(S.mean(-1), "b h p -> b (h p)").unsqueeze(1)
+                    qh = rearrange(query, "b l (h p) -> b l h p", p=self.headdim)
+                    rr = torch.einsum("bhpn,blhn->blhp", S, qh)     # no rotation
+                    return rearrange(rr, "b l h p -> b l (h p)")
                 ph = phi_1H.unsqueeze(1) if phi_arg is None else phi_arg    # honor the caller's phase
                 qh = rearrange(query, "b l (h p) -> b l h p", p=self.headdim)
                 q_rot = _rotate_ladder(qh, ph, self.rope_freqs)

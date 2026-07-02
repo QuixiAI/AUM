@@ -35,6 +35,32 @@ def _brute_exclusive_read(query, k, v, tau_bar, lam_bar, r, theta, dt_bias, eps=
     return torch.stack(outs, dim=1)
 
 
+def test_segment_checkpointing_is_exact():
+    # C7 memory fix: gradient-checkpointed segments must reproduce the non-checkpointed loop
+    # EXACTLY — same j* (halt_u is pre-drawn), same loss, same gradients.
+    def run(seg):
+        torch.manual_seed(0)
+        cfg = AumConfig(n_layer=2, vocab_size=128, d_intermediate=128, silence_enabled=True,
+                        silence_segment=seg)
+        m = AumLMHeadModel(cfg).train()
+        torch.manual_seed(1)
+        ids = torch.randint(0, 128, (2, 12))
+        torch.manual_seed(2)                                  # aligns the halt_u draw
+        res, aux = m(ids, return_aux=True)
+        loss = (torch.nn.functional.cross_entropy(
+                    res.logits[:, :-1].reshape(-1, 128), ids[:, 1:].reshape(-1))
+                + aux.pi.mean() + aux.E_traj.mean())
+        loss.backward()
+        grad = m.backbone.layers[-1].unfold.in_proj_qkv.weight.grad.clone()
+        return float(loss.detach()), grad, aux.j_star.clone()
+
+    l_plain, g_plain, j_plain = run(0)                        # one unsegmented pass
+    l_ckpt, g_ckpt, j_ckpt = run(4)                           # 3 checkpointed segments (L=12)
+    assert torch.equal(j_plain, j_ckpt)                       # identical sampled candidates
+    assert abs(l_plain - l_ckpt) < 1e-6
+    assert torch.allclose(g_plain, g_ckpt, rtol=1e-5, atol=1e-7)
+
+
 def test_exclude_current_matches_bruteforce():
     g = torch.Generator().manual_seed(3)
     B, L, H, Dqk, Dv = 2, 8, 3, 8, 6

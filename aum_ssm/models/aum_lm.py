@@ -11,6 +11,7 @@ from collections import namedtuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 from aum_ssm.models.config_aum import AumConfig
 from aum_ssm.modules.unfold import Unfold                 # U phase
@@ -86,12 +87,17 @@ def _token_read(S_prev, S_cur, headdim, freqs):
 
     exclude_current=True -> S_{t-1} (the predictive read); else S_t (the silent read). The query is
     split per U-head and rotated by that head's ladder at the phase the CALLER passes (phi_{t-1}
-    for predict, phi_t for the silent read). pooled=True -> Pool(S) = mean over the key axis (§14).
+    for predict, phi_t for the silent read). pooled=True -> the §14 phase-free read Pool(S) =
+    S q_pool with the caller's static query (None -> mean over the key axis).
     """
     def read(query, phi_arg=None, exclude_current=False, pooled=False):
         S = S_prev if exclude_current else S_cur
         if pooled:
-            return S.mean(-1).reshape(S.shape[0], 1, -1)
+            if query is None:
+                return S.mean(-1).reshape(S.shape[0], 1, -1)
+            qh = query.reshape(*query.shape[:-1], -1, headdim)      # (B,1,H,Dqk), no rotation
+            r = torch.einsum("bhpn,blhn->blhp", S, qh)
+            return r.reshape(r.shape[0], r.shape[1], -1)
         qh = query.reshape(*query.shape[:-1], -1, headdim)          # (B,1,H,Dqk)
         q_rot = _rotate_ladder(qh, phi_arg, freqs)
         r = torch.einsum("bhpn,blhn->blhp", S, q_rot)
@@ -190,9 +196,13 @@ class AumBackbone(nn.Module):
         #   sigma_{t-1} -> g_hat_t -> e_t -> mu_t -> sigma_t^0 -> (silence loop) -> sigma_t
         # run over tokens after the core's parallel scan. The loop steps the top layer's evidence
         # state itself (S_t = alpha_t*S_{t-1} + x_t (x) k_rot_t from the write pack), serving the
-        # predictive read from S_{t-1}@phi_{t-1} and the silent read from S_t@phi_t. Declared
-        # bottleneck (C7): sequential in T; the fused kernel / segment checkpointing comes with the
-        # training bring-up.
+        # predictive read from S_{t-1}@phi_{t-1} and the silent read from S_t@phi_t.
+        #
+        # C7 memory fix: with config.silence_segment > 0 the loop runs in segments under gradient
+        # checkpointing — only segment-boundary carries (S, sigma) are stored; in-segment
+        # intermediates (the per-token S chain, the dominant cost) are recomputed on backward.
+        # Gradients are EXACT; j* sampling is deterministic under recompute because the uniforms
+        # are drawn once outside (halt_u -> inverse-CDF selection inside the silence block).
         alpha, xw, k_rot = read_src["alpha"], read_src["x"], read_src["k_rot"]
         headdim, freqs = read_src["headdim"], read_src["freqs"]
         B, L, H, Dv = xw.shape
@@ -202,27 +212,68 @@ class AumBackbone(nn.Module):
         phi_read = phi                                        # phase used by the SILENT read only
         if ablation == "phase_scrambled" and L > 1:           # §14: eps_t shuffled across tokens
             phi_read = phi[:, torch.randperm(L, device=phi.device)]
-        outs, auxes = [], []
-        for t in range(L):
-            S_prev = S
-            S = (alpha[:, t].unsqueeze(-1).unsqueeze(-1) * S_prev
-                 + xw[:, t].unsqueeze(-1) * k_rot[:, t].unsqueeze(-2))
-            read_t = _token_read(S_prev, S, headdim, freqs)
-            o_step, aux_t = self.silence(
-                g_t[:, t:t + 1], read_t, phi_read[:, t:t + 1], phi_prev_t, sigma,
-                m_t[:, t:t + 1], s_t[:, t:t + 1], logits_fn,
-                None if ablation == "phase_scrambled" else ablation, forced_depth)
-            sigma = aux_t.sigma_star[:, :1]                   # BPTT through the token recurrence
-            phi_prev_t = phi[:, t:t + 1]
-            outs.append(o_step)
-            auxes.append(aux_t)
-        o_t = torch.cat(outs, dim=1)
-        aux = _cat_aux(auxes)
+        u = None
+        if self.training and forced_depth is None:            # pre-drawn Categorical(w) uniforms
+            u = torch.rand(B, L, device=g_t.device)
+        seg = getattr(self.config, "silence_segment", 0)
+        use_ckpt = (self.training and torch.is_grad_enabled() and inference_params is None
+                    and ablation is None and 0 < seg < L)
+        seg = seg if use_ckpt else L
+        run = partial(self._global_segment, headdim=headdim, freqs=freqs, logits_fn=logits_fn,
+                      ablation=None if ablation == "phase_scrambled" else ablation,
+                      forced_depth=forced_depth)
+        pieces = []
+        for t0 in range(0, L, seg):
+            t1 = min(t0 + seg, L)
+            args = (S, sigma, phi_prev_t, g_t[:, t0:t1], phi[:, t0:t1], phi_read[:, t0:t1],
+                    m_t[:, t0:t1], s_t[:, t0:t1], alpha[:, t0:t1], xw[:, t0:t1], k_rot[:, t0:t1],
+                    None if u is None else u[:, t0:t1])
+            if use_ckpt:
+                out = torch.utils.checkpoint.checkpoint(
+                    run, *args, use_reentrant=False, preserve_rng_state=False)
+            else:
+                out = run(*args)
+            S, sigma, phi_prev_t = out[0], out[1], out[2]
+            pieces.append(out[3:])
+        o_t = torch.cat([p[0] for p in pieces], dim=1)
+        cat = lambda i: torch.cat([p[i] for p in pieces], dim=1)
+        aux = SilenceAux(
+            g=cat(1), g_hat=cat(2), e=cat(3), mu=cat(4), e_tilde=cat(5), sigma0=cat(6),
+            sigma_traj=list(cat(7).unbind(2)), r_traj=list(cat(8).unbind(2)),
+            E_traj=cat(9), pi=cat(10), w=cat(11), expected_J=cat(12),
+            o_stack=cat(13), j_star=cat(14), sigma_star=cat(15), phi=cat(16),
+        )
         if inference_params is not None:                      # prefill: seed the silence carry slot
             slot = self._silence_slot(inference_params, g_t.shape[0], g_t.device)
             slot["sigma"].copy_(sigma[:, 0].detach())
             slot["phi_prev"].copy_(phi[:, -1:])
         return (o_t, aux) if return_aux else o_t
+
+    def _global_segment(self, S, sigma, phi_prev_t, g_seg, phi_seg, phi_read_seg, m_seg, s_seg,
+                        alpha_seg, x_seg, k_seg, u_seg, headdim, freqs, logits_fn,
+                        ablation, forced_depth):
+        """One segment of the §2 global recurrence. Returns a flat tensor tuple —
+        (S, sigma, phi_prev, o, then the SilenceAux fields with traj lists stacked on dim 2) —
+        so it can run under torch.utils.checkpoint with exact gradients."""
+        outs, auxes = [], []
+        for t in range(g_seg.shape[1]):
+            S_prev = S
+            S = (alpha_seg[:, t].unsqueeze(-1).unsqueeze(-1) * S_prev
+                 + x_seg[:, t].unsqueeze(-1) * k_seg[:, t].unsqueeze(-2))
+            read_t = _token_read(S_prev, S, headdim, freqs)
+            o_step, aux_t = self.silence(
+                g_seg[:, t:t + 1], read_t, phi_read_seg[:, t:t + 1], phi_prev_t, sigma,
+                m_seg[:, t:t + 1], s_seg[:, t:t + 1], logits_fn, ablation, forced_depth,
+                halt_u=None if u_seg is None else u_seg[:, t:t + 1])
+            sigma = aux_t.sigma_star[:, :1]                   # BPTT through the token recurrence
+            phi_prev_t = phi_seg[:, t:t + 1]
+            outs.append(o_step)
+            auxes.append(aux_t)
+        a = _cat_aux(auxes)
+        return (S, sigma, phi_prev_t, torch.cat(outs, dim=1),
+                a.g, a.g_hat, a.e, a.mu, a.e_tilde, a.sigma0,
+                torch.stack(a.sigma_traj, dim=2), torch.stack(a.r_traj, dim=2),
+                a.E_traj, a.pi, a.w, a.expected_J, a.o_stack, a.j_star, a.sigma_star, a.phi)
 
     def _silence_slot(self, inference_params, batch, device):
         kv = inference_params.key_value_memory_dict
