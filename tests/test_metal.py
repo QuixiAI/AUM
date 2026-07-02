@@ -57,9 +57,11 @@ def test_metal_grad_matches_reference(H, D):
 def _ssd_fwd_ref(C, B, X, cl):
     N = C.shape[-2]
     s = C.float() @ B.float().transpose(-1, -2)
-    d = torch.exp(cl[..., :, None] - cl[..., None, :])
-    m = torch.tril(torch.ones(N, N, device=C.device))
-    return (s * d * m) @ X.float()
+    diff = cl[..., :, None] - cl[..., None, :]
+    mask = torch.tril(torch.ones(N, N, device=C.device, dtype=torch.bool))
+    # mask BEFORE exp: the strict upper triangle has large POSITIVE exponents at long N, and
+    # exp -> inf would turn the masked product into NaN
+    return (s * torch.exp(diff.masked_fill(~mask, float("-inf")))) @ X.float()
 
 
 def _ssd_inputs(Bt, H, N, D, seed=0):
@@ -89,16 +91,21 @@ def test_mamba2_bwd_kernel_matches_autograd(D):
     assert rel(dcl.float(), clr.grad) < 0.02, ("dcumlog", rel(dcl.float(), clr.grad))
 
 
-@pytest.mark.parametrize("N,D", [(128, 64), (256, 64), (136, 64), (128, 128)])
-def test_mamba2_forward_routes_match_reference(N, D):
-    # D=64 with N%64==0 and N>=128 takes the chunked LINEAR-TIME pipeline; ragged N (136) and
-    # D=128 take the quadratic kernel — every route must agree with the fp32 reference.
+@pytest.mark.parametrize("N,D,route", [
+    (128, 64, "chunked"), (256, 64, "chunked"),     # forced linear-time (64x64 quadrant state)
+    (128, 128, "chunked"), (256, 128, "chunked"),   # ... at the reference head dim
+    (136, 64, "auto"), (136, 128, "auto"),          # ragged N -> quadratic
+    (2048, 64, "auto"),                             # at/above the measured crossover -> chunked
+])
+def test_mamba2_forward_routes_match_reference(N, D, route):
+    # Both routes (and the auto threshold) must agree with the fp32 reference.
     C, Bm, X, cl = _ssd_inputs(2, 2, N, D, seed=3)
     y_ref = _ssd_fwd_ref(C, Bm, X, cl)
-    y = km.mamba2(C.bfloat16(), Bm.bfloat16(), X.bfloat16(), cl).float()
+    fn = km.mamba2_chunked if route == "chunked" else km.mamba2
+    y = fn(C.bfloat16(), Bm.bfloat16(), X.bfloat16(), cl).float()
     torch.mps.synchronize()
     rel = ((y - y_ref).abs().max() / (y_ref.abs().max() + 1e-6)).item()
-    assert rel < 0.03, (N, D, rel)
+    assert rel < 0.03, (N, D, route, rel)
 
 
 @pytest.mark.parametrize("D", [64, 128])

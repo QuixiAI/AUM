@@ -46,9 +46,15 @@ _ext._set_library(_METALLIB)
 
 def mamba2(C, B, X, cumlog):
     """SSD forward ((C@Bᵀ)⊙exp(cl_i−cl_j)⊙causal)@X. C,B,X bf16 (B,H,N,D); cumlog fp32 (B,H,N).
-    MPS; D in {64,128}, N%8. Auto-routed: the chunked LINEAR-TIME 3-kernel pipeline when D=64 and
-    N is a multiple of 128; the quadratic materialized kernel otherwise (incl. all of D=128)."""
+    MPS; D in {64,128}, N%8. Auto-routed between the quadratic kernel and the chunked LINEAR-TIME
+    pipeline (64x64 quadrant-tiled state, both head dims) at the MEASURED crossovers:
+    N>=2048 for D=64, N>=8192 for D=128 (N%64==0 required for chunked)."""
     return _ext.mamba2(C, B, X, cumlog)
+
+
+def mamba2_chunked(C, B, X, cumlog):
+    """The chunked linear-time route, forced (testing/benchmarks). Requires N%64==0, N>=128."""
+    return _ext.mamba2_chunked(C, B, X, cumlog)
 
 
 def mamba2_bwd(C, B, X, cumlog, dY):

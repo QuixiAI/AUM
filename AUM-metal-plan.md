@@ -115,24 +115,25 @@ end-to-end through the real model, silence on and off.
 | M4 fused backward | done (`mamba2_bwd` + the dcumlog host identity) |
 | M5 benchmark/fuse | **open** — see below |
 
-## Remaining work (the open perf track)
+## The committed roadmap (the perf track)
 
-1. **Fully-fused bespoke U-phase kernel** (fwd+bwd): fold the rotation ladder, L2-norms, ρτ
-   gate, scan, and gated-RMSNorm into one kernel, eliminating the host preamble's extra
-   global-memory passes. Tracked as QuixiAI/AUM issue #1. Note the ladder means per-block
-   frequencies in-register — the rev.-2 "single scalar phase per head" fusion sketch no longer
-   applies.
-1b. **Chunked linear-time SSD at D=128** — the reference head dim still takes the quadratic
-   route (the D×D register state doesn't fit at 128); a quadrant-tiled variant (or folding it
-   into the bespoke kernel above) would extend the 2.9× linear-time win to the reference config.
-2. **Fused sequential global-block kernel** (C7): one dispatch running the
-   σ→ĝ→e→μ→σ⁰→σ recurrence over the sequence with S resident on-chip
-   (working state O(d_σ + d + H·d_h²) ≈ 66K floats per batch row at Tiny scale). Memory is
-   already solved by checkpointing; this buys wall-clock.
-3. **Benchmarks** (M5): metal vs reference-on-MPS at reference shapes; then D=128 tiling and
-   shared-memory-state experiments per the perf handbook discipline.
-4. **Triton/NVIDIA bring-up** (out of scope here): same operand-folding design; the SISO kernels
-   in `ops/triton/unfold/` need the write gate, k/v norms, unwrapped φ, and the host-side ladder.
+**Division principle: algorithm & geometry → ThunderMittens; operand fusion & model-specifics →
+AUM.** ThunderMittens' SSD family is the best general `(C,B,X,cumlog) → Y` engine on Apple
+Silicon — pure math, every geometry, no model assumptions. The AUM kernel is "TM's best SSD core
++ AUM's fused operand pipeline welded on." Cores are vendored verbatim (file-copy ports, both
+directions); the substrate is synced from TM. Every step below is benchmarked per the
+perf-handbook discipline; route thresholds are measured, not guessed.
+
+| # | Home | Work | Status |
+|---|---|---|---|
+| 1 | TM (built here, ports back verbatim) | **Chunked linear-time forward at D=128**: quadrant-tile the D×D register state into 64×64 blocks (kv gains a quadrant grid axis; scan is already elementwise; out accumulates per-half with S-quadrant loops); scanned state stored bf16 (identical results — the out-mma consumed bf16 anyway — at half the state-read traffic). Measured (M-series): D=64 2.0×@2048 / 3.7×@4096 / 7.2×@8192; D=128 parity@4096 / 2.1×@8192 — auto-route thresholds set accordingly (2048 / 8192). The D=128 mid-range is bounded by per-query-tile state reloads; cooperative sharing across a chunk's 8 query tiles (threadgroup staging) is the follow-up there, likely folded into step 3 | **landed** |
+| 2 | TM (same flow) | **Chunked linear-time backward** (D=64 → 128): reverse decayed scan for the inter-chunk state gradient + chunk-bounded intra tiles + in-kernel dcl. Backward is ~⅔ of training time — the biggest single win at seq 4096 | open |
+| 3 | AUM | **Fused operand pipeline** on the chunked skeleton (issue #1): rotation ladder (per-block cos/sin in-register from φ + rope_freqs), k/v L2-norms, ρτ gate folded into loads; D-skip + gated-RMSNorm into the out-store. Kills ~6 global passes over (B,H,N,D) | open |
+| 4 | AUM | **Fused sequential global-block kernel** (C7): one dispatch marching (σ, S) over the sequence, silence-block GEMMs in-kernel. Working state ≈ 66K floats/row at Tiny scale. Memory already solved by checkpointing; this buys wall-clock | open |
+| 5 | — | **Triton/NVIDIA bring-up** (out of scope here): same operand-folding design; `ops/triton/unfold/` needs the write gate, k/v norms, unwrapped φ, host-side ladder | deferred |
+
+TM keeps its kernels operand-pure (no fusion hooks — that is what keeps a general library
+maintainable); AUM owns every fusion. TM algorithmic wins flow into AUM as file copies.
 
 ## Verification (standing, all in `tests/test_metal.py` + the suite)
 

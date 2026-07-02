@@ -86,41 +86,55 @@ static void encode(F fn) {
 }
 
 // ---- mamba2 SSD forward:  Y = ((C@Bᵀ) ⊙ exp(cl_i−cl_j) ⊙ causal) @ X ----
-// Routed: the quadratic materialized kernel for small/ragged N or D=128; the chunked
-// linear-time 3-kernel pipeline (ssd_chunk_kv -> scan -> out, O(N·(L+D)·D)) otherwise.
-// The chunked kernels hold a DxD register state — feasible only at D=64.
-static at::Tensor mamba2_mps(const at::Tensor& C_in, const at::Tensor& B_in,
-                             const at::Tensor& X_in, const at::Tensor& cl_in) {
-  TORCH_CHECK(C_in.device().is_mps(), "mamba2: tensors must be MPS");
-  TORCH_CHECK(C_in.scalar_type() == at::kBFloat16, "mamba2: C,B,X must be bfloat16");
-  TORCH_CHECK(cl_in.scalar_type() == at::kFloat, "mamba2: cumlog must be float32");
-  auto C = C_in.contiguous(), B = B_in.contiguous(), X = X_in.contiguous(), cl = cl_in.contiguous();
+// Two routes over one math: the quadratic materialized kernel, and the chunked linear-time
+// 3-kernel pipeline (ssd_chunk_kv -> scan -> out, O(N·(L+D)·D)) whose DxD chunk state is
+// quadrant-tiled into 64x64 register blocks (kv grid gains a QB*QB axis, QB = D/64; the scanned
+// state is stored bf16 — the out mma consumes bf16 anyway, so results are identical and the
+// dominant state-read traffic halves). Auto-route thresholds are MEASURED (M-series):
+// chunked wins from N>=2048 at D=64 (2-7x) and N>=8192 at D=128 (2.1x; parity at 4096 — the
+// remaining gap is per-query-tile state reloads, the cooperative-sharing follow-up).
+static void mamba2_check(const at::Tensor& C, const at::Tensor& cl) {
+  TORCH_CHECK(C.device().is_mps(), "mamba2: tensors must be MPS");
+  TORCH_CHECK(C.scalar_type() == at::kBFloat16, "mamba2: C,B,X must be bfloat16");
+  TORCH_CHECK(cl.scalar_type() == at::kFloat, "mamba2: cumlog must be float32");
   TORCH_CHECK(C.dim() == 4, "mamba2: C,B,X expect (B,H,N,D)");
-  const int Bsz = C.size(0), H = C.size(1);
-  const unsigned N = (unsigned)C.size(2);
   const int D = C.size(3);
   TORCH_CHECK(D == 64 || D == 128, "mamba2: D must be 64 or 128");
-  TORCH_CHECK(N % 8 == 0, "mamba2: N must be a multiple of 8");
+  TORCH_CHECK(C.size(2) % 8 == 0, "mamba2: N must be a multiple of 8");
+}
+
+static at::Tensor mamba2_quadratic(const at::Tensor& C, const at::Tensor& B,
+                                   const at::Tensor& X, const at::Tensor& cl) {
+  const int Bsz = C.size(0), H = C.size(1), D = C.size(3);
+  const unsigned N = (unsigned)C.size(2);
   auto out = at::empty_like(C);
-  constexpr unsigned L = 64;                       // must match SSD_CHUNK_L in the metal
-  if (D != 64 || N % L != 0 || N < 2 * L) {        // quadratic route
-    encode([&](Encoder& e) {
-      e.pipeline("mamba2_" + std::to_string(D));
-      e.in(C, 0); e.in(B, 1); e.in(X, 2); e.in(cl, 3); e.out(out, 4);
-      e.bytes(N, 5); e.bytes((unsigned)H, 6);
-      e.dispatch((int)N / 8, H, Bsz, 32, 1, 1);
-    });
-    return out;
-  }
-  const int Cn = (int)(N / L);                     // chunked linear-time route (D=64)
-  auto f32 = C.options().dtype(at::kFloat);
-  auto s_raw = at::empty({Bsz, H, Cn, D, D}, f32);
-  auto s_ex = at::empty({Bsz, H, Cn, D, D}, f32);
+  encode([&](Encoder& e) {
+    e.pipeline("mamba2_" + std::to_string(D));
+    e.in(C, 0); e.in(B, 1); e.in(X, 2); e.in(cl, 3); e.out(out, 4);
+    e.bytes(N, 5); e.bytes((unsigned)H, 6);
+    e.dispatch((int)N / 8, H, Bsz, 32, 1, 1);
+  });
+  return out;
+}
+
+static constexpr unsigned kSsdChunkL = 64;         // must match SSD_CHUNK_L in the metal
+
+static at::Tensor mamba2_chunked(const at::Tensor& C, const at::Tensor& B,
+                                 const at::Tensor& X, const at::Tensor& cl) {
+  const int Bsz = C.size(0), H = C.size(1), D = C.size(3);
+  const unsigned N = (unsigned)C.size(2);
+  TORCH_CHECK(N % kSsdChunkL == 0 && N >= 2 * kSsdChunkL,
+              "mamba2_chunked: N must be a multiple of 64 and >= 128");
+  const int Cn = (int)(N / kSsdChunkL);
+  const int QB = D / 64;                           // 64x64 state quadrants per side
+  auto out = at::empty_like(C);
+  auto s_raw = at::empty({Bsz, H, Cn, D, D}, C.options().dtype(at::kFloat));
+  auto s_ex = at::empty({Bsz, H, Cn, D, D}, C.options());   // bf16 (see routing note above)
   encode([&](Encoder& e) {
     e.pipeline("ssd_chunk_kv_" + std::to_string(D));
     e.in(B, 0); e.in(X, 1); e.in(cl, 2); e.out(s_raw, 3);
     e.bytes(N, 4); e.bytes((unsigned)H, 5);
-    e.dispatch(Cn, H, Bsz, 32, 1, 1);
+    e.dispatch(Cn * QB * QB, H, Bsz, 32, 1, 1);
   });
   encode([&](Encoder& e) {
     e.pipeline("ssd_chunk_scan_" + std::to_string(D));
@@ -135,6 +149,25 @@ static at::Tensor mamba2_mps(const at::Tensor& C_in, const at::Tensor& B_in,
     e.dispatch((int)N / 8, H, Bsz, 32, 1, 1);
   });
   return out;
+}
+
+static at::Tensor mamba2_mps(const at::Tensor& C_in, const at::Tensor& B_in,
+                             const at::Tensor& X_in, const at::Tensor& cl_in) {
+  auto C = C_in.contiguous(), B = B_in.contiguous(), X = X_in.contiguous(), cl = cl_in.contiguous();
+  mamba2_check(C, cl);
+  const unsigned N = (unsigned)C.size(2);
+  const int D = C.size(3);
+  const unsigned chunk_min = (D == 64) ? 2048 : 8192;      // measured crossovers
+  if (N % kSsdChunkL != 0 || N < chunk_min)
+    return mamba2_quadratic(C, B, X, cl);
+  return mamba2_chunked(C, B, X, cl);
+}
+
+static at::Tensor mamba2_chunked_mps(const at::Tensor& C_in, const at::Tensor& B_in,
+                                     const at::Tensor& X_in, const at::Tensor& cl_in) {
+  auto C = C_in.contiguous(), B = B_in.contiguous(), X = X_in.contiguous(), cl = cl_in.contiguous();
+  mamba2_check(C, cl);
+  return mamba2_chunked(C, B, X, cl);                      // forced route (tests / benchmarks)
 }
 
 // ---- mamba2 SSD backward -> (dC, dB, dX, dcumlog) ----
@@ -201,7 +234,8 @@ static std::tuple<at::Tensor, at::Tensor> aum_decode_mps(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("_set_library", &aum_set_library, "set the metallib path");
-  m.def("mamba2", &mamba2_mps, "AUM-Ø SSD forward (MPS)");
+  m.def("mamba2", &mamba2_mps, "AUM-Ø SSD forward (MPS, auto-routed)");
+  m.def("mamba2_chunked", &mamba2_chunked_mps, "AUM-Ø SSD forward, forced chunked route");
   m.def("mamba2_bwd", &mamba2_bwd_mps, "AUM-Ø SSD backward dC,dB,dX (MPS)");
   m.def("aum_decode", &aum_decode_mps, "AUM-Ø single-token U-phase decode step (MPS)");
 }

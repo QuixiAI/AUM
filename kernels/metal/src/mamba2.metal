@@ -104,6 +104,10 @@ instantiate_mamba2(128);
 // ---------------------------------------------------------------------------
 constant constexpr const int SSD_CHUNK_L = 64;
 
+// The DxD chunk state is register-feasible per simdgroup only at 64x64, so the state is tiled
+// into QB x QB quadrants of 64x64 (QB = D/64): the kv grid gains a quadrant axis
+// (grid.x = C * QB * QB), each simdgroup owning one quadrant built from 64-wide column slices
+// of B and X. At D=64 (QB=1) this reduces exactly to the untiled kernel.
 template <int D>
 kernel void ssd_chunk_kv(device   bf16     *Bm [[buffer(0)]],
                          device   bf16     *X  [[buffer(1)]],
@@ -113,48 +117,52 @@ kernel void ssd_chunk_kv(device   bf16     *Bm [[buffer(0)]],
                          constant unsigned &H  [[buffer(5)]],
                          uint3 blockIdx [[threadgroup_position_in_grid]],
                          uint  laneId   [[thread_index_in_simdgroup]]) {
-    static_assert(D == 64, "ssd_chunk_kv currently supports D=64");
+    static_assert(D == 64 || D == 128, "ssd_chunk_kv supports D in {64,128}");
     constexpr int TPC = SSD_CHUNK_L / 8;
+    constexpr int QB = D / 64;                        // 64-wide quadrant blocks per side
     using gl_t  = gl<bfloat, 1, -1, -1, D>;
     using gl_cl = gl<float, 1, -1, 1, -1>;
     gl_t  gB(Bm, nullptr, H, N, nullptr);
     gl_t  gX(X, nullptr, H, N, nullptr);
     gl_cl gcl(cl, nullptr, H, nullptr, N);
-    const int c = blockIdx.x, head = blockIdx.y, batch = blockIdx.z;
+    const int cq = blockIdx.x, head = blockIdx.y, batch = blockIdx.z;
+    const int c = cq / (QB * QB);                     // chunk
+    const int kb = (cq % (QB * QB)) / QB;             // state row block (B-dim)
+    const int xb = cq % QB;                           // state col block (X-dim)
     const int C = (int)N / SSD_CHUNK_L;
     const float cl_rc = cl[((long)batch * (int)H + head) * (long)N
                            + (long)(c + 1) * SSD_CHUNK_L - 1];   // reference r_c
 
-    rt_fl<D, D> kv;
+    rt_fl<64, 64> kv;
     zero(kv);
     for (int t = 0; t < TPC; ++t) {
         const int tile = c * TPC + t;
-        rt_bf<8, D, ducks::rt_layout::col> b_reg;
-        rt_bf<8, D> x_reg;
-        load(b_reg, gB, {batch, head, tile, 0}, laneId);
-        load(x_reg, gX, {batch, head, tile, 0}, laneId);
+        rt_bf<8, 64, ducks::rt_layout::col> b_reg;
+        rt_bf<8, 64> x_reg;
+        load(b_reg, gB, {batch, head, tile, kb}, laneId);
+        load(x_reg, gX, {batch, head, tile, xb}, laneId);
         // per-row weight w_j = exp(cl[r_c] - cl[j])  (<= 1)
         typename rt_fl<8, 8>::col_vec lj, w;
         load(lj, gcl, {batch, head, 0, tile}, laneId);
         sub(w, lj, cl_rc);
         mul(w, w, -1.0f);
         exp(w, w);
-        rt_fl<8, D> x_fl;
+        rt_fl<8, 64> x_fl;
         copy(x_fl, x_reg);
         mul_row(x_fl, x_fl, w);
-        rt_bf<8, D> x_w;
+        rt_bf<8, 64> x_w;
         copy(x_w, x_fl);
         mma_AtB(kv, b_reg, x_w, kv);
     }
     gl<float, 1, -1, D, D> gs(S, nullptr, (int)H * C, nullptr, nullptr);
-    store(gs, kv, {batch, head * C + c, 0, 0}, laneId);
+    store(gs, kv, {batch, head * C + c, kb, xb}, laneId);
 }
 
 // Exclusive decayed prefix over chunks: run = L_c * run + KV_c, S_ex[c] = run-before.
 template <int D>
 kernel void ssd_chunk_scan(device const float *Sin [[buffer(0)]],
                            device const float *cl  [[buffer(1)]],
-                           device float       *Sex [[buffer(2)]],
+                           device bf16        *Sex [[buffer(2)]],
                            constant unsigned  &C   [[buffer(3)]],
                            constant unsigned  &N   [[buffer(4)]],
                            uint3 blockIdx [[threadgroup_position_in_grid]],
@@ -167,7 +175,7 @@ kernel void ssd_chunk_scan(device const float *Sin [[buffer(0)]],
         long idx = base + e;
         for (int c = 0; c < (int)C; ++c, idx += D * D) {
             const float t = Sin[idx];
-            Sex[idx] = run;
+            Sex[idx] = bf16(run);
             // re-reference S from r_{c-1} to r_c before adding KV_c (run is 0 at c=0)
             const float lam = (c > 0)
                 ? metal::exp(clbh[(long)(c + 1) * SSD_CHUNK_L - 1]
@@ -180,19 +188,23 @@ kernel void ssd_chunk_scan(device const float *Sin [[buffer(0)]],
 
 // Per-query-tile output: intra-chunk decay tiles (bounded by the chunk) plus the
 // inter-chunk state term. Grid (N/8, H, B) like the quadratic kernel.
+// Output accumulates per 64-wide half (QB halves, QB = D/64); the inter-chunk term loops the
+// stored S quadrants: y[:, xq] += C[:, kq] @ S[kq, xq]. At D=64 (QB=1) this reduces exactly to
+// the untiled kernel.
 template <int D>
 kernel void ssd_chunk_out(device   bf16       *Cq [[buffer(0)]],
                           device   bf16       *Bm [[buffer(1)]],
                           device   bf16       *X  [[buffer(2)]],
                           device   float      *cl [[buffer(3)]],
-                          device   const float *Sex [[buffer(4)]],
+                          device   const bf16 *Sex [[buffer(4)]],
                           device   bf16       *Y  [[buffer(5)]],
                           constant unsigned   &N  [[buffer(6)]],
                           constant unsigned   &H  [[buffer(7)]],
                           uint3 blockIdx [[threadgroup_position_in_grid]],
                           uint  laneId   [[thread_index_in_simdgroup]]) {
-    static_assert(D == 64, "ssd_chunk_out currently supports D=64");
+    static_assert(D == 64 || D == 128, "ssd_chunk_out supports D in {64,128}");
     constexpr int TPC = SSD_CHUNK_L / 8;
+    constexpr int QB = D / 64;
     using gl_t  = gl<bfloat, 1, -1, -1, D>;
     using gl_cl = gl<float, 1, -1, 1, -1>;
     gl_t  gC(Cq, nullptr, H, N, nullptr);
@@ -209,32 +221,38 @@ kernel void ssd_chunk_out(device   bf16       *Cq [[buffer(0)]],
     typename rt_fl<8, 8>::col_vec cumlog_i;
     load(cumlog_i, gcl, {batch, head, 0, qi}, laneId);
 
-    rt_fl<8, D> y_reg;
-    zero(y_reg);
+    rt_fl<8, 64> y_blk[QB];
+    #pragma clang loop unroll(full)
+    for (int xq = 0; xq < QB; ++xq)
+        zero(y_blk[xq]);
 
     // inter-chunk: y = diag(exp(cl_i - cl[r_{c-1}])) * (C @ S_c)   (skip for chunk 0)
     if (c > 0) {
-        rt_fl<D, D> s_fl;
-        gl<float, 1, -1, D, D> gs(const_cast<device float*>(Sex), nullptr,
-                                  (int)H * C, nullptr, nullptr);
-        load(s_fl, gs, {batch, head * C + c, 0, 0}, laneId);
-        rt_bf<D, D> s_bf;
-        copy(s_bf, s_fl);
-        mma_AB(y_reg, c_reg, s_bf, y_reg);
+        gl<bfloat, 1, -1, D, D> gs(const_cast<device bf16*>(Sex), nullptr,
+                                   (int)H * C, nullptr, nullptr);
+        for (int kq = 0; kq < QB; ++kq) {
+            rt_bf<8, 64> c_kq;
+            load(c_kq, gC, {batch, head, qi, kq}, laneId);
+            for (int xq = 0; xq < QB; ++xq) {
+                rt_bf<64, 64> s_bf;
+                load(s_bf, gs, {batch, head * C + c, kq, xq}, laneId);
+                mma_AB(y_blk[xq], c_kq, s_bf, y_blk[xq]);
+            }
+        }
         const float cl_ref = cl[((long)batch * (int)H + head) * (long)N
                                 + (long)c * SSD_CHUNK_L - 1];     // r_{c-1}
         typename rt_fl<8, 8>::col_vec w;
         sub(w, cumlog_i, cl_ref);
         exp(w, w);
-        mul_row(y_reg, y_reg, w);
+        #pragma clang loop unroll(full)
+        for (int xq = 0; xq < QB; ++xq)
+            mul_row(y_blk[xq], y_blk[xq], w);
     }
 
     // intra-chunk: the quadratic loop, bounded to this chunk
     for (int kj = c * TPC; kj <= qi; kj++) {
         rt_bf<8, D, ducks::rt_layout::col> b_reg;
-        rt_bf<8, D> x_reg;
         load(b_reg, gB, {batch, head, kj, 0}, laneId);
-        load(x_reg, gX, {batch, head, kj, 0}, laneId);
         typename rt_fl<8, 8>::row_vec cumlog_j;
         load(cumlog_j, gcl, {batch, head, 0, kj}, laneId);
 
@@ -256,9 +274,16 @@ kernel void ssd_chunk_out(device   bf16       *Cq [[buffer(0)]],
 
         rt_bf<8, 8> att_bf;
         copy(att_bf, att);
-        mma_AB(y_reg, att_bf, x_reg, y_reg);
+        #pragma clang loop unroll(full)
+        for (int xq = 0; xq < QB; ++xq) {
+            rt_bf<8, 64> x_xq;
+            load(x_xq, gX, {batch, head, kj, xq}, laneId);
+            mma_AB(y_blk[xq], att_bf, x_xq, y_blk[xq]);
+        }
     }
-    store(gY, y_reg, {batch, head, qi, 0}, laneId);
+    #pragma clang loop unroll(full)
+    for (int xq = 0; xq < QB; ++xq)
+        store(gY, y_blk[xq], {batch, head, qi, xq}, laneId);
 }
 
 #define instantiate_ssd_chunk(D)                                                     \
@@ -270,19 +295,20 @@ kernel void ssd_chunk_out(device   bf16       *Cq [[buffer(0)]],
     uint laneId [[thread_index_in_simdgroup]]);                                      \
   template [[host_name("ssd_chunk_scan_" #D)]] [[kernel]] void                       \
   ssd_chunk_scan<D>(device const float *Sin [[buffer(0)]],                           \
-    device const float *cl [[buffer(1)]], device float *Sex [[buffer(2)]],           \
+    device const float *cl [[buffer(1)]], device bf16 *Sex [[buffer(2)]],            \
     constant unsigned &C [[buffer(3)]], constant unsigned &N [[buffer(4)]],          \
     uint3 blockIdx [[threadgroup_position_in_grid]],                                 \
     uint tid [[thread_index_in_threadgroup]]);                                       \
   template [[host_name("ssd_chunk_out_" #D)]] [[kernel]] void                        \
   ssd_chunk_out<D>(device bf16 *Cq [[buffer(0)]], device bf16 *Bm [[buffer(1)]],     \
     device bf16 *X [[buffer(2)]], device float *cl [[buffer(3)]],                    \
-    device const float *Sex [[buffer(4)]], device bf16 *Y [[buffer(5)]],             \
+    device const bf16 *Sex [[buffer(4)]], device bf16 *Y [[buffer(5)]],              \
     constant unsigned &N [[buffer(6)]], constant unsigned &H [[buffer(7)]],          \
     uint3 blockIdx [[threadgroup_position_in_grid]],                                 \
     uint laneId [[thread_index_in_simdgroup]]);
 
 instantiate_ssd_chunk(64);
+instantiate_ssd_chunk(128);
 
 // ---------------------------------------------------------------------------
 // Mamba-2 / SSD BACKWARD (quadratic, no atomics), D in {64,128}. The forward is the
