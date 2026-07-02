@@ -269,7 +269,10 @@ class GenerationMixin:
             input_ids, self, max_length, top_k=top_k, top_p=top_p, min_p = min_p, temperature=temperature, output_scores=output_scores, **kwargs
         )
         if not output_scores:
-            output.scores = None
+            # the output type may be an immutable namedtuple (transformers-free fallback)
+            output = output._replace(scores=None) if hasattr(output, "_replace") else output
+            if not hasattr(output, "_replace"):
+                output.scores = None
         return output if return_dict_in_generate else output.sequences
 
 

@@ -1,282 +1,162 @@
-# Mamba
+# AUM-Ø
 
-![Mamba](assets/selection.png "Selective State Space")
-> **Mamba: Linear-Time Sequence Modeling with Selective State Spaces**\
-> Albert Gu*, Tri Dao*\
-> Paper: https://arxiv.org/abs/2312.00752
+**Attentive Unfolding Modulation with Silence** — an affine resonant evidence core with a
+benefit-gated global hypothesis register.
 
-![Mamba-2](assets/ssd_algorithm.png "State Space Dual Model")
-> **Transformers are SSMs: Generalized Models and Efficient Algorithms**\
->     **Through Structured State Space Duality**\
-> Tri Dao*, Albert Gu*\
-> Paper: https://arxiv.org/abs/2405.21060
+> **AUM-Ø v6** (pronounced *Aum-nought*) is a recurrent sequence architecture built on one
+> principle — *continuation arises from temporary configuration* — and one structural commitment:
+> *separate evidence from interpretation, and spend extra computation only where revising the
+> interpretation pays.*
+>
+> Spec: [AUM-Ø.md](AUM-Ø.md) (the source of truth — architecture, training recipe, pre-registered
+> evaluation, and a tensor manifest verified against the built checkpoint).
 
-![Mamba-3](assets/mamba3.png "Inference-first State Space Model")
-> **Mamba-3: Improved Sequence Modeling using State Space Principles**\
->     **Through Structured State Space Duality**\
-> Aakash Lahoti*, Kevin Y. Li*, Berlin Chen*, Caitlin Wang*, Aviv Bick, J. Zico Kolter, Tri Dao†, Albert Gu†\
-> Paper: https://arxiv.org/abs/2603.15569
+The architecture maintains two kinds of state on two clocks. An **evidence state** $S_t$ — a
+phase-addressed associative memory updated once per token by an affine recurrence — records *what
+has been observed*. A **hypothesis register** $\sigma_t$ — a small nonlinear state revised zero or
+more times per token by an inner "silence" loop — holds *how the evidence is currently
+interpreted*. A learned **integration pressure** $\pi_t$, trained against measured counterfactual
+benefit, decides when revision is worth the compute:
 
-## About
+$$A \rightarrow U \rightarrow M \rightarrow \varnothing:\quad
+\text{observe} \rightarrow \text{accumulate} \rightarrow \text{weigh} \rightarrow \text{revise when it pays}$$
 
-Mamba is a new state space model architecture showing promising performance on information-dense data such as language modeling, where previous subquadratic models fall short of Transformers.
-It is based on the line of progress on [structured state space models](https://github.com/state-spaces/s4),
-with an efficient hardware-aware design and implementation in the spirit of [FlashAttention](https://github.com/Dao-AILab/flash-attention).
+This repository is a fork of [state-spaces/mamba](https://github.com/state-spaces/mamba): the
+evidence core is a gated linear-attention / selective-SSM recurrence in the Mamba-2 family, and
+the U-phase chunk kernel is mathematically the Mamba-2 SSD numerator with AUM's rotation,
+normalization, and gating folded into its operands.
 
-## Installation
+## Status
 
-Install PyTorch first, then:
-- [Option] `pip install causal-conv1d>=1.4.0 --no-build-isolation`: an efficient implementation of a simple causal Conv1d layer used inside the Mamba block.
-- `pip install mamba-ssm --no-build-isolation`: the core Mamba package.
-- `pip install mamba-ssm[causal-conv1d] --no-build-isolation`: To install core Mamba package and causal-conv1d.
+The **AUM-Ø-Tiny v6 reference model (78,255,136 params)** is fully implemented and validated:
 
-`--no-build-isolation` is required so that pip uses your existing CUDA-enabled PyTorch instead of installing torch-cpu in an isolated build environment.
+- **Evidence core** (12 layers of A→U→M→MLP): bounded local GQA grounding, the resonant affine
+  evidence recurrence with the multi-frequency rotation ladder (§4), error-free precision, SwiGLU.
+- **Global silence block** (§5–§9, ~1.77M params): hypothesis-conditioned predictive grounding,
+  error-fed precision, the revision loop with loss-mixture halting (per-candidate outputs, one
+  carried register — no state blending), integration pressure, and the fixed-depth-K
+  counterfactual benefit pipeline.
+- **True sequential global recurrence** (§2/C7) with exact-gradient segment checkpointing, so
+  seq-2048 training never materializes the per-token state chain.
+- **Decode**: single-token generation is one more step of the same recurrence —
+  decode ≡ full forward is a test invariant, silence on and off.
+- **Training harness**: staged schedule (§12) with the scale-free R² pressure gate, the seven-term
+  objective (§10), synthetic task families with held-out generators, the full baseline/control/
+  ablation gate (§14/§15), and the registered diagnostics (§16).
+- **Apple-Silicon Metal backend**: self-contained kernels (forward, fused backward, decode step)
+  in [kernels/metal](kernels/metal) — no external kernel repo needed, only Xcode's Metal
+  toolchain. Training fwd+bwd runs fully on the GPU via PyTorch MPS.
+- **Deferred**: Triton/NVIDIA in-kernel fusion (the production training path); the fused
+  sequential kernel for the global block (wall-clock optimization — memory is already solved).
 
-NOTE: To use Mamba-3, please install from source `MAMBA_FORCE_BUILD=TRUE pip install --no-cache-dir --force-reinstall git+https://github.com/state-spaces/mamba.git --no-build-isolation`.
+## Layout
 
-Other requirements:
-- Linux
-- NVIDIA GPU
-- PyTorch 1.12+
-- CUDA 11.6+
+```
+AUM-Ø.md              the v6 specification (source of truth)
+AUM-design.md         fork/implementation design notes
+AUM-metal-plan.md     Metal backend plan
+aum_ssm/
+  models/             AumConfig (defaults = the Tiny v6 reference) + AumLMHeadModel
+  modules/            evidence_layer, ground_attn (A), unfold (U), modulate (M),
+                      silence (the global block), ssd_reference (the pure-PyTorch oracle)
+  ops/metal/          the Metal U-phase backend (dispatch onto kernels/metal)
+  training/           losses, schedule, trainer, counterfactual benefit, synthetic tasks,
+                      diagnostics, and the §14/§15 gate harness
+  utils/              generation (prefill + decode driver)
+kernels/metal/        self-contained Metal build: MSL substrate + mamba2 (SSD fwd),
+                      mamba2_bwd (SSD bwd), aum_decode (single-token step)
+train/
+  init.py             materialize the randomly-initialized Tiny v6 checkpoint (~78M)
+  tokenizer.py        SmolLM2 tokenizer (49152-vocab BPE — matches the spec exactly) + verify
+  prepare_data.py     tokenize a corpus into packed uint16 shards + manifest
+  muon.py             Muon optimizer (vendored) + the AUM parameter partition (§13 recipe)
+tests/                the full suite (decode parity, kernel-vs-oracle, gate machinery, ...)
+```
 
-For AMD cards, see additional prerequisites below.
+## Requirements
 
-## Usage
+- PyTorch ≥ 2.x. The reference backend is pure PyTorch and runs on **CPU, Apple MPS, or CUDA** —
+  no Triton, no CUDA toolkit needed.
+- For the Metal backend: an Apple-Silicon Mac with Xcode's Metal toolchain (`xcrun metal`).
+  Kernels JIT-compile on first import.
+- For data prep: `pip install transformers datasets numpy`.
 
-We expose several levels of interface with the Mamba model.
+## Quickstart
 
-### Selective SSM
+```bash
+# 1. materialize the reference checkpoint (78,255,136 params; validates the Appendix-A manifest)
+python train/init.py
 
-Mamba is based on a selective SSM layer, which is the focus of the paper (Section 3; Algorithm 2).
+# 2. verify the tokenizer against the model config (SmolLM2, vocab 49152 — an exact match)
+python train/tokenizer.py --config train/checkpoints/aum-tiny-v6-init/config.json
 
-Source: [ops/selective_scan_interface.py](mamba_ssm/ops/selective_scan_interface.py).
+# 3. tokenize a corpus into packed uint16 shards
+python train/prepare_data.py --source HuggingFaceFW/fineweb-edu --streaming \
+    --out-dir train/data/fineweb-edu --val-fraction 0.01 \
+    --config train/checkpoints/aum-tiny-v6-init/config.json
 
-### Mamba Block
+# run the test suite
+pytest tests/
+```
 
-The main module of this repository is the Mamba architecture block wrapping the selective SSM.
+### Model usage
 
-Source: [modules/mamba_simple.py](mamba_ssm/modules/mamba_simple.py).
-
-Usage:
-``` python
+```python
 import torch
-from mamba_ssm import Mamba
+from aum_ssm.models.config_aum import AumConfig
+from aum_ssm.models.aum_lm import AumLMHeadModel
 
-batch, length, dim = 2, 64, 16
-x = torch.randn(batch, length, dim).to("cuda")
-model = Mamba(
-    # This module uses roughly 3 * expand * d_model^2 parameters
-    d_model=dim, # Model dimension d_model
-    d_state=16,  # SSM state expansion factor
-    d_conv=4,    # Local convolution width
-    expand=2,    # Block expansion factor
-).to("cuda")
-y = model(x)
-assert y.shape == x.shape
+cfg = AumConfig(silence_enabled=True)          # defaults ARE the Tiny v6 reference (~78M)
+model = AumLMHeadModel(cfg)
+
+ids = torch.randint(0, cfg.vocab_size, (1, 128))
+logits = model(ids).logits                      # training/prefill forward
+
+out = model.generate(input_ids=ids[:, :32], max_length=64, cg=False)   # recurrent decode
+
+# training aux (per-candidate outputs, halting weights, pressure, consistency, ...)
+result, aux = model(ids, return_aux=True)
 ```
 
-### Mamba-2
+`silence_enabled=False` gives the parameter-matched **evidence-core baseline** (~76.5M);
+`baseline="top_gru"` the Top-GRU adapter; `ablation=...` at forward time selects the §14
+mechanism-isolating controls (`no_op`, `no_read`, `phase_scrambled`, `random`).
 
-The Mamba-2 block is implemented at [modules/mamba2.py](mamba_ssm/modules/mamba2.py).
+### Optimizer (§13 recipe)
 
-A simpler version is at [modules/mamba2_simple.py](mamba_ssm/modules/mamba2_simple.py)
-
-The usage is similar to Mamba(-1):
-``` python
-from mamba_ssm import Mamba2
-model = Mamba2(
-    # This module uses roughly 3 * expand * d_model^2 parameters
-    d_model=dim, # Model dimension d_model
-    d_state=64,  # SSM state expansion factor, typically 64 or 128
-    d_conv=4,    # Local convolution width
-    expand=2,    # Block expansion factor
-).to("cuda")
-y = model(x)
-assert y.shape == x.shape
+```python
+from train.muon import build_optimizer
+opt = build_optimizer(model)   # Muon (lr 0.02 spectral, wd 0.1) on 2D hidden matrices,
+                               # AdamW (6e-4) on the tied embedding/classifier + scalars
 ```
 
-#### SSD
+### U-phase backends
 
-A minimal version of the inner SSD module (Listing 1 from the Mamba-2 paper) with conversion between "discrete" and "continuous" SSM versions
-is at [modules/ssd_minimal.py](mamba_ssm/modules/ssd_minimal.py).
+`AumConfig(kernel_backend=...)`:
 
-### Mamba-3
+| backend | where | notes |
+|---|---|---|
+| `reference` (auto) | CPU / MPS / CUDA | pure PyTorch, the correctness oracle |
+| `metal` | Apple MPS | self-contained kernels; fwd + fused bwd + decode step on the GPU |
+| `triton` | NVIDIA | deferred to the production training bring-up |
 
-The Mamba-3 block is implemented at [modules/mamba3.py](mamba_ssm/modules/mamba3.py).
+## Reference configuration (AUM-Ø-Tiny v6)
 
-The usage is as follows:
-``` python
-from mamba_ssm import Mamba3
-batch, length, dim = 2, 2048, 768
-x = torch.randn(batch, length, dim).to(torch.bfloat16).to("cuda")
-model = Mamba3(
-    # This module uses roughly 6 * d_model^2 parameters
-    d_model=dim, # Model dimension d_model
-    d_state=128,  # SSM state size
-    headdim=64, # SSM headdim
-    is_mimo=True, # Use MIMO mode
-    mimo_rank=4, # MIMO rank when is_mimo=True
-    chunk_size=16, # 64/mimo_rank if x is in bf16, else 32/mimo_rank
-    is_outproj_norm=False, # Additional post SSM norm
-    dtype=torch.bfloat16,
-).to("cuda")
-y = model(x)
-assert y.shape == x.shape
-```
+| Field | Value |
+|---|---|
+| d_model / evidence layers | 512 / 12 (+1 global block) |
+| Vocab (tied) | 49 152 (SmolLM2 BPE) |
+| A: heads / kv / head-dim / window | 8 / 2 / 64 / 256 |
+| U: heads / head-dim / rotation ladder | 4 / 128 / B=64, ω ∈ [10⁻³, 1] geometric |
+| Register d_σ / precision k_μ / J_max | 128 / 32 / 2 |
+| Params: total / silence / ablated core | 78,255,136 / 1,769,408 / 76,485,728 |
 
-### Mamba Language Model
+## Provenance
 
-Finally, we provide an example of a complete language model: a deep sequence model backbone (with repeating Mamba blocks) + language model head.
-
-Source: [models/mixer_seq_simple.py](mamba_ssm/models/mixer_seq_simple.py).
-
-This is an example of how to integrate Mamba into an end-to-end neural network.
-This example is used in the generation scripts below.
-
-
-## Pretrained Models
-
-Pretrained models are uploaded to
-[Hugging Face](https://huggingface.co/state-spaces): `mamba-130m`, `mamba-370m`,
-`mamba-790m`, `mamba-1.4b`, `mamba-2.8b`, `mamba2-130m`, `mamba2-370m`,
-`mamba2-780m`, `mamba2-1.3b`, `mamba2-2.7b`, `transformerpp-2.7b`, `mamba2attn-2.7b`, trained on 300B tokens on the Pile, as well as `mamba-2.8b-slimpj`
-(trained on 600B tokens on the SlimPajama dataset).
-
-
-The models will be autodownloaded by the generation script below.
-
-These models were trained on the [Pile](https://huggingface.co/datasets/EleutherAI/pile), and follow the standard model dimensions described by GPT-3 and followed by many open source models:
-
-| Parameters | Layers | Model dim. | 
-|------------|--------|------------|
-| 130M       | 24     | 768        |
-| 370M       | 48     | 1024       |
-| 790M       | 48     | 1536       |
-| 1.4B       | 48     | 2048       |
-| 2.8B       | 64     | 2560       |
-
-(The layer count of Mamba doubles that of a Transformer with similar size, as two Mamba blocks are needed for each "layer" (MHA block + MLP block) of a Transformer.)
-
-Note: these are base models trained only for 300B tokens, without any form of downstream modification (instruction tuning, etc.).
-Performance is expected to be comparable or better than other architectures trained on similar data, but not to match larger or fine-tuned models.
-
-
-## Evaluations
-
-To run zero-shot evaluations of models (corresponding to Table 3 of the paper),
-we use the
-[lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness)
-library.
-
-1. Install `lm-evaluation-harness` by `pip install lm-eval==0.4.2`.
-2. Run evaluation with (more documentation at the [lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness/tree/big-refactor) repo):
-``` sh
-lm_eval --model mamba_ssm --model_args pretrained=state-spaces/mamba-130m --tasks lambada_openai,hellaswag,piqa,arc_easy,arc_challenge,winogrande,openbookqa --device cuda --batch_size 256
-python evals/lm_harness_eval.py --model hf --model_args pretrained=EleutherAI/pythia-160m --tasks lambada_openai,hellaswag,piqa,arc_easy,arc_challenge,winogrande --device cuda --batch_size 64
-```
-
-To reproduce the results on the `mamba-2.8b-slimpj` model reported in the blogposts:
-``` sh
-lm_eval --model mamba_ssm --model_args pretrained=state-spaces/mamba-2.8b-slimpj --tasks boolq,piqa,hellaswag,winogrande,arc_easy,arc_challenge,openbookqa,race,truthfulqa_mc2 --device cuda --batch_size 256
-lm_eval --model mamba_ssm --model_args pretrained=state-spaces/mamba-2.8b-slimpj --tasks mmlu --num_fewshot 5 --device cuda --batch_size 256
-```
-
-To run evaluations on Mamba-2 models, simply replace the model names:
-``` sh
-lm_eval --model mamba_ssm --model_args pretrained=state-spaces/mamba2-2.7b --tasks lambada_openai,hellaswag,piqa,arc_easy,arc_challenge,winogrande,openbookqa --device cuda --batch_size 256
-lm_eval --model mamba_ssm --model_args pretrained=state-spaces/transformerpp-2.7b --tasks lambada_openai,hellaswag,piqa,arc_easy,arc_challenge,winogrande,openbookqa --device cuda --batch_size 256
-lm_eval --model mamba_ssm --model_args pretrained=state-spaces/mamba2attn-2.7b --tasks lambada_openai,hellaswag,piqa,arc_easy,arc_challenge,winogrande,openbookqa --device cuda --batch_size 256
-```
-
-Note that the result of each task might differ from reported values by 0.1-0.3 due to noise in the evaluation process.
-
-## Inference
-
-The script [benchmarks/benchmark_generation_mamba_simple.py](benchmarks/benchmark_generation_mamba_simple.py)
-1. autoloads a model from the Hugging Face Hub,
-2. generates completions of a user-specified prompt,
-3. benchmarks the inference speed of this generation.
-
-Other configurable options include the top-p (nucleus sampling) probability, and the softmax temperature.
-
-### Examples
-
-To test generation latency (e.g. batch size = 1) with different sampling strategies:
-
-``` sh
-python benchmarks/benchmark_generation_mamba_simple.py --model-name "state-spaces/mamba-2.8b" --prompt "My cat wrote all this CUDA code for a new language model and" --topp 0.9 --temperature 0.7 --repetition-penalty 1.2
-python benchmarks/benchmark_generation_mamba_simple.py --model-name "EleutherAI/pythia-2.8b" --prompt "My cat wrote all this CUDA code for a new language model and" --topp 0.9 --temperature 0.7 --repetition-penalty 1.2
-python benchmarks/benchmark_generation_mamba_simple.py --model-name "state-spaces/mamba-2.8b" --prompt "My cat wrote all this CUDA code for a new language model and" --minp 0.05 --topk 0 --temperature 0.7 --repetition-penalty 1.2
-```
-
-To test generation throughput with random prompts (e.g. large batch size):
-``` sh
-python benchmarks/benchmark_generation_mamba_simple.py --model-name "state-spaces/mamba-2.8b" --batch 64
-python benchmarks/benchmark_generation_mamba_simple.py --model-name "EleutherAI/pythia-2.8b" --batch 64
-```
-
-With Mamba-2, you just need to change the model name:
-``` sh
-python benchmarks/benchmark_generation_mamba_simple.py --model-name "state-spaces/mamba2-2.7b" --prompt "My cat wrote all this CUDA code for a new language model and" --topp 0.9 --temperature 0.7 --repetition-penalty 1.2
-```
-
-
-## Troubleshooting
-
-### Precision
-Our models were trained using PyTorch [AMP](https://pytorch.org/docs/stable/amp.html) for mixed precision. AMP keeps model parameters in float32 and casts to half precision when necessary.
-On the other hand, other frameworks like DeepSpeed store parameters in float16 and upcasts when necessary (e.g. for optimizer accumulation).
-
-We've observed that higher precision for the main model parameters may be necessary, because SSMs are sensitive to their recurrent dynamics. If you are experiencing instabilities,
-as a first step please try a framework storing parameters in fp32 (such as AMP).
-
-### Initialization
-Some parts of the model have initializations inherited from prior work on S4 models.
-For [example](https://github.com/state-spaces/mamba/blob/f0affcf69f06d1d06cef018ff640bf080a11c421/mamba_ssm/modules/mamba_simple.py#L102), the $\Delta$ parameter has a targeted range by initializing the bias of its linear projection.
-However, some frameworks may have post-initialization hooks (e.g. setting all bias terms in `nn.Linear` modules to zero).
-If this is the case, you may have to add custom logic (e.g. this [line](https://github.com/state-spaces/mamba/blob/f0affcf69f06d1d06cef018ff640bf080a11c421/mamba_ssm/modules/mamba_simple.py#L104) turns off re-initializing in our trainer, but would be a no-op in any other framework)
-that is specific to the training framework.
-
-## Additional Prerequisites for AMD cards
-
-### Patching ROCm
-
-If you are on ROCm 6.0, run the following steps to avoid errors during compilation. This is not required for ROCm 6.1 onwards.
-
-1. Locate your ROCm installation directory. This is typically found at `/opt/rocm/`, but may vary depending on your installation.
-
-2. Apply the Patch. Run with `sudo` in case you encounter permission issues.
-   ```bash
-    patch /opt/rocm/include/hip/amd_detail/amd_hip_bf16.h < rocm_patch/rocm6_0.patch 
-   ```
-
-
-## Citation
-
-If you use this codebase, or otherwise find our work valuable, please cite Mamba:
-```
-@article{mamba,
-  title={Mamba: Linear-Time Sequence Modeling with Selective State Spaces},
-  author={Gu, Albert and Dao, Tri},
-  journal={arXiv preprint arXiv:2312.00752},
-  year={2023}
-}
-
-@inproceedings{mamba2,
-  title={Transformers are {SSM}s: Generalized Models and Efficient Algorithms Through Structured State Space Duality},
-  author={Dao, Tri and Gu, Albert},
-  booktitle={International Conference on Machine Learning (ICML)},
-  year={2024}
-}
-
-@misc{lahoti2026mamba3improvedsequencemodeling,
-      title={Mamba-3: Improved Sequence Modeling using State Space Principles}, 
-      author={Aakash Lahoti and Kevin Y. Li and Berlin Chen and Caitlin Wang and Aviv Bick and J. Zico Kolter and Tri Dao and Albert Gu},
-      year={2026},
-      eprint={2603.15569},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2603.15569}, 
-}
-```
+- Forked from [state-spaces/mamba](https://github.com/state-spaces/mamba) (Gu & Dao) — the
+  backbone scaffolding, and the SSD formulation the U phase builds on. Original license retained
+  ([LICENSE](LICENSE)).
+- The Metal substrate in `kernels/metal/include` derives from ThunderMittens (an Apple MSL port of
+  [ThunderKittens](https://github.com/HazyResearch/ThunderKittens)); see
+  [kernels/metal/NOTICE](kernels/metal/NOTICE).
+- `train/muon.py` vendors [Muon](https://github.com/KellerJordan/Muon) (Keller Jordan, MIT).
