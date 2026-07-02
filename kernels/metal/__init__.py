@@ -20,7 +20,8 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _INCLUDE = os.path.join(_HERE, "include")
 _SRC = os.path.join(_HERE, "src")
 _METALLIB = os.path.join(_HERE, "aum.metallib")
-_METAL_SOURCES = [os.path.join(_SRC, "mamba2.metal"), os.path.join(_SRC, "aum_decode.metal")]
+_METAL_SOURCES = [os.path.join(_SRC, "mamba2.metal"), os.path.join(_SRC, "aum_decode.metal"),
+                  os.path.join(_SRC, "aum_unfold.metal")]
 
 
 def build_metallib(force: bool = False) -> str:
@@ -69,6 +70,19 @@ def mamba2_bwd(C, B, X, cumlog, dY):
 def mamba2_bwd_chunked(C, B, X, cumlog, dY):
     """The chunked linear-time backward, forced (testing/benchmarks). N%64==0, N>=128."""
     return _ext.mamba2_bwd_chunked(C, B, X, cumlog, dY)
+
+
+def aum_operands(q, k, v, phi, rho_tau, freqs, eps=1e-6):
+    """Fused U-phase operand builder (§4): C = R(phi)q, B = R(phi)(k/||k||), X = rho*tau*(v/||v||),
+    reading (B,N,H,Dh) bf16 and writing the kernel layout (B,H,N,D). phi/rho_tau (B,N,H) fp32;
+    freqs (Dh/2) fp32. One pass — replaces the host rotation/norm/scale/rearrange chain."""
+    return _ext.aum_operands(q, k, v, phi, rho_tau, freqs, float(eps))
+
+
+def aum_epilogue(Y, v, z, d_skip, norm_weight, eps=1e-5):
+    """Fused U-phase epilogue: silu(z) * RMSNorm(Y + d_skip*v) * norm_weight. Y (B,H,N,D) bf16;
+    v,z (B,N,H,Dh) bf16; d_skip flat (H*Dh) fp32; norm_weight (Dh) fp32. Writes (B,N,H,Dh)."""
+    return _ext.aum_epilogue(Y, v, z, d_skip, norm_weight, float(eps))
 
 
 def aum_decode(S, alpha, x, k_rot, q_rot):

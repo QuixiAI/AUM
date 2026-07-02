@@ -187,10 +187,12 @@ kernel void ssd_chunk_scan(device const float *Sin [[buffer(0)]],
 }
 
 // Per-query-tile output: intra-chunk decay tiles (bounded by the chunk) plus the
-// inter-chunk state term. Grid (N/8, H, B) like the quadratic kernel.
+// inter-chunk state term. COOPERATIVE: grid (C, H, B) with TPC warps per threadgroup — one
+// threadgroup per chunk, each warp owning one query tile. Every S_c quadrant is staged into
+// threadgroup memory ONCE per chunk (cooperative load) and consumed by all TPC warps —
+// amortizing the dominant state-read traffic by TPC (the D=128 mid-range bottleneck).
 // Output accumulates per 64-wide half (QB halves, QB = D/64); the inter-chunk term loops the
-// stored S quadrants: y[:, xq] += C[:, kq] @ S[kq, xq]. At D=64 (QB=1) this reduces exactly to
-// the untiled kernel.
+// staged S quadrants: y[:, xq] += C[:, kq] @ S[kq, xq].
 template <int D>
 kernel void ssd_chunk_out(device   bf16       *Cq [[buffer(0)]],
                           device   bf16       *Bm [[buffer(1)]],
@@ -201,10 +203,13 @@ kernel void ssd_chunk_out(device   bf16       *Cq [[buffer(0)]],
                           constant unsigned   &N  [[buffer(6)]],
                           constant unsigned   &H  [[buffer(7)]],
                           uint3 blockIdx [[threadgroup_position_in_grid]],
-                          uint  laneId   [[thread_index_in_simdgroup]]) {
+                          uint  tid  [[thread_index_in_threadgroup]],
+                          uint  warp [[simdgroup_index_in_threadgroup]],
+                          uint  laneId [[thread_index_in_simdgroup]]) {
     static_assert(D == 64 || D == 128, "ssd_chunk_out supports D in {64,128}");
     constexpr int TPC = SSD_CHUNK_L / 8;
     constexpr int QB = D / 64;
+    using G = group<TPC>;
     using gl_t  = gl<bfloat, 1, -1, -1, D>;
     using gl_cl = gl<float, 1, -1, 1, -1>;
     gl_t  gC(Cq, nullptr, H, N, nullptr);
@@ -212,8 +217,8 @@ kernel void ssd_chunk_out(device   bf16       *Cq [[buffer(0)]],
     gl_t  gX(X, nullptr, H, N, nullptr);
     gl_t  gY(Y, nullptr, H, N, nullptr);
     gl_cl gcl(cl, nullptr, H, nullptr, N);
-    const int qi = blockIdx.x, head = blockIdx.y, batch = blockIdx.z;
-    const int c = qi / TPC;                       // this tile's chunk
+    const int c = blockIdx.x, head = blockIdx.y, batch = blockIdx.z;
+    const int qi = c * TPC + (int)warp;           // this warp's query tile
     const int C = (int)N / SSD_CHUNK_L;
 
     rt_bf<8, D> c_reg;
@@ -227,6 +232,7 @@ kernel void ssd_chunk_out(device   bf16       *Cq [[buffer(0)]],
         zero(y_blk[xq]);
 
     // inter-chunk: y = diag(exp(cl_i - cl[r_{c-1}])) * (C @ S_c)   (skip for chunk 0)
+    threadgroup st_bf<64, 64> sS;                 // one staged state quadrant (8KB)
     if (c > 0) {
         gl<bfloat, 1, -1, D, D> gs(const_cast<device bf16*>(Sex), nullptr,
                                    (int)H * C, nullptr, nullptr);
@@ -234,9 +240,12 @@ kernel void ssd_chunk_out(device   bf16       *Cq [[buffer(0)]],
             rt_bf<8, 64> c_kq;
             load(c_kq, gC, {batch, head, qi, kq}, laneId);
             for (int xq = 0; xq < QB; ++xq) {
+                G::load(sS, gs, {batch, head * C + c, kq, xq}, tid);   // once per chunk
+                threadgroup_barrier(metal::mem_flags::mem_threadgroup);
                 rt_bf<64, 64> s_bf;
-                load(s_bf, gs, {batch, head * C + c, kq, xq}, laneId);
+                load(s_bf, sS, laneId);
                 mma_AB(y_blk[xq], c_kq, s_bf, y_blk[xq]);
+                threadgroup_barrier(metal::mem_flags::mem_threadgroup);
             }
         }
         const float cl_ref = cl[((long)batch * (int)H + head) * (long)N
@@ -305,6 +314,8 @@ kernel void ssd_chunk_out(device   bf16       *Cq [[buffer(0)]],
     device const bf16 *Sex [[buffer(4)]], device bf16 *Y [[buffer(5)]],              \
     constant unsigned &N [[buffer(6)]], constant unsigned &H [[buffer(7)]],          \
     uint3 blockIdx [[threadgroup_position_in_grid]],                                 \
+    uint tid [[thread_index_in_threadgroup]],                                        \
+    uint warp [[simdgroup_index_in_threadgroup]],                                    \
     uint laneId [[thread_index_in_simdgroup]]);
 
 instantiate_ssd_chunk(64);
@@ -401,7 +412,8 @@ kernel void ssd_chunk_rscan(device const float *Gin [[buffer(0)]],
     }
 }
 
-// K6: dC — chunk-bounded intra tiles + the inter term w_t (dY_t Sex_c^T). Grid (N/8, H, B).
+// K6: dC — chunk-bounded intra tiles + the inter term w_t (dY_t Sex_c^T). COOPERATIVE:
+// grid (C, H, B) x TPC warps; Sex quadrants staged into threadgroup memory once per chunk.
 template <int D>
 kernel void ssd_chunk_bwd_row(device   bf16     *Cq [[buffer(0)]],
                               device   bf16     *Bm [[buffer(1)]],
@@ -413,18 +425,21 @@ kernel void ssd_chunk_bwd_row(device   bf16     *Cq [[buffer(0)]],
                               constant unsigned &N  [[buffer(7)]],
                               constant unsigned &H  [[buffer(8)]],
                               uint3 blockIdx [[threadgroup_position_in_grid]],
-                              uint  laneId   [[thread_index_in_simdgroup]]) {
+                              uint  tid  [[thread_index_in_threadgroup]],
+                              uint  warp [[simdgroup_index_in_threadgroup]],
+                              uint  laneId [[thread_index_in_simdgroup]]) {
     static_assert(D == 64 || D == 128, "ssd_chunk_bwd_row supports D in {64,128}");
     constexpr int TPC = SSD_CHUNK_L / 8;
     constexpr int QB = D / 64;
+    using G = group<TPC>;
     using gl_t  = gl<bfloat, 1, -1, -1, D>;
     using gl_cl = gl<float, 1, -1, 1, -1>;
     gl_t  gC(Cq, nullptr, H, N, nullptr), gB(Bm, nullptr, H, N, nullptr);
     gl_t  gX(X, nullptr, H, N, nullptr), gdY(dY, nullptr, H, N, nullptr);
     gl_t  gdC(dC, nullptr, H, N, nullptr);
     gl_cl gcl(cl, nullptr, H, nullptr, N);
-    const int i = blockIdx.x, head = blockIdx.y, batch = blockIdx.z;
-    const int c = i / TPC;
+    const int c = blockIdx.x, head = blockIdx.y, batch = blockIdx.z;
+    const int i = c * TPC + (int)warp;            // this warp's row tile
     const int C = (int)N / SSD_CHUNK_L;
 
     rt_bf<8, D> c_i, dy_i;
@@ -439,16 +454,20 @@ kernel void ssd_chunk_bwd_row(device   bf16     *Cq [[buffer(0)]],
         zero(dc_blk[kq]);
 
     // inter: dC_i[:, kq] += w_i * sum_xq dY_i[:, xq] @ Sex_c[kq, xq]^T   (skip chunk 0)
+    threadgroup st_bf<64, 64> sS;                 // one staged state quadrant (8KB)
     if (c > 0) {
         gl<bfloat, 1, -1, D, D> gs(const_cast<device bf16*>(Sex), nullptr,
                                    (int)H * C, nullptr, nullptr);
         for (int kq = 0; kq < QB; ++kq) {
             for (int xq = 0; xq < QB; ++xq) {
+                G::load(sS, gs, {batch, head * C + c, kq, xq}, tid);   // once per chunk
+                threadgroup_barrier(metal::mem_flags::mem_threadgroup);
                 rt_bf<64, 64, ducks::rt_layout::col> s_col;
-                load(s_col, gs, {batch, head * C + c, kq, xq}, laneId);
+                load(s_col, sS, laneId);
                 rt_bf<8, 64> dy_xq;
                 load(dy_xq, gdY, {batch, head, i, xq}, laneId);
                 mma_ABt(dc_blk[kq], dy_xq, s_col, dc_blk[kq]);
+                threadgroup_barrier(metal::mem_flags::mem_threadgroup);
             }
         }
         const float cl_ref = cl[((long)batch * (int)H + head) * (long)N
@@ -497,7 +516,9 @@ kernel void ssd_chunk_bwd_row(device   bf16     *Cq [[buffer(0)]],
         store(gdC, dc_blk[kq], {batch, head, i, kq}, laneId);
 }
 
-// K7: dB, dX — chunk-bounded intra tiles + the inter terms through dKV_c. Grid (N/8, H, B).
+// K7: dB, dX — chunk-bounded intra tiles + the inter terms through dKV_c. COOPERATIVE:
+// grid (C, H, B) x TPC warps; each dKV quadrant staged into threadgroup memory once per chunk
+// and consumed twice (row layout for dX's mma_AB, col layout for dB's mma_ABt).
 template <int D>
 kernel void ssd_chunk_bwd_col(device   bf16     *Cq [[buffer(0)]],
                               device   bf16     *Bm [[buffer(1)]],
@@ -510,18 +531,21 @@ kernel void ssd_chunk_bwd_col(device   bf16     *Cq [[buffer(0)]],
                               constant unsigned &N  [[buffer(8)]],
                               constant unsigned &H  [[buffer(9)]],
                               uint3 blockIdx [[threadgroup_position_in_grid]],
-                              uint  laneId   [[thread_index_in_simdgroup]]) {
+                              uint  tid  [[thread_index_in_threadgroup]],
+                              uint  warp [[simdgroup_index_in_threadgroup]],
+                              uint  laneId [[thread_index_in_simdgroup]]) {
     static_assert(D == 64 || D == 128, "ssd_chunk_bwd_col supports D in {64,128}");
     constexpr int TPC = SSD_CHUNK_L / 8;
     constexpr int QB = D / 64;
+    using G = group<TPC>;
     using gl_t  = gl<bfloat, 1, -1, -1, D>;
     using gl_cl = gl<float, 1, -1, 1, -1>;
     gl_t  gC(Cq, nullptr, H, N, nullptr), gB(Bm, nullptr, H, N, nullptr);
     gl_t  gX(X, nullptr, H, N, nullptr), gdY(dY, nullptr, H, N, nullptr);
     gl_t  gdB(dB, nullptr, H, N, nullptr), gdX(dX, nullptr, H, N, nullptr);
     gl_cl gcl(cl, nullptr, H, nullptr, N);
-    const int j = blockIdx.x, head = blockIdx.y, batch = blockIdx.z;
-    const int c = j / TPC;
+    const int c = blockIdx.x, head = blockIdx.y, batch = blockIdx.z;
+    const int j = c * TPC + (int)warp;            // this warp's col tile
     const int C = (int)N / SSD_CHUNK_L;
 
     rt_bf<8, D, ducks::rt_layout::col> b_col, x_col;
@@ -538,6 +562,7 @@ kernel void ssd_chunk_bwd_col(device   bf16     *Cq [[buffer(0)]],
     }
 
     // inter: dX_j += w'_j B_j@dKV_c ; dB_j += w'_j X_j@dKV_c^T   (dKV of the last chunk is 0)
+    threadgroup st_bf<64, 64> sK;                 // one staged dKV quadrant (8KB)
     if (c < C - 1) {
         gl<bfloat, 1, -1, D, D> gk(const_cast<device bf16*>(dKV), nullptr,
                                    (int)H * C, nullptr, nullptr);
@@ -545,18 +570,17 @@ kernel void ssd_chunk_bwd_col(device   bf16     *Cq [[buffer(0)]],
             rt_bf<8, 64> b_kq;
             load(b_kq, gB, {batch, head, j, kq}, laneId);
             for (int xq = 0; xq < QB; ++xq) {
+                G::load(sK, gk, {batch, head * C + c, kq, xq}, tid);   // once per chunk
+                threadgroup_barrier(metal::mem_flags::mem_threadgroup);
                 rt_bf<64, 64> k_row;
-                load(k_row, gk, {batch, head * C + c, kq, xq}, laneId);
+                load(k_row, sK, laneId);
                 mma_AB(dx_blk[xq], b_kq, k_row, dx_blk[xq]);
-            }
-        }
-        for (int kq = 0; kq < QB; ++kq) {
-            for (int xq = 0; xq < QB; ++xq) {
                 rt_bf<64, 64, ducks::rt_layout::col> k_col;
-                load(k_col, gk, {batch, head * C + c, kq, xq}, laneId);
+                load(k_col, sK, laneId);
                 rt_bf<8, 64> x_xq;
                 load(x_xq, gX, {batch, head, j, xq}, laneId);
                 mma_ABt(db_blk[kq], x_xq, k_col, db_blk[kq]);
+                threadgroup_barrier(metal::mem_flags::mem_threadgroup);
             }
         }
         // w'_j = exp(cl[r_c] - cl_j)
@@ -645,6 +669,8 @@ kernel void ssd_chunk_bwd_col(device   bf16     *Cq [[buffer(0)]],
     device bf16 *dC [[buffer(6)]], constant unsigned &N [[buffer(7)]],               \
     constant unsigned &H [[buffer(8)]],                                              \
     uint3 blockIdx [[threadgroup_position_in_grid]],                                 \
+    uint tid [[thread_index_in_threadgroup]],                                        \
+    uint warp [[simdgroup_index_in_threadgroup]],                                    \
     uint laneId [[thread_index_in_simdgroup]]);                                      \
   template [[host_name("ssd_chunk_bwd_col_" #D)]] [[kernel]] void                    \
   ssd_chunk_bwd_col<D>(device bf16 *Cq [[buffer(0)]], device bf16 *Bm [[buffer(1)]], \
@@ -653,6 +679,8 @@ kernel void ssd_chunk_bwd_col(device   bf16     *Cq [[buffer(0)]],
     device bf16 *dB [[buffer(6)]], device bf16 *dX [[buffer(7)]],                    \
     constant unsigned &N [[buffer(8)]], constant unsigned &H [[buffer(9)]],          \
     uint3 blockIdx [[threadgroup_position_in_grid]],                                 \
+    uint tid [[thread_index_in_threadgroup]],                                        \
+    uint warp [[simdgroup_index_in_threadgroup]],                                    \
     uint laneId [[thread_index_in_simdgroup]]);
 
 instantiate_ssd_chunk_bwd(64);

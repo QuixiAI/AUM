@@ -11,10 +11,16 @@ Vendored substrate (header-only MSL, in ./include/):
   from the ThunderMittens working tree; unmodified here.
 
 Kernel sources (in ./src/):
-  - mamba2.metal      : SSD forward (quadratic materialized, D in {64,128}), the chunked
-                        LINEAR-TIME 3-kernel pipeline (ssd_chunk_kv/scan/out, D=64), and the
-                        backward (mamba2_bwd_row/col with in-kernel fp32 dcumlog row/col sums,
-                        D in {64,128}). Vendored verbatim from ThunderMittens' mamba2 kernel.
+  - mamba2.metal      : SSD forward (quadratic materialized), the chunked LINEAR-TIME pipeline
+                        (ssd_chunk_kv/scan/out + the gstate/rscan/bwd_row/bwd_col backward),
+                        64x64 quadrant-tiled and COOPERATIVE (threadgroup-per-chunk state
+                        staging), D in {64,128}; plus the quadratic backward
+                        (mamba2_bwd_row/col). Derived from ThunderMittens' mamba2 kernel; the
+                        chunked-pipeline extensions were built here and port back (see the
+                        session port-back notes).
+  - aum_unfold.metal  : the AUM-only fused U-phase operand pipeline (aum_operands: rotation
+                        ladder + k/v L2-norms + rho*tau + layout transpose; aum_epilogue:
+                        D-skip + gated RMSNorm + transpose back). Written for AUM-Ø.
 
 Host dispatch (./aum_metal.mm) and build (./__init__.py):
   Written for AUM-Ø; the generic torch-MPS encoder/plumbing follows ThunderMittens' tk_torch

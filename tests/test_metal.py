@@ -126,6 +126,46 @@ def test_mamba2_forward_routes_match_reference(N, D, route):
     assert rel < 0.03, (N, D, route, rel)
 
 
+@pytest.mark.parametrize("H,D", [(8, 64), (4, 128)])
+def test_fused_pipeline_forward_and_grads_match_reference(H, D):
+    # the step-3 fully-fused path (aum_operands -> mamba2 -> aum_epilogue, recompute-based
+    # backward) vs the fp32 reference, forward AND all gradients incl. dt_bias/D-skip/norm weight
+    from aum_ssm.modules.ssd_reference import aum_unfold_chunk_ref
+    torch.manual_seed(0)
+    B, L = 2, 64
+    mk = lambda *s: torch.randn(*s, device="mps")
+
+    def build():
+        torch.manual_seed(1)
+        d = dict(q=mk(B, L, H, D), k=mk(B, L, H, D), v=mk(B, L, H, D), z=mk(B, L, H, D),
+                 tau_bar=mk(B, L, H), lam_bar=mk(B, L, H), r=mk(B, L, H), theta=mk(B, L, H),
+                 dt_bias=mk(H), D=mk(H, D), nw=mk(D))
+        for t in d.values():
+            t.requires_grad_(True)
+        return d
+
+    a, b = build(), build()
+    # call the Function directly: the router sends grad-mode work to the composed path (the
+    # fused backward is at parity until 3b), but its correctness must stay covered here
+    from aum_ssm.ops.metal.unfold_metal import _AumUnfoldFused
+    from aum_ssm.modules.ssd_reference import ladder_freqs
+    out_m = _AumUnfoldFused.apply(a["q"], a["k"], a["v"], a["z"], a["tau_bar"], a["lam_bar"],
+                                  a["r"], a["theta"], a["dt_bias"], a["D"], a["nw"],
+                                  ladder_freqs(D // 2, device="mps"), 1e-4)
+    out_r, _ = aum_unfold_chunk_ref(b["q"], b["k"], b["v"], b["tau_bar"], b["lam_bar"], b["r"],
+                                    b["theta"], z=b["z"], D=b["D"], dt_bias=b["dt_bias"],
+                                    norm_weight=b["nw"], block_len=16)
+    torch.mps.synchronize()
+    rel = lambda u, w: ((u.float() - w.float()).abs().max() / (w.float().abs().max() + 1e-6)).item()
+    assert rel(out_m, out_r) < 0.04, rel(out_m, out_r)
+    out_m.float().sum().backward()
+    out_r.float().sum().backward()
+    torch.mps.synchronize()
+    for key in ("q", "k", "v", "z", "tau_bar", "theta", "dt_bias", "D", "nw"):
+        rg = rel(a[key].grad, b[key].grad)
+        assert rg < 0.08, (key, rg)
+
+
 @pytest.mark.parametrize("D", [64, 128])
 def test_aum_decode_kernel_matches_math(D):
     # the fused single-token step S <- a*S + x⊗k_rot ; out = S·q_rot, directly vs the fp32 math

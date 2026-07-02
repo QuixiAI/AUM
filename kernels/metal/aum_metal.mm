@@ -146,7 +146,7 @@ static at::Tensor mamba2_chunked(const at::Tensor& C, const at::Tensor& B,
     e.pipeline("ssd_chunk_out_" + std::to_string(D));
     e.in(C, 0); e.in(B, 1); e.in(X, 2); e.in(cl, 3); e.in(s_ex, 4); e.out(out, 5);
     e.bytes(N, 6); e.bytes((unsigned)H, 7);
-    e.dispatch((int)N / 8, H, Bsz, 32, 1, 1);
+    e.dispatch(Cn, H, Bsz, 256, 1, 1);           // cooperative: one threadgroup per chunk
   });
   return out;
 }
@@ -157,7 +157,7 @@ static at::Tensor mamba2_mps(const at::Tensor& C_in, const at::Tensor& B_in,
   mamba2_check(C, cl);
   const unsigned N = (unsigned)C.size(2);
   const int D = C.size(3);
-  const unsigned chunk_min = (D == 64) ? 2048 : 8192;      // measured crossovers
+  const unsigned chunk_min = (D == 64) ? 2048 : 4096;      // measured crossovers (coop)
   if (N % kSsdChunkL != 0 || N < chunk_min)
     return mamba2_quadratic(C, B, X, cl);
   return mamba2_chunked(C, B, X, cl);
@@ -230,7 +230,7 @@ static std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mamba2_bwd_chu
     e.pipeline("ssd_chunk_out_" + std::to_string(D));
     e.in(C, 0); e.in(B, 1); e.in(X, 2); e.in(cl, 3); e.in(s_ex, 4); e.out(Y, 5);
     e.bytes(N, 6); e.bytes((unsigned)H, 7);
-    e.dispatch((int)N / 8, H, Bsz, 32, 1, 1);
+    e.dispatch(Cn, H, Bsz, 256, 1, 1);           // cooperative
   });
   encode([&](Encoder& e) {                              // G_c = dSex_c (reuses s_raw: dead after scan)
     e.pipeline("ssd_chunk_gstate_" + std::to_string(D));
@@ -248,14 +248,14 @@ static std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mamba2_bwd_chu
     e.pipeline("ssd_chunk_bwd_row_" + std::to_string(D));
     e.in(C, 0); e.in(B, 1); e.in(X, 2); e.in(cl, 3); e.in(dY, 4); e.in(s_ex, 5); e.out(dC, 6);
     e.bytes(N, 7); e.bytes((unsigned)H, 8);
-    e.dispatch((int)N / 8, H, Bsz, 32, 1, 1);
+    e.dispatch(Cn, H, Bsz, 256, 1, 1);           // cooperative
   });
   encode([&](Encoder& e) {                              // dB, dX
     e.pipeline("ssd_chunk_bwd_col_" + std::to_string(D));
     e.in(C, 0); e.in(B, 1); e.in(X, 2); e.in(cl, 3); e.in(dY, 4); e.in(dkv, 5);
     e.out(dB, 6); e.out(dX, 7);
     e.bytes(N, 8); e.bytes((unsigned)H, 9);
-    e.dispatch((int)N / 8, H, Bsz, 32, 1, 1);
+    e.dispatch(Cn, H, Bsz, 256, 1, 1);           // cooperative
   });
   // dcl = rowsum(M) - colsum(M) = <dY,Y> - <dX,X>  (exact identity, fp32 on host)
   auto dcl = (dY.to(at::kFloat) * Y.to(at::kFloat)).sum(-1)
@@ -272,7 +272,7 @@ static std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mamba2_bwd_mps
   mamba2_check(C, cl);
   const unsigned N = (unsigned)C.size(2);
   const int D = C.size(3);
-  const unsigned chunk_min = (D == 64) ? 2048 : 8192;      // measured forward crossovers
+  const unsigned chunk_min = (D == 64) ? 2048 : 4096;      // measured crossovers (coop)
   if (N % kSsdChunkL != 0 || N < chunk_min)
     return mamba2_bwd_quadratic(C, B, X, cl, dY);
   return mamba2_bwd_chunked(C, B, X, cl, dY);
@@ -312,6 +312,59 @@ static std::tuple<at::Tensor, at::Tensor> aum_decode_mps(
   return {out, S};
 }
 
+// ---- AUM fused U-phase operand pipeline (§4) ----
+// aum_operands: one pass builds the SSD operands C = R(phi)q, B = R(phi)k_hat, X = rho*tau*v_hat
+// from the model's (B, N, H, Dh) layout into the kernel's (B, H, N, D) layout (transpose free).
+static std::tuple<at::Tensor, at::Tensor, at::Tensor> aum_operands_mps(
+    const at::Tensor& q_in, const at::Tensor& k_in, const at::Tensor& v_in,
+    const at::Tensor& phi_in, const at::Tensor& rtw_in, const at::Tensor& freqs_in, double eps) {
+  TORCH_CHECK(q_in.device().is_mps() && q_in.scalar_type() == at::kBFloat16,
+              "aum_operands: q,k,v must be bf16 MPS");
+  TORCH_CHECK(phi_in.scalar_type() == at::kFloat && rtw_in.scalar_type() == at::kFloat &&
+              freqs_in.scalar_type() == at::kFloat, "aum_operands: phi/rtw/freqs must be fp32");
+  auto q = q_in.contiguous(), k = k_in.contiguous(), v = v_in.contiguous();
+  auto phi = phi_in.contiguous(), rtw = rtw_in.contiguous(), freqs = freqs_in.contiguous();
+  TORCH_CHECK(q.dim() == 4, "aum_operands: q,k,v expect (B, N, H, Dh)");
+  const int Bsz = q.size(0), H = q.size(2), D = q.size(3);
+  const unsigned N = (unsigned)q.size(1);
+  TORCH_CHECK(D % 64 == 0, "aum_operands: Dh must be a multiple of 64");
+  auto C = at::empty({Bsz, H, (long)N, D}, q.options());
+  auto B = at::empty_like(C), X = at::empty_like(C);
+  const float epsf = (float)eps;
+  encode([&](Encoder& e) {
+    e.pipeline("aum_operands");
+    e.in(q, 0); e.in(k, 1); e.in(v, 2); e.in(phi, 3); e.in(rtw, 4); e.in(freqs, 5);
+    e.out(C, 6); e.out(B, 7); e.out(X, 8);
+    e.bytes(N, 9); e.bytes((unsigned)H, 10); e.bytes((unsigned)D, 11); e.bytes(epsf, 12);
+    e.dispatch((int)N, H, Bsz, 32, 1, 1);          // one simdgroup per (b, l, h) row
+  });
+  return {C, B, X};
+}
+
+// aum_epilogue: out = silu(z) * RMSNorm(Y + Dskip*v) * w_norm, writing the model layout back.
+static at::Tensor aum_epilogue_mps(const at::Tensor& Y_in, const at::Tensor& v_in,
+                                   const at::Tensor& z_in, const at::Tensor& dsk_in,
+                                   const at::Tensor& wn_in, double eps) {
+  TORCH_CHECK(Y_in.device().is_mps() && Y_in.scalar_type() == at::kBFloat16,
+              "aum_epilogue: Y,v,z must be bf16 MPS");
+  TORCH_CHECK(dsk_in.scalar_type() == at::kFloat && wn_in.scalar_type() == at::kFloat,
+              "aum_epilogue: Dskip / norm weight must be fp32");
+  auto Y = Y_in.contiguous(), v = v_in.contiguous(), z = z_in.contiguous();
+  auto dsk = dsk_in.contiguous(), wn = wn_in.contiguous();
+  TORCH_CHECK(v.dim() == 4, "aum_epilogue: v,z expect (B, N, H, Dh)");
+  const int Bsz = v.size(0), H = v.size(2), D = v.size(3);
+  const unsigned N = (unsigned)v.size(1);
+  auto out = at::empty_like(v);
+  const float epsf = (float)eps;
+  encode([&](Encoder& e) {
+    e.pipeline("aum_epilogue");
+    e.in(Y, 0); e.in(v, 1); e.in(z, 2); e.in(dsk, 3); e.in(wn, 4); e.out(out, 5);
+    e.bytes(N, 6); e.bytes((unsigned)H, 7); e.bytes((unsigned)D, 8); e.bytes(epsf, 9);
+    e.dispatch((int)N, H, Bsz, 32, 1, 1);
+  });
+  return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("_set_library", &aum_set_library, "set the metallib path");
   m.def("mamba2", &mamba2_mps, "AUM-Ø SSD forward (MPS, auto-routed)");
@@ -319,4 +372,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("mamba2_bwd", &mamba2_bwd_mps, "AUM-Ø SSD backward (MPS, auto-routed)");
   m.def("mamba2_bwd_chunked", &mamba2_bwd_chunked_mps, "AUM-Ø SSD backward, forced chunked route");
   m.def("aum_decode", &aum_decode_mps, "AUM-Ø single-token U-phase decode step (MPS)");
+  m.def("aum_operands", &aum_operands_mps, "AUM-Ø fused U-phase operand builder (MPS)");
+  m.def("aum_epilogue", &aum_epilogue_mps, "AUM-Ø fused U-phase epilogue (MPS)");
 }
