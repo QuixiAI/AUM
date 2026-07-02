@@ -1,12 +1,14 @@
 #!/usr/bin/env python
 """Tokenize the AUM-Ø training corpus into packed uint16 token shards.
 
-Default mode reads the HuggingFace dataset list from ``train/datasets`` (one repo id per line),
-streams ``--samples-per-dataset`` (default 15 000) documents from each, tokenizes them with the
-AUM-Ø tokenizer (SmolLM2, vocab 49152 -> fits uint16), separates documents with the EOS id, and
-writes a flat token stream into fixed-size ``<split>_NNNNN.bin`` shards + a ``manifest.json``
-under ``train/data/`` (gitignored). Flat packing (no fixed context baked in) lets the training
-loader sample any ``seq_len`` window; ``--seq-len`` here is only a manifest hint.
+Default mode reads the HuggingFace dataset list from ``train/datasets`` (one ``org/repo`` or
+``org/repo:config`` per line), STREAMS ``--samples-per-dataset`` (default 15 000) documents from
+each — streaming + the limit means only the requested samples are ever fetched, never a full
+dataset — tokenizes them with the AUM-Ø tokenizer (SmolLM2, vocab 49152 -> fits uint16),
+separates documents with the EOS id, and writes a flat token stream into fixed-size
+``<split>_NNNNN.bin`` shards + a ``manifest.json`` under ``train/data/`` (gitignored). Flat
+packing (no fixed context baked in) lets the training loader sample any ``seq_len`` window;
+``--seq-len`` here is only a manifest hint.
 
 Dataset repos differ in schema; loading is robust to that: configs are auto-resolved (preferring
 English variants like ``eng_Latn``/``en``), the text field is auto-detected (``text``/``content``
@@ -29,6 +31,7 @@ Requires ``transformers`` + ``datasets`` at run time (pip install "aum_ssm[data]
 import argparse
 import gzip
 import glob
+import itertools
 import json
 import os
 import sys
@@ -77,8 +80,12 @@ def _require_datasets():
         raise SystemExit('datasets is required for HF sources: pip install "aum_ssm[data]"') from e
 
 
-def _load_stream(name, split="train"):
-    """load_dataset with config + split auto-resolution, streaming. Returns (iterable, config)."""
+def _load_stream(name, split="train", config=None):
+    """load_dataset with config + split auto-resolution, streaming. Returns (iterable, config).
+
+    Streaming + the caller's sample limit means only the requested documents are ever fetched —
+    no dataset is downloaded in full.
+    """
     hf = _require_datasets()
 
     def _load(config):
@@ -92,14 +99,22 @@ def _load_stream(name, split="train"):
             print(f"  [{name}] split {split!r} missing; using {pick!r} (available: {avail})")
             return hf.load_dataset(name, config, split=pick, streaming=True)
 
+    if config is not None:                                  # explicit repo:config — no guessing
+        return _load(config), config
     try:
         return _load(None), None
     except ValueError as e:
         if "Config name is missing" not in str(e) and "BuilderConfig" not in str(e):
             raise
     configs = hf.get_dataset_config_names(name)
-    chosen = next((p for p in _PREFERRED_CONFIGS if p in configs), configs[0])
-    print(f"  [{name}] {len(configs)} configs; using {chosen!r}")
+    chosen = next((p for p in _PREFERRED_CONFIGS if p in configs), None)
+    if chosen is None:
+        chosen = configs[0]
+        print(f"  [{name}] WARNING: {len(configs)} configs and none matched the preferred names "
+              f"{_PREFERRED_CONFIGS}; falling back to {chosen!r} (alphabetically first — almost "
+              f"certainly NOT what you want). Pin one as '{name}:<config>' in the datasets file.")
+    else:
+        print(f"  [{name}] {len(configs)} configs; using {chosen!r}")
     return _load(chosen), chosen
 
 
@@ -115,9 +130,10 @@ def _extract_text(example, text_column=None):
     return max(strings, key=len) if strings else ""
 
 
-def iter_hf(source, split, text_column, limit=0):
-    """Stream documents from a HF dataset (always streaming — nothing is downloaded in full)."""
-    ds, _ = _load_stream(source, split)
+def iter_hf(source, split, text_column, limit=0, config=None):
+    """Stream up to `limit` documents from a HF dataset. Streaming + the limit means only the
+    requested samples are fetched — never the full dataset."""
+    ds, _ = _load_stream(source, split, config)
     n = 0
     for ex in ds:
         yield _extract_text(ex, text_column)
@@ -138,14 +154,17 @@ def iter_documents(source, split, text_column, limit):
 
 
 def read_dataset_list(path):
-    """One HF repo id per line; blank lines and #-comments skipped."""
-    names = []
+    """One dataset per line: `org/repo` or `org/repo:config`. Blanks and #-comments skipped.
+    Returns [(name, config_or_None)]."""
+    entries = []
     with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.split("#")[0].strip()
-            if line:
-                names.append(line)
-    return names
+            if not line:
+                continue
+            name, _, config = line.partition(":")
+            entries.append((name, config or None))
+    return entries
 
 
 # --------------------------------------------------------------------------- sharding
@@ -239,9 +258,10 @@ def _setup(args):
     if args.val_fraction > 0:
         writers["val"] = ShardWriter(args.out_dir, "val", args.shard_size_tokens)
         every = max(2, round(1.0 / args.val_fraction))
-        writer_for = lambda i: writers["val" if i % every == 0 else "train"]
+        counter = itertools.count()                      # GLOBAL stripe — never restarts per
+        writer_for = lambda _i: writers["val" if next(counter) % every == 0 else "train"]  # source
     else:
-        writer_for = lambda _: writers["train"]
+        writer_for = lambda _i: writers["train"]
     return vocab_size, eos_id, encode_fn, writers, writer_for
 
 
@@ -275,13 +295,15 @@ def run_mix(args):
           f"({args.datasets_file}) -> {args.out_dir}")
 
     per_source, n_total = {}, 0
-    for si, name in enumerate(names):
-        print(f"[{si + 1}/{len(names)}] {name}")
+    for si, (name, config) in enumerate(names):
+        label = f"{name}:{config}" if config else name
+        print(f"[{si + 1}/{len(names)}] {label}")
         before = {s: w.total for s, w in writers.items()}
-        docs = iter_hf(name, args.split, args.text_column, limit=args.samples_per_dataset)
+        docs = iter_hf(name, args.split, args.text_column,
+                       limit=args.samples_per_dataset, config=config)
         n = pack((d for d in docs if d), encode_fn, eos_id, writer_for, args.batch_docs)
         tokens = {s: writers[s].total - before[s] for s in writers}
-        per_source[name] = {"documents": n, "tokens": tokens}
+        per_source[label] = {"documents": n, "tokens": tokens}
         n_total += n
         print(f"  {n:,} docs, {sum(tokens.values()):,} tokens")
 
