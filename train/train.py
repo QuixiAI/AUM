@@ -38,13 +38,12 @@ Pieces it ties together:
     # resume
     python train/train.py --resume train/checkpoints/<run>/step-000200
 
-    # with Weights & Biases reporting (accelerate tracker; WANDB_MODE=offline works too)
-    python train/train.py --wandb --wandb-project aum-ssm
-
 Progress is a tqdm bar over optimizer steps (loss/stage/lr/tok-s live in the postfix); periodic
 loss-part lines, eval results, and stage transitions print above it and append to
-<run>/metrics.jsonl. --wandb mirrors everything to W&B (train/* per log interval, val/* per
-eval, lr, tokens, stage).
+<run>/metrics.jsonl. W&B reporting is ON by default whenever the wandb package is installed
+(train/* per log interval, val/* per eval, lr, tokens, stage; --wandb-project to name the
+project, WANDB_MODE=offline works, --no-wandb to disable; an init failure degrades to a
+warning, never kills the run).
 
 Single-process only for now (MPS or one GPU): the vendored Muon here is the single-device
 variant and the silence-path trainer reaches through the raw module. `accelerate launch` with
@@ -231,10 +230,19 @@ def main():
     ap.add_argument("--save-every", type=int, default=1000)
     ap.add_argument("--log-every", type=int, default=10)
     ap.add_argument("--no-tqdm", action="store_true", help="plain-print progress (logs/CI)")
-    ap.add_argument("--wandb", action="store_true", help="report to Weights & Biases")
+    ap.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=None,
+                    help="report to Weights & Biases (default: ON when the wandb package is "
+                         "installed; --no-wandb to disable)")
     ap.add_argument("--wandb-project", default="aum-ssm")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
+
+    if args.wandb is None:                              # default: report whenever wandb exists
+        try:
+            import wandb  # noqa: F401
+            args.wandb = True
+        except ImportError:
+            args.wandb = False
 
     from accelerate import Accelerator
     from accelerate.utils import set_seed
@@ -309,9 +317,14 @@ def main():
     log_path = os.path.join(run_dir, "metrics.jsonl")
 
     if args.wandb:
-        accelerator.init_trackers(args.wandb_project, config=vars(args),
-                                  init_kwargs={"wandb": {"name": args.run_name,
-                                                         "resume": "allow"}})
+        try:
+            accelerator.init_trackers(args.wandb_project, config=vars(args),
+                                      init_kwargs={"wandb": {"name": args.run_name,
+                                                             "resume": "allow"}})
+        except Exception as e:                           # not logged in / offline / etc.
+            accelerator.print(f"WARNING: wandb init failed ({e}); continuing without it "
+                              f"(wandb login, or WANDB_MODE=offline, or --no-wandb)")
+            args.wandb = False
 
     accelerator.print(
         f"AUM-Ø train: {n_params / 1e6:.1f}M params on {accelerator.device} | "
