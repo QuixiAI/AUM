@@ -1,24 +1,29 @@
 #!/usr/bin/env python
-"""Tokenize a corpus into packed uint16 token shards for AUM-Ø training.
+"""Tokenize the AUM-Ø training corpus into packed uint16 token shards.
 
-Reads documents (a HuggingFace dataset id, or local ``.txt`` / ``.jsonl`` files), tokenizes them
-with the AUM-Ø tokenizer (SmolLM2, vocab 49152 -> fits uint16), separates documents with the EOS
-id, and writes a flat token stream split into fixed-size ``<split>_NNNNN.bin`` shards plus a
-``manifest.json``. Flat packing (no fixed context baked in) lets the training loader sample any
-``seq_len`` window; ``--seq-len`` here is only a manifest hint / sequence-count estimate.
+Default mode reads the HuggingFace dataset list from ``train/datasets`` (one repo id per line),
+streams ``--samples-per-dataset`` (default 15 000) documents from each, tokenizes them with the
+AUM-Ø tokenizer (SmolLM2, vocab 49152 -> fits uint16), separates documents with the EOS id, and
+writes a flat token stream into fixed-size ``<split>_NNNNN.bin`` shards + a ``manifest.json``
+under ``train/data/`` (gitignored). Flat packing (no fixed context baked in) lets the training
+loader sample any ``seq_len`` window; ``--seq-len`` here is only a manifest hint.
 
-    # HuggingFace streaming corpus
-    python train/prepare_data.py --source HuggingFaceFW/fineweb-edu --split train \
-        --streaming --out-dir train/data/fineweb-edu --shard-size-tokens 100_000_000
+Dataset repos differ in schema; loading is robust to that: configs are auto-resolved (preferring
+English variants like ``eng_Latn``/``en``), the text field is auto-detected (``text``/``content``
+/ first string column), and the split falls back to the first available one.
 
-    # local files (one document per .txt line; jsonl reads --text-column)
+    # the default corpus: 15k samples from every dataset in train/datasets -> train/data/
+    python train/prepare_data.py
+
+    # a single HF dataset or local files instead
+    python train/prepare_data.py --source HuggingFaceFW/fineweb-edu --streaming --out-dir train/data/fineweb-edu
     python train/prepare_data.py --source 'corpus/*.jsonl' --out-dir train/data/mine --val-fraction 0.01
 
     # validate the packing/sharding mechanics with no external deps
     python train/prepare_data.py --self-test
 
 A shard reads back as:  np.memmap(path, dtype=np.uint16, mode="r")  -> a 1-D token stream.
-Requires ``transformers`` (always) and ``datasets`` (only for HF sources) at run time.
+Requires ``transformers`` + ``datasets`` at run time (pip install "aum_ssm[data]").
 """
 
 import argparse
@@ -46,7 +51,8 @@ def _open(path):
 
 
 def iter_local(paths, text_column):
-    """Yield strings from local files: each non-empty line of .txt; obj[text_column] of .jsonl."""
+    """Yield strings from local files: each non-empty line of .txt; the text field of .jsonl
+    (explicit --text-column, else auto-detected)."""
     for path in paths:
         is_jsonl = ".jsonl" in path or ".ndjson" in path
         with _open(path) as f:
@@ -54,28 +60,92 @@ def iter_local(paths, text_column):
                 line = line.strip()
                 if not line:
                     continue
-                yield json.loads(line).get(text_column, "") if is_jsonl else line
+                yield _extract_text(json.loads(line), text_column) if is_jsonl else line
 
 
-def iter_hf(source, split, text_column, streaming):
+# Config / text-field preferences for heterogeneous HF repos (fineweb-2 and friends are
+# per-language configs; books/phrase corpora use different text keys).
+_PREFERRED_CONFIGS = ("eng_Latn", "en", "eng", "english", "default", "sample-10BT")
+_TEXT_KEYS = ("text", "content", "markdown", "raw_content", "document", "chapter")
+
+
+def _require_datasets():
     try:
-        from datasets import load_dataset
+        import datasets  # noqa: F401
+        return datasets
     except ImportError as e:  # pragma: no cover
-        raise SystemExit("datasets is required for HF sources: pip install datasets") from e
-    ds = load_dataset(source, split=split, streaming=streaming)
+        raise SystemExit('datasets is required for HF sources: pip install "aum_ssm[data]"') from e
+
+
+def _load_stream(name, split="train"):
+    """load_dataset with config + split auto-resolution, streaming. Returns (iterable, config)."""
+    hf = _require_datasets()
+
+    def _load(config):
+        try:
+            return hf.load_dataset(name, config, split=split, streaming=True)
+        except ValueError as e:
+            if "split" not in str(e).lower():
+                raise
+            avail = hf.get_dataset_split_names(name, config)
+            pick = next((s for s in avail if "train" in s), avail[0])
+            print(f"  [{name}] split {split!r} missing; using {pick!r} (available: {avail})")
+            return hf.load_dataset(name, config, split=pick, streaming=True)
+
+    try:
+        return _load(None), None
+    except ValueError as e:
+        if "Config name is missing" not in str(e) and "BuilderConfig" not in str(e):
+            raise
+    configs = hf.get_dataset_config_names(name)
+    chosen = next((p for p in _PREFERRED_CONFIGS if p in configs), configs[0])
+    print(f"  [{name}] {len(configs)} configs; using {chosen!r}")
+    return _load(chosen), chosen
+
+
+def _extract_text(example, text_column=None):
+    """The document string of a heterogeneous example: the given column, a known key, or the
+    first (longest) string field."""
+    if text_column and isinstance(example.get(text_column), str):
+        return example[text_column]
+    for k in _TEXT_KEYS:
+        if isinstance(example.get(k), str):
+            return example[k]
+    strings = [v for v in example.values() if isinstance(v, str)]
+    return max(strings, key=len) if strings else ""
+
+
+def iter_hf(source, split, text_column, limit=0):
+    """Stream documents from a HF dataset (always streaming — nothing is downloaded in full)."""
+    ds, _ = _load_stream(source, split)
+    n = 0
     for ex in ds:
-        yield ex[text_column]
+        yield _extract_text(ex, text_column)
+        n += 1
+        if limit and n >= limit:
+            return
 
 
-def iter_documents(source, split, text_column, streaming, limit):
+def iter_documents(source, split, text_column, limit):
     matches = glob.glob(source)
     it = iter_local(sorted(matches), text_column) if matches else \
-        iter_hf(source, split, text_column, streaming)
+        iter_hf(source, split, text_column, limit)
     for i, doc in enumerate(it):
         if limit and i >= limit:
             return
         if doc:
             yield doc
+
+
+def read_dataset_list(path):
+    """One HF repo id per line; blank lines and #-comments skipped."""
+    names = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.split("#")[0].strip()
+            if line:
+                names.append(line)
+    return names
 
 
 # --------------------------------------------------------------------------- sharding
@@ -150,7 +220,8 @@ def write_manifest(out_dir, tokenizer, vocab_size, eos_id, seq_len, source, writ
 
 
 # --------------------------------------------------------------------------- driver
-def run(args):
+def _setup(args):
+    """Tokenizer + vocab check + writers + the val-striping selector, shared by both modes."""
     from train.tokenizer import load_tokenizer, verify  # local import: only needed for real runs
 
     tok = load_tokenizer(args.tokenizer)
@@ -171,17 +242,52 @@ def run(args):
         writer_for = lambda i: writers["val" if i % every == 0 else "train"]
     else:
         writer_for = lambda _: writers["train"]
+    return vocab_size, eos_id, encode_fn, writers, writer_for
 
-    docs = iter_documents(args.source, args.split, args.text_column, args.streaming, args.limit_docs)
-    n_docs = pack(docs, encode_fn, eos_id, writer_for, args.batch_docs)
+
+def _finish(args, vocab_size, eos_id, writers, source, n_docs):
     for w in writers.values():
         w.close()
     m = write_manifest(args.out_dir, args.tokenizer, vocab_size, eos_id, args.seq_len,
-                       args.source, writers)
-    print(f"tokenized {n_docs} docs -> {args.out_dir}")
+                       source, writers)
+    print(f"tokenized {n_docs:,} docs -> {args.out_dir}")
     for split, s in m["splits"].items():
         print(f"  {split:5s}: {s['total_tokens']:>14,} tokens  "
               f"~{s['approx_sequences']:>10,} x {args.seq_len}-seqs  ({len(s['shards'])} shards)")
+
+
+def run(args):
+    """Single-source mode: one HF dataset id or a local path/glob."""
+    vocab_size, eos_id, encode_fn, writers, writer_for = _setup(args)
+    docs = iter_documents(args.source, args.split, args.text_column, args.limit_docs)
+    n_docs = pack(docs, encode_fn, eos_id, writer_for, args.batch_docs)
+    _finish(args, vocab_size, eos_id, writers, args.source, n_docs)
+
+
+def run_mix(args):
+    """Default mode: N samples from every HF dataset listed in --datasets-file, one shard
+    stream, with per-source document/token accounting in the manifest."""
+    names = read_dataset_list(args.datasets_file)
+    if not names:
+        raise SystemExit(f"no datasets listed in {args.datasets_file}")
+    vocab_size, eos_id, encode_fn, writers, writer_for = _setup(args)
+    print(f"corpus: {args.samples_per_dataset:,} samples from each of {len(names)} datasets "
+          f"({args.datasets_file}) -> {args.out_dir}")
+
+    per_source, n_total = {}, 0
+    for si, name in enumerate(names):
+        print(f"[{si + 1}/{len(names)}] {name}")
+        before = {s: w.total for s, w in writers.items()}
+        docs = iter_hf(name, args.split, args.text_column, limit=args.samples_per_dataset)
+        n = pack((d for d in docs if d), encode_fn, eos_id, writer_for, args.batch_docs)
+        tokens = {s: writers[s].total - before[s] for s in writers}
+        per_source[name] = {"documents": n, "tokens": tokens}
+        n_total += n
+        print(f"  {n:,} docs, {sum(tokens.values()):,} tokens")
+
+    source = {"datasets_file": args.datasets_file, "samples_per_dataset": args.samples_per_dataset,
+              "per_source": per_source}
+    _finish(args, vocab_size, eos_id, writers, source, n_total)
 
 
 def self_test():
@@ -223,28 +329,36 @@ def self_test():
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Tokenize a corpus into packed uint16 shards.")
-    ap.add_argument("--source", help="HF dataset id OR a local path/glob (.txt/.jsonl[.gz])")
-    ap.add_argument("--out-dir", default=os.path.join("train", "data", "corpus"))
-    ap.add_argument("--split", default="train", help="HF split name")
-    ap.add_argument("--text-column", default="text", help="jsonl/HF field holding the document text")
+    here = os.path.dirname(os.path.abspath(__file__))
+    ap = argparse.ArgumentParser(description="Tokenize the AUM-Ø corpus into packed uint16 shards.")
+    ap.add_argument("--source", default=None,
+                    help="a single HF dataset id OR a local path/glob (.txt/.jsonl[.gz]); "
+                         "omit to use --datasets-file")
+    ap.add_argument("--datasets-file", default=os.path.join(here, "datasets"),
+                    help="file listing HF dataset ids, one per line (default mode)")
+    ap.add_argument("--samples-per-dataset", type=int, default=15_000,
+                    help="documents streamed from EACH listed dataset")
+    ap.add_argument("--out-dir", default=os.path.join(here, "data"))
+    ap.add_argument("--split", default="train", help="HF split name (auto-falls back)")
+    ap.add_argument("--text-column", default=None,
+                    help="document text field (default: auto-detect text/content/...)")
     ap.add_argument("--tokenizer", default="HuggingFaceTB/SmolLM2-135M")
     ap.add_argument("--config", default=None, help="model config.json to verify vocab against")
     ap.add_argument("--vocab-size", type=int, default=49152)
-    ap.add_argument("--streaming", action="store_true", help="stream the HF dataset (no full download)")
     ap.add_argument("--shard-size-tokens", type=int, default=100_000_000)
     ap.add_argument("--batch-docs", type=int, default=1000, help="documents per tokenizer batch")
-    ap.add_argument("--val-fraction", type=float, default=0.0, help="hold out ~this fraction as val")
+    ap.add_argument("--val-fraction", type=float, default=0.01, help="hold out ~this fraction as val")
     ap.add_argument("--seq-len", type=int, default=2048, help="manifest hint / sequence-count estimate")
-    ap.add_argument("--limit-docs", type=int, default=0, help="cap document count (0 = all)")
+    ap.add_argument("--limit-docs", type=int, default=0, help="single-source mode: cap docs (0 = all)")
     ap.add_argument("--self-test", action="store_true", help="validate mechanics with synthetic data")
     args = ap.parse_args()
 
     if args.self_test:
         return self_test()
-    if not args.source:
-        ap.error("--source is required (or pass --self-test)")
-    run(args)
+    if args.source:
+        run(args)
+    else:
+        run_mix(args)
 
 
 if __name__ == "__main__":
