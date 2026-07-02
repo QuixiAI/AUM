@@ -115,24 +115,26 @@ def _lang_ok(example, language):
     return True
 
 
-def _load_stream(name, split="train", config=None):
+def _load_stream(name, split="train", config=None, skip=0):
     """load_dataset with config + split auto-resolution, streaming. Returns (iterable, config).
 
     Streaming + the caller's sample limit means only the requested documents are ever fetched —
-    no dataset is downloaded in full.
+    no dataset is downloaded in full. skip > 0 skips that many leading documents (for --append
+    top-ups that must not re-ingest what a previous run already packed).
     """
     hf = _require_datasets()
 
     def _load(config):
         try:
-            return hf.load_dataset(name, config, split=split, streaming=True)
+            ds = hf.load_dataset(name, config, split=split, streaming=True)
         except ValueError as e:
             if "split" not in str(e).lower():
                 raise
             avail = hf.get_dataset_split_names(name, config)
             pick = next((s for s in avail if "train" in s), avail[0])
             print(f"  [{name}] split {split!r} missing; using {pick!r} (available: {avail})")
-            return hf.load_dataset(name, config, split=pick, streaming=True)
+            ds = hf.load_dataset(name, config, split=pick, streaming=True)
+        return ds.skip(skip) if skip else ds
 
     if config is not None:                                  # explicit repo:config — no guessing
         return _load(config), config
@@ -166,11 +168,11 @@ def _extract_text(example, text_column=None):
     return max(strings, key=len) if strings else ""
 
 
-def iter_hf(source, split, text_column, limit=0, config=None, language="en"):
+def iter_hf(source, split, text_column, limit=0, config=None, language="en", skip=0):
     """Stream up to `limit` documents from a HF dataset. Streaming + the limit means only the
     requested samples are fetched — never the full dataset. Examples whose language metadata
     contradicts `language` are skipped BEFORE counting toward the limit (skips are reported)."""
-    ds, _ = _load_stream(source, split, config)
+    ds, _ = _load_stream(source, split, config, skip=skip)
     n = skipped = 0
     for ex in ds:
         if not _lang_ok(ex, language):
@@ -184,13 +186,14 @@ def iter_hf(source, split, text_column, limit=0, config=None, language="en"):
         print(f"  [{source}] skipped {skipped:,} non-{language} documents (language filter)")
 
 
-def iter_documents(source, split, text_column, limit, language="en"):
+def iter_documents(source, split, text_column, limit, language="en", skip=0):
     matches = glob.glob(source)
     if matches:
         it = iter_local(sorted(matches), text_column)
     else:
         name, _, config = source.partition(":")
-        it = iter_hf(name, split, text_column, limit, config=config or None, language=language)
+        it = iter_hf(name, split, text_column, limit, config=config or None, language=language,
+                     skip=skip)
     for i, doc in enumerate(it):
         if limit and i >= limit:
             return
@@ -298,7 +301,11 @@ def write_manifest(out_dir, tokenizer, vocab_size, eos_id, seq_len, source, writ
 
 # --------------------------------------------------------------------------- driver
 def _setup(args):
-    """Tokenizer + vocab check + writers + the val-striping selector, shared by both modes."""
+    """Tokenizer + vocab check + writers + the val-striping selector, shared by both modes.
+
+    --append seeds the writers from the existing manifest, so new shards continue the numbering
+    and the rewritten manifest keeps every prior shard — top-ups never clobber a corpus.
+    """
     from train.tokenizer import load_tokenizer, verify  # local import: only needed for real runs
 
     tok = load_tokenizer(args.tokenizer)
@@ -308,19 +315,35 @@ def _setup(args):
     verify(tok, vocab_size)
     eos_id = tok.eos_token_id if tok.eos_token_id is not None else tok.pad_token_id
 
+    existing = None
+    if getattr(args, "append", False):
+        mpath = os.path.join(args.out_dir, "manifest.json")
+        if not os.path.exists(mpath):
+            raise SystemExit(f"--append: no manifest.json in {args.out_dir}")
+        existing = json.load(open(mpath))
+        if existing["vocab_size"] != vocab_size or existing["eos_id"] != eos_id:
+            raise SystemExit("--append: tokenizer/vocab/eos mismatch with the existing manifest")
+
     def encode_fn(texts):
         return tok(texts, add_special_tokens=False)["input_ids"]
 
     os.makedirs(args.out_dir, exist_ok=True)
-    writers = {"train": ShardWriter(args.out_dir, "train", args.shard_size_tokens)}
+    splits = {"train"} | ({"val"} if args.val_fraction > 0 else set()) \
+        | (set(existing["splits"]) if existing else set())
+    writers = {s: ShardWriter(args.out_dir, s, args.shard_size_tokens) for s in sorted(splits)}
+    if existing:
+        for s, w in writers.items():
+            prior = existing["splits"].get(s)
+            if prior:
+                w.shards = list(prior["shards"])         # numbering continues after these
+                w.total = prior["total_tokens"]
     if args.val_fraction > 0:
-        writers["val"] = ShardWriter(args.out_dir, "val", args.shard_size_tokens)
         every = max(2, round(1.0 / args.val_fraction))
         counter = itertools.count()                      # GLOBAL stripe — never restarts per
         writer_for = lambda _i: writers["val" if next(counter) % every == 0 else "train"]  # source
     else:
         writer_for = lambda _i: writers["train"]
-    return vocab_size, eos_id, encode_fn, writers, writer_for
+    return vocab_size, eos_id, encode_fn, writers, writer_for, existing
 
 
 def _finish(args, vocab_size, eos_id, writers, source, n_docs):
@@ -335,13 +358,23 @@ def _finish(args, vocab_size, eos_id, writers, source, n_docs):
 
 
 def run(args):
-    """Single-source mode: one HF dataset id (optionally `:config`) or a local path/glob."""
-    vocab_size, eos_id, encode_fn, writers, writer_for = _setup(args)
+    """Single-source mode: one HF dataset id (optionally `:config`) or a local path/glob.
+    With --append this tops up an existing corpus (pair with --skip-docs when re-drawing from a
+    source the corpus already contains, so only NEW documents are ingested)."""
+    vocab_size, eos_id, encode_fn, writers, writer_for, existing = _setup(args)
     budget = args.chunks_per_dataset * args.seq_len if args.chunks_per_dataset else 0
     docs = iter_documents(args.source, args.split, args.text_column, args.limit_docs,
-                          language=args.language)
-    n_docs, _ = pack(docs, encode_fn, eos_id, writer_for, args.batch_docs, token_budget=budget)
-    _finish(args, vocab_size, eos_id, writers, args.source, n_docs)
+                          language=args.language, skip=args.skip_docs)
+    n_docs, n_tok = pack(docs, encode_fn, eos_id, writer_for, args.batch_docs,
+                         token_budget=budget)
+    source = args.source
+    if existing is not None:
+        source = existing["source"] if isinstance(existing["source"], dict) else \
+            {"base": existing["source"]}
+        source.setdefault("appended", []).append(
+            {"source": args.source, "documents": n_docs, "tokens": n_tok,
+             "skip_docs": args.skip_docs})
+    _finish(args, vocab_size, eos_id, writers, source, n_docs)
 
 
 def run_mix(args):
@@ -351,7 +384,9 @@ def run_mix(args):
     names = read_dataset_list(args.datasets_file)
     if not names:
         raise SystemExit(f"no datasets listed in {args.datasets_file}")
-    vocab_size, eos_id, encode_fn, writers, writer_for = _setup(args)
+    if args.append:
+        raise SystemExit("--append works with --source (single-source top-ups), not mix mode")
+    vocab_size, eos_id, encode_fn, writers, writer_for, _ = _setup(args)
     budget = args.chunks_per_dataset * args.seq_len
     print(f"corpus: {args.chunks_per_dataset:,} x {args.seq_len}-token chunks "
           f"(~{budget / 1e6:.0f}M tokens) from each of {len(names)} datasets "
@@ -461,6 +496,12 @@ def main():
     ap.add_argument("--val-fraction", type=float, default=0.01, help="hold out ~this fraction as val")
     ap.add_argument("--seq-len", type=int, default=4096, help="manifest hint / sequence-count estimate")
     ap.add_argument("--limit-docs", type=int, default=0, help="single-source mode: cap docs (0 = all)")
+    ap.add_argument("--append", action="store_true",
+                    help="single-source mode: top up an EXISTING --out-dir corpus (shard "
+                         "numbering continues; the manifest is merged, never clobbered)")
+    ap.add_argument("--skip-docs", type=int, default=0,
+                    help="skip this many leading documents of the stream (avoid re-ingesting "
+                         "what a prior run already packed from the same source)")
     ap.add_argument("--self-test", action="store_true", help="validate mechanics with synthetic data")
     args = ap.parse_args()
 
