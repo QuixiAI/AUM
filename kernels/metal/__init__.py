@@ -20,8 +20,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _INCLUDE = os.path.join(_HERE, "include")
 _SRC = os.path.join(_HERE, "src")
 _METALLIB = os.path.join(_HERE, "aum.metallib")
-_METAL_SOURCES = [os.path.join(_SRC, "mamba2.metal"), os.path.join(_SRC, "mamba2_bwd.metal"),
-                  os.path.join(_SRC, "aum_decode.metal")]
+_METAL_SOURCES = [os.path.join(_SRC, "mamba2.metal"), os.path.join(_SRC, "aum_decode.metal")]
 
 
 def build_metallib(force: bool = False) -> str:
@@ -47,13 +46,15 @@ _ext._set_library(_METALLIB)
 
 def mamba2(C, B, X, cumlog):
     """SSD forward ((C@Bᵀ)⊙exp(cl_i−cl_j)⊙causal)@X. C,B,X bf16 (B,H,N,D); cumlog fp32 (B,H,N).
-    MPS; D in {64,128}, N%8."""
+    MPS; D in {64,128}, N%8. Auto-routed: the chunked LINEAR-TIME 3-kernel pipeline when D=64 and
+    N is a multiple of 128; the quadratic materialized kernel otherwise (incl. all of D=128)."""
     return _ext.mamba2(C, B, X, cumlog)
 
 
 def mamba2_bwd(C, B, X, cumlog, dY):
-    """SSD backward -> (dC, dB, dX). C,B,X,dY bf16 (B,H,N,D); cumlog fp32 (B,H,N). MPS; D in {64,128}.
-    dcumlog = <dY,Y> − <dX,X> is computed on the host by the caller (not returned)."""
+    """SSD backward -> (dC, dB, dX, dcumlog). C,B,X,dY bf16 (B,H,N,D); cumlog fp32 (B,H,N). MPS;
+    D in {64,128}. dcumlog = rowsum(M) − colsum(M) with M = dSt∘S, accumulated in-kernel in fp32
+    — the forward output Y is NOT needed for the backward."""
     return _ext.mamba2_bwd(C, B, X, cumlog, dY)
 
 

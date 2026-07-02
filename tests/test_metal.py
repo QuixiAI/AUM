@@ -54,35 +54,51 @@ def test_metal_grad_matches_reference(H, D):
         assert float(rel) < 0.06, (k, float(rel))
 
 
-@pytest.mark.parametrize("D", [64, 128])
-def test_mamba2_bwd_kernel_matches_autograd(D):
-    # the fused SSD backward kernel directly vs autograd-through the PyTorch SSD core (tight)
-    def fwd(C, B, X, cl):
-        N = C.shape[-2]
-        s = C.float() @ B.float().transpose(-1, -2)
-        d = torch.exp(cl[..., :, None] - cl[..., None, :])
-        m = torch.tril(torch.ones(N, N, device=C.device))
-        return (s * d * m) @ X.float()
+def _ssd_fwd_ref(C, B, X, cl):
+    N = C.shape[-2]
+    s = C.float() @ B.float().transpose(-1, -2)
+    d = torch.exp(cl[..., :, None] - cl[..., None, :])
+    m = torch.tril(torch.ones(N, N, device=C.device))
+    return (s * d * m) @ X.float()
 
-    torch.manual_seed(0)
-    Bt, H, N = 2, 4, 16
+
+def _ssd_inputs(Bt, H, N, D, seed=0):
+    torch.manual_seed(seed)
     C = torch.randn(Bt, H, N, D, device="mps") * 0.5
     Bm = torch.randn(Bt, H, N, D, device="mps") * 0.5
     X = torch.randn(Bt, H, N, D, device="mps")
     a = torch.sigmoid(torch.randn(Bt, H, N, device="mps")) * 0.5 + 0.5
     cl = torch.cumsum(torch.log(a), -1).float()
+    return C, Bm, X, cl
+
+
+@pytest.mark.parametrize("D", [64, 128])
+def test_mamba2_bwd_kernel_matches_autograd(D):
+    # the fused SSD backward kernel (dC,dB,dX + in-kernel dcumlog) vs autograd through the core
+    Bt, H, N = 2, 4, 16
+    C, Bm, X, cl = _ssd_inputs(Bt, H, N, D)
     dY = torch.randn(Bt, H, N, D, device="mps")
     Cr, Br, Xr, clr = (t.clone().detach().requires_grad_() for t in (C, Bm, X, cl))
-    fwd(Cr, Br, Xr, clr).backward(dY.float())
-    dC, dB, dX = km.mamba2_bwd(C.bfloat16(), Bm.bfloat16(), X.bfloat16(), cl, dY.bfloat16())
-    Y = km.mamba2(C.bfloat16(), Bm.bfloat16(), X.bfloat16(), cl).float()
+    _ssd_fwd_ref(Cr, Br, Xr, clr).backward(dY.float())
+    dC, dB, dX, dcl = km.mamba2_bwd(C.bfloat16(), Bm.bfloat16(), X.bfloat16(), cl, dY.bfloat16())
     torch.mps.synchronize()
-    dcl = (dY.float() * Y).sum(-1) - (dX.float() * X.float()).sum(-1)   # host identity
     rel = lambda u, v: ((u - v).abs().max() / (v.abs().max() + 1e-6)).item()
     assert rel(dC.float(), Cr.grad) < 0.02, ("dC", rel(dC.float(), Cr.grad))
     assert rel(dB.float(), Br.grad) < 0.02, ("dB", rel(dB.float(), Br.grad))
     assert rel(dX.float(), Xr.grad) < 0.02, ("dX", rel(dX.float(), Xr.grad))
-    assert rel(dcl, clr.grad) < 0.02, ("dcumlog", rel(dcl, clr.grad))
+    assert rel(dcl.float(), clr.grad) < 0.02, ("dcumlog", rel(dcl.float(), clr.grad))
+
+
+@pytest.mark.parametrize("N,D", [(128, 64), (256, 64), (136, 64), (128, 128)])
+def test_mamba2_forward_routes_match_reference(N, D):
+    # D=64 with N%64==0 and N>=128 takes the chunked LINEAR-TIME pipeline; ragged N (136) and
+    # D=128 take the quadratic kernel — every route must agree with the fp32 reference.
+    C, Bm, X, cl = _ssd_inputs(2, 2, N, D, seed=3)
+    y_ref = _ssd_fwd_ref(C, Bm, X, cl)
+    y = km.mamba2(C.bfloat16(), Bm.bfloat16(), X.bfloat16(), cl).float()
+    torch.mps.synchronize()
+    rel = ((y - y_ref).abs().max() / (y_ref.abs().max() + 1e-6)).item()
+    assert rel < 0.03, (N, D, rel)
 
 
 @pytest.mark.parametrize("D", [64, 128])

@@ -86,6 +86,9 @@ static void encode(F fn) {
 }
 
 // ---- mamba2 SSD forward:  Y = ((C@Bᵀ) ⊙ exp(cl_i−cl_j) ⊙ causal) @ X ----
+// Routed: the quadratic materialized kernel for small/ragged N or D=128; the chunked
+// linear-time 3-kernel pipeline (ssd_chunk_kv -> scan -> out, O(N·(L+D)·D)) otherwise.
+// The chunked kernels hold a DxD register state — feasible only at D=64.
 static at::Tensor mamba2_mps(const at::Tensor& C_in, const at::Tensor& B_in,
                              const at::Tensor& X_in, const at::Tensor& cl_in) {
   TORCH_CHECK(C_in.device().is_mps(), "mamba2: tensors must be MPS");
@@ -99,17 +102,45 @@ static at::Tensor mamba2_mps(const at::Tensor& C_in, const at::Tensor& B_in,
   TORCH_CHECK(D == 64 || D == 128, "mamba2: D must be 64 or 128");
   TORCH_CHECK(N % 8 == 0, "mamba2: N must be a multiple of 8");
   auto out = at::empty_like(C);
+  constexpr unsigned L = 64;                       // must match SSD_CHUNK_L in the metal
+  if (D != 64 || N % L != 0 || N < 2 * L) {        // quadratic route
+    encode([&](Encoder& e) {
+      e.pipeline("mamba2_" + std::to_string(D));
+      e.in(C, 0); e.in(B, 1); e.in(X, 2); e.in(cl, 3); e.out(out, 4);
+      e.bytes(N, 5); e.bytes((unsigned)H, 6);
+      e.dispatch((int)N / 8, H, Bsz, 32, 1, 1);
+    });
+    return out;
+  }
+  const int Cn = (int)(N / L);                     // chunked linear-time route (D=64)
+  auto f32 = C.options().dtype(at::kFloat);
+  auto s_raw = at::empty({Bsz, H, Cn, D, D}, f32);
+  auto s_ex = at::empty({Bsz, H, Cn, D, D}, f32);
   encode([&](Encoder& e) {
-    e.pipeline("mamba2_" + std::to_string(D));
-    e.in(C, 0); e.in(B, 1); e.in(X, 2); e.in(cl, 3); e.out(out, 4);
-    e.bytes(N, 5); e.bytes((unsigned)H, 6);
+    e.pipeline("ssd_chunk_kv_" + std::to_string(D));
+    e.in(B, 0); e.in(X, 1); e.in(cl, 2); e.out(s_raw, 3);
+    e.bytes(N, 4); e.bytes((unsigned)H, 5);
+    e.dispatch(Cn, H, Bsz, 32, 1, 1);
+  });
+  encode([&](Encoder& e) {
+    e.pipeline("ssd_chunk_scan_" + std::to_string(D));
+    e.in(s_raw, 0); e.in(cl, 1); e.out(s_ex, 2);
+    e.bytes((unsigned)Cn, 3); e.bytes(N, 4);
+    e.dispatch(Bsz * H, 1, 1, 256, 1, 1);
+  });
+  encode([&](Encoder& e) {
+    e.pipeline("ssd_chunk_out_" + std::to_string(D));
+    e.in(C, 0); e.in(B, 1); e.in(X, 2); e.in(cl, 3); e.in(s_ex, 4); e.out(out, 5);
+    e.bytes(N, 6); e.bytes((unsigned)H, 7);
     e.dispatch((int)N / 8, H, Bsz, 32, 1, 1);
   });
   return out;
 }
 
-// ---- mamba2 SSD backward -> (dC, dB, dX);  dcumlog is <dY,Y>-<dX,X> on the host ----
-static std::tuple<at::Tensor, at::Tensor, at::Tensor> mamba2_bwd_mps(
+// ---- mamba2 SSD backward -> (dC, dB, dX, dcumlog) ----
+// dcumlog = rowsum(M) - colsum(M), M = dSt ∘ S, accumulated IN-KERNEL in fp32 (mamba2_bwd_row
+// emits r, mamba2_bwd_col emits cc) — no host identity, and the forward output Y is not needed.
+static std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mamba2_bwd_mps(
     const at::Tensor& C_in, const at::Tensor& B_in, const at::Tensor& X_in,
     const at::Tensor& cl_in, const at::Tensor& dY_in) {
   TORCH_CHECK(C_in.device().is_mps(), "mamba2_bwd: tensors must be MPS");
@@ -123,20 +154,24 @@ static std::tuple<at::Tensor, at::Tensor, at::Tensor> mamba2_bwd_mps(
   const int D = C.size(3);
   TORCH_CHECK(D == 64 || D == 128, "mamba2_bwd: D must be 64 or 128");
   TORCH_CHECK(N % 8 == 0, "mamba2_bwd: N must be a multiple of 8");
+  auto f32 = C.options().dtype(at::kFloat);
   auto dC = at::empty_like(C), dB = at::empty_like(C), dX = at::empty_like(C);
-  encode([&](Encoder& e) {                              // dC (fix query chunk i, loop j<=i)
-    e.pipeline("mamba2_bwd_i_" + std::to_string(D));
-    e.in(C, 0); e.in(B, 1); e.in(X, 2); e.in(dY, 3); e.in(cl, 4); e.out(dC, 5);
-    e.bytes(N, 6); e.bytes((unsigned)H, 7);
-    e.dispatch((int)N / 8, H, Bsz, 32, 1, 1);
-  });
-  encode([&](Encoder& e) {                              // dB, dX (fix key chunk j, loop i>=j)
-    e.pipeline("mamba2_bwd_j_" + std::to_string(D));
-    e.in(C, 0); e.in(B, 1); e.in(X, 2); e.in(dY, 3); e.in(cl, 4); e.out(dB, 5); e.out(dX, 6);
+  auto r = at::empty({Bsz, H, (long)N}, f32);
+  auto cc = at::empty({Bsz, H, (long)N}, f32);
+  encode([&](Encoder& e) {                              // dC + rowsum(M) (fix row tile, loop j<=i)
+    e.pipeline("mamba2_bwd_row_" + std::to_string(D));
+    e.in(C, 0); e.in(B, 1); e.in(X, 2); e.in(cl, 3); e.in(dY, 4); e.out(dC, 5); e.out(r, 6);
     e.bytes(N, 7); e.bytes((unsigned)H, 8);
     e.dispatch((int)N / 8, H, Bsz, 32, 1, 1);
   });
-  return {dC, dB, dX};
+  encode([&](Encoder& e) {                              // dB, dX + colsum(M) (fix col tile, loop i>=j)
+    e.pipeline("mamba2_bwd_col_" + std::to_string(D));
+    e.in(C, 0); e.in(B, 1); e.in(X, 2); e.in(cl, 3); e.in(dY, 4);
+    e.out(dB, 5); e.out(dX, 6); e.out(cc, 7);
+    e.bytes(N, 8); e.bytes((unsigned)H, 9);
+    e.dispatch((int)N / 8, H, Bsz, 32, 1, 1);
+  });
+  return {dC, dB, dX, r - cc};
 }
 
 // ---- aum_decode: single-token U-phase step  S <- a*S + x⊗k_rot ; out = S·q_rot ----

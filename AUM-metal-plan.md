@@ -23,12 +23,15 @@ backward if `_FUSED_BWD` is disabled.
 ```
 kernels/metal/
   include/            vendored header-only MSL substrate (tile/type/op primitives; derived from
-                      ThunderMittens, an Apple MSL port of ThunderKittens — see NOTICE)
-  src/mamba2.metal        SSD forward, D in {64,128}
-  src/mamba2_bwd.metal    SSD backward (dC, dB, dX), D in {64,128}
+                      ThunderMittens, an Apple MSL port of ThunderKittens — see NOTICE;
+                      periodically synced from the ThunderMittens working tree)
+  src/mamba2.metal        SSD forward (quadratic, D in {64,128}) + the chunked LINEAR-TIME
+                          3-kernel pipeline (ssd_chunk_kv/scan/out, D=64) + the backward
+                          (mamba2_bwd_row/col, in-kernel fp32 dcumlog, D in {64,128})
   src/aum_decode.metal    single-token U-phase step, D in {64,128}
-  aum_metal.mm        ObjC++ dispatch onto torch's MPS command stream
-                      (torch::mps::get_command_buffer / get_dispatch_queue)
+  aum_metal.mm        ObjC++ dispatch onto torch's MPS command stream; mamba2 auto-routes
+                      D=64 & N%64==0 & N>=128 to the linear-time pipeline (2.9x at N=4096),
+                      quadratic otherwise (incl. all of D=128)
   __init__.py         compiles src/*.metal -> aum.metallib via `xcrun metal` on import, JIT-builds
                       the extension (torch.utils.cpp_extension.load), exposes
                       mamba2 / mamba2_bwd / aum_decode
@@ -54,17 +57,27 @@ accumulators, per the reference's fp32-state convention.
 One simdgroup per (batch, head, query-chunk); decay tile from `add_row`/`sub_col`/`exp` over the
 host-precomputed `cumlog`; `make_causal` on the diagonal chunk. Grid `(N/8, H, B)`.
 
-### Backward — `mamba2_bwd` (the rev.-2 "hard part", now landed)
-Forked from the FA-2 `attn_bwd` structure, atomics-free via the i/j ownership split:
-`mamba2_bwd_i` (fix query chunk, loop j ≤ i) → `dC`; `mamba2_bwd_j` (fix key chunk, loop i ≥ j)
-→ `dB, dX`. No softmax ⇒ no L/delta passes. The decay gradient never touches the kernel: the
-host identity
+### Backward — `mamba2_bwd_row/col` (the rev.-2 "hard part"; landed, then improved upstream)
+Forked from the FA-2 `attn_bwd` structure, atomics-free via the row/col ownership split:
+`mamba2_bwd_row` (fix row tile, loop j ≤ i) → `dC` + fp32 `rowsum(M)`; `mamba2_bwd_col`
+(fix col tile, loop i ≥ j) → `dB, dX` + fp32 `colsum(M)`, with `M = dSt∘S`. No softmax ⇒ no
+L/delta passes. The decay gradient is now **in-kernel**:
 
-$$d\,\mathrm{cl}_k=\langle dY_k,Y_k\rangle-\langle dX_k,X_k\rangle$$
+$$d\,\mathrm{cl}=\mathrm{rowsum}(M)-\mathrm{colsum}(M)$$
 
-(rowsum − colsum of $dM\odot M$) gives `dcumlog` from tensors already in hand. Wrapped in a
+with fp32 accumulation (the first landing used the host identity
+$\langle dY,Y\rangle-\langle dX,X\rangle$ over bf16 tensors — the in-kernel form is more accurate
+and means the forward output $Y$ is never saved for backward). Wrapped in a
 `torch.autograd.Function` (`aum_ssm/ops/metal/unfold_metal.py`); grads match the fp32 reference
 within bf16 tolerance at both head dims; `_ssd_core_ref` retained as the oracle/fallback.
+
+### Chunked linear-time SSD — `ssd_chunk_kv/scan/out` (ported from upstream perf work)
+The quadratic kernel rescans all earlier key tiles per 8-row query tile — $O(N^2 D)$. The chunked
+pipeline is $O(N(L{+}D)D)$: per-chunk decayed KV states (K1), an exclusive decayed prefix scan
+over chunks (K2), then chunk-bounded intra tiles + one inter-chunk state term per query tile
+(K3). Chunk $L=64$; the $D{\times}D$ register state limits it to $D=64$ — the dispatch
+auto-routes ($D{=}64$, $N\%64{=}0$, $N\ge128$ → chunked; else quadratic). Measured 2.9× over
+quadratic at $N=4096$, break-even at $N\approx1024$, growing with $N$.
 
 ### Decode — `aum_decode` (replaces the rev.-2 `lin_attn_causal` fork plan)
 A single token makes mma's 8×8 tiles waste 7/8 of their capacity, so the plan's tile-kernel fork
@@ -109,6 +122,9 @@ end-to-end through the real model, silence on and off.
    global-memory passes. Tracked as QuixiAI/AUM issue #1. Note the ladder means per-block
    frequencies in-register — the rev.-2 "single scalar phase per head" fusion sketch no longer
    applies.
+1b. **Chunked linear-time SSD at D=128** — the reference head dim still takes the quadratic
+   route (the D×D register state doesn't fit at 128); a quadrant-tiled variant (or folding it
+   into the bespoke kernel above) would extend the 2.9× linear-time win to the reference config.
 2. **Fused sequential global-block kernel** (C7): one dispatch running the
    σ→ĝ→e→μ→σ⁰→σ recurrence over the sequence with S resident on-chip
    (working state O(d_σ + d + H·d_h²) ≈ 66K floats per batch row at Tiny scale). Memory is

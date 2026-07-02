@@ -5,9 +5,10 @@
 #
 # mamba2(C,B,X,cumlog) computes ((C@Bᵀ) ⊙ exp(cumlog_i−cumlog_j) ⊙ causal) @ X, which is exactly the
 # AUM readout S_t·R(φ)q with C=R(φ)q, B=k_rot=R(φ)·L2norm(k), X=ρτ·L2norm(v), cumlog=cumsum(−λτ).
-# Headdim D=64 or D=128 (the Appendix-A reference is 4 heads x 128). Both the forward (mamba2) and
-# the backward (mamba2_bwd → dC,dB,dX) run on the Metal GPU; dcumlog is the cheap host identity
-# <dY,Y>−<dX,X>. `_ssd_core_ref` stays as the correctness oracle / fallback.
+# Headdim D=64 or D=128 (the Appendix-A reference is 4 heads x 128). The forward auto-routes to a
+# chunked LINEAR-TIME 3-kernel pipeline at D=64 (quadratic materialized form otherwise); the
+# backward (mamba2_bwd) returns dC,dB,dX and an fp32 in-kernel dcumlog = rowsum(M)−colsum(M).
+# `_ssd_core_ref` stays as the correctness oracle / fallback.
 
 import os
 import sys
@@ -42,10 +43,12 @@ _FUSED_BWD = True   # M4: fused mamba2_bwd Metal kernel. Set False to fall back 
 
 
 class _Mamba2SSD(torch.autograd.Function):
-    """Forward + backward both on the Metal GPU (tk_torch.mamba2 / mamba2_bwd).
+    """Forward + backward both on the Metal GPU (kernels.metal mamba2 / mamba2_bwd).
 
-    dcumlog is the cheap host identity dcl_k = <dY_k,Y_k> − <dX_k,X_k> (rowsum/colsum of dM⊙M),
-    so the kernels only emit dC/dB/dX. `_ssd_core_ref` remains the correctness oracle / fallback.
+    The forward auto-routes to the chunked LINEAR-TIME pipeline at D=64 (quadratic otherwise).
+    The backward kernels emit dC/dB/dX AND dcumlog = rowsum(M)−colsum(M) with fp32 in-kernel
+    accumulation, so the forward output Y is never saved. `_ssd_core_ref` remains the
+    correctness oracle / fallback.
     """
 
     @staticmethod
@@ -53,17 +56,15 @@ class _Mamba2SSD(torch.autograd.Function):
         km = _metal()
         with torch.no_grad():
             Y = km.mamba2(C.bfloat16(), B.bfloat16(), X.bfloat16(), cumlog.float()).to(C.dtype)
-        ctx.save_for_backward(C, B, X, cumlog, Y)
+        ctx.save_for_backward(C, B, X, cumlog)
         return Y
 
     @staticmethod
     def backward(ctx, dY):
-        C, B, X, cumlog, Y = ctx.saved_tensors
+        C, B, X, cumlog = ctx.saved_tensors
         if _FUSED_BWD:
-            dC, dB, dX = _metal().mamba2_bwd(C.bfloat16(), B.bfloat16(), X.bfloat16(),
-                                             cumlog.float(), dY.bfloat16())
-            dC, dB, dX = dC.float(), dB.float(), dX.float()
-            dcumlog = (dY.float() * Y.float()).sum(-1) - (dX * X.float()).sum(-1)
+            dC, dB, dX, dcumlog = _metal().mamba2_bwd(C.bfloat16(), B.bfloat16(), X.bfloat16(),
+                                                      cumlog.float(), dY.bfloat16())
         else:
             with torch.enable_grad():
                 ins = [t.detach().requires_grad_(True) for t in (C, B, X, cumlog)]
