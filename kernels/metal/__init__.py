@@ -134,14 +134,26 @@ def fused_linear_cross_entropy_ce(h, W, targets, row_weight=None, divisor=None,
     return total / divisor, dh, dW, ce_all
 
 
-def aum_silence_fwd(streams, alpha, xw, k_rot, halt_u, wpack, kappa, forced=-1):
+def aum_silence_fwd(streams, alpha, xw, k_rot, halt_u, wpack, kappa, forced=-1, no_op=False,
+                    halt_mode=0, delta=0.5):
     """Fused sequential global block, forward (§5-§9; roadmap step 4): the whole L-token silence
     recurrence in ONE kernel launch (one threadgroup per batch row). streams (B,L,2720) fp32 is
     the token-parallel precompute pack, wpack the flat weight pack (layouts:
-    aum_ssm/ops/metal/silence_metal.py). Returns (save (B,L,3151), j_star (B,L) int32, S_final,
+    aum_ssm/ops/metal/silence_metal.py). no_op = the §14 stage-1 ablation (carry sigma^0).
+    Returns (save (B,L,3151), j_star (B,L) int32, S_final,
     S_ckpt (B,ceil(L/64),8,64,64) — the segment-start states the backward replays from)."""
     return _ext.aum_silence_fwd(streams, alpha, xw, k_rot, halt_u, wpack, float(kappa),
-                                int(forced))
+                                int(forced), int(no_op), int(halt_mode), float(delta))
+
+
+def aum_silence_bwd(streams, alpha, xw, k_rot, wpack, save, j_star, S_ckpt, dout, kappa,
+                    forced=-1, no_op=False):
+    """Fused sequential global block, backward: reverse march with segment S-replay. dout
+    (B,L,2567) packs the incoming grads (d sigma_stack | d g_hat | d r_stack | d E | d pi | d w |
+    d sigma_star). Returns (demit (B,L,5443) — per-token d-vectors from which the host forms all
+    weight/stream grads as batched GEMMs — plus dalpha, dxw, dkrot)."""
+    return _ext.aum_silence_bwd(streams, alpha, xw, k_rot, wpack, save, j_star, S_ckpt, dout,
+                                float(kappa), int(forced), int(no_op))
 
 
 def aum_decode(S, alpha, x, k_rot, q_rot):

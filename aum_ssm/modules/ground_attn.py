@@ -49,6 +49,49 @@ class GroundAttn(nn.Module):
         j = torch.arange(L, device=device)[None, :]
         return (j <= i) & (j > i - self.window_size)
 
+    def _sliding_blocks(self, q, k, v):
+        """Exact sliding-window causal attention in O(L*w) memory (w = window_size).
+
+        SDPA with a full (L, L) boolean window mask hits the MPS math fallback, which saves the
+        ENTIRE quadratic attention matrix for backward — (B, H, 4096, 4096) fp32 is ~26GB per 4
+        sequences, the dominant memory (and swap) cost of a train step. Instead: view the
+        sequence as w-sized blocks; queries in block i attend keys in blocks {i-1, i} under a
+        constant (w, 2w) relative mask — identical math, O(L*w) footprint. Checkpointed under
+        training so backward recomputes the block scores instead of storing them.
+        """
+        w = self.window_size
+        B, H, L, dh = q.shape
+        nb = (L + w - 1) // w
+        pad = nb * w - L
+        if pad:
+            q = F.pad(q, (0, 0, 0, pad))
+            k = F.pad(k, (0, 0, 0, pad))
+            v = F.pad(v, (0, 0, 0, pad))
+
+        def blocks(qp, kp, vp):
+            qb = qp.reshape(B, H, nb, w, dh)
+            kb = kp.reshape(B, H, nb, w, dh)
+            vb = vp.reshape(B, H, nb, w, dh)
+            k2 = torch.cat([torch.cat([torch.zeros_like(kb[:, :, :1]), kb[:, :, :-1]], dim=2),
+                            kb], dim=3)                        # (B, H, nb, 2w, dh)
+            v2 = torch.cat([torch.cat([torch.zeros_like(vb[:, :, :1]), vb[:, :, :-1]], dim=2),
+                            vb], dim=3)
+            p = torch.arange(w, device=qp.device)[:, None]
+            c = torch.arange(2 * w, device=qp.device)[None, :]
+            allow = (c > p) & (c <= p + w)                     # key offset (c - w) in (p - w, p]
+            allow = allow.expand(nb, w, 2 * w).clone()
+            allow[0] &= (c >= w)                               # block 0: no previous block
+            bias = torch.where(allow, 0.0, float("-inf")).to(qp.dtype)
+            scores = qb @ k2.transpose(-1, -2) * (dh ** -0.5) + bias
+            out = torch.softmax(scores, dim=-1) @ v2           # (B, H, nb, w, dh)
+            return out.reshape(B, H, nb * w, dh)
+
+        if self.training and torch.is_grad_enabled():
+            ctx = torch.utils.checkpoint.checkpoint(blocks, q, k, v, use_reentrant=False)
+        else:
+            ctx = blocks(q, k, v)
+        return ctx[:, :, :L]
+
     def _cache_mask(self, Lq, Lk, device):
         # query row i sits at absolute position (Lk - Lq + i); attend key j <= pos (+ window)
         pos = torch.arange(Lq, device=device)[:, None] + (Lk - Lq)
@@ -80,7 +123,10 @@ class GroundAttn(nn.Module):
         if cache is not None:
             ctx = F.scaled_dot_product_attention(q, k, v, attn_mask=self._cache_mask(L, k.shape[2], x.device))
         elif self.window_size is not None and self.causal:
-            ctx = F.scaled_dot_product_attention(q, k, v, attn_mask=self._window_mask(L, x.device))
+            if L > 2 * self.window_size:                  # long sequences: O(L*w) blocked form
+                ctx = self._sliding_blocks(q, k, v)
+            else:                                         # short: the mask is small anyway
+                ctx = F.scaled_dot_product_attention(q, k, v, attn_mask=self._window_mask(L, x.device))
         else:
             ctx = F.scaled_dot_product_attention(q, k, v, is_causal=self.causal)
         ctx = rearrange(ctx, "b h l d -> b l (h d)")

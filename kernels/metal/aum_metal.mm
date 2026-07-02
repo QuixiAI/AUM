@@ -405,7 +405,7 @@ static constexpr int kSilSV = 3151;                 // save-pack width    (must 
 static std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> aum_silence_fwd_mps(
     const at::Tensor& streams_in, const at::Tensor& alpha_in, const at::Tensor& xw_in,
     const at::Tensor& krot_in, const at::Tensor& haltu_in, const at::Tensor& wpack_in,
-    double kappa, int64_t forced) {
+    double kappa, int64_t forced, int64_t no_op, int64_t halt_mode, double delta) {
   auto streams = streams_in.contiguous(), alpha = alpha_in.contiguous();
   auto xw = xw_in.contiguous(), krot = krot_in.contiguous();
   auto haltu = haltu_in.contiguous(), wpack = wpack_in.contiguous();
@@ -420,16 +420,53 @@ static std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> aum_silence_fw
   auto S_ckpt = at::empty({Bsz, nseg, 8, 64, 64}, f32);
   auto save = at::empty({Bsz, (long)L, kSilSV}, f32);
   auto jstar = at::empty({Bsz, (long)L}, streams.options().dtype(at::kInt));
-  const float kap = (float)kappa;
-  const int frc = (int)forced;
+  const float kap = (float)kappa, dlt = (float)delta;
+  const int frc = (int)forced, nop = (int)no_op, hm = (int)halt_mode;
   encode([&](Encoder& e) {
     e.pipeline("aum_silence_fwd");
     e.in(streams, 0); e.in(alpha, 1); e.in(xw, 2); e.in(krot, 3); e.in(haltu, 4);
     e.in(wpack, 5); e.out(S, 6); e.out(save, 7); e.out(jstar, 8); e.out(S_ckpt, 9);
-    e.bytes(L, 10); e.bytes(kap, 11); e.bytes(frc, 12);
+    e.bytes(L, 10); e.bytes(kap, 11); e.bytes(frc, 12); e.bytes(nop, 13);
+    e.bytes(hm, 14); e.bytes(dlt, 15);
     e.dispatch(1, 1, Bsz, 256, 1, 1);                // one threadgroup per batch row
   });
   return {save, jstar, S, S_ckpt};
+}
+
+static constexpr int kSilDO = 2567;                  // dout pack width (must match DO)
+static constexpr int kSilDE = 5443;                  // demit pack width (must match DE)
+
+static std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> aum_silence_bwd_mps(
+    const at::Tensor& streams_in, const at::Tensor& alpha_in, const at::Tensor& xw_in,
+    const at::Tensor& krot_in, const at::Tensor& wpack_in, const at::Tensor& save_in,
+    const at::Tensor& jstar_in, const at::Tensor& sckpt_in, const at::Tensor& dout_in,
+    double kappa, int64_t forced, int64_t no_op) {
+  auto streams = streams_in.contiguous(), alpha = alpha_in.contiguous();
+  auto xw = xw_in.contiguous(), krot = krot_in.contiguous(), wpack = wpack_in.contiguous();
+  auto save = save_in.contiguous(), jstar = jstar_in.contiguous();
+  auto sckpt = sckpt_in.contiguous(), dout = dout_in.contiguous();
+  const int Bsz = streams.size(0);
+  const unsigned L = (unsigned)streams.size(1);
+  TORCH_CHECK(dout.size(2) == kSilDO, "aum_silence_bwd: dout pack width mismatch");
+  auto f32 = streams.options();
+  auto demit = at::empty({Bsz, (long)L, kSilDE}, f32);
+  auto dalpha = at::empty({Bsz, (long)L, 8}, f32);
+  auto dxw = at::empty({Bsz, (long)L, 512}, f32);
+  auto dkrot = at::empty({Bsz, (long)L, 512}, f32);
+  auto S_seg = at::empty({Bsz, 64, 8, 64, 64}, f32);
+  auto dS = at::zeros({Bsz, 8, 64, 64}, f32);
+  const float kap = (float)kappa;
+  const int frc = (int)forced, nop = (int)no_op;
+  encode([&](Encoder& e) {
+    e.pipeline("aum_silence_bwd");
+    e.in(streams, 0); e.in(alpha, 1); e.in(xw, 2); e.in(krot, 3); e.in(wpack, 4);
+    e.in(save, 5); e.in(jstar, 6); e.in(sckpt, 7); e.in(dout, 8);
+    e.out(demit, 9); e.out(dalpha, 10); e.out(dxw, 11); e.out(dkrot, 12);
+    e.out(S_seg, 13); e.out(dS, 14);
+    e.bytes(L, 15); e.bytes(kap, 16); e.bytes(frc, 17); e.bytes(nop, 18);
+    e.dispatch(1, 1, Bsz, 256, 1, 1);
+  });
+  return {demit, dalpha, dxw, dkrot};
 }
 
 static at::Tensor cross_entropy_bwd_mps(
@@ -461,6 +498,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("aum_decode", &aum_decode_mps, "AUM-Ø single-token U-phase decode step (MPS)");
   m.def("aum_silence_fwd", &aum_silence_fwd_mps,
         "AUM-Ø fused sequential global block, forward (MPS)");
+  m.def("aum_silence_bwd", &aum_silence_bwd_mps,
+        "AUM-Ø fused sequential global block, backward (MPS)");
   m.def("aum_operands", &aum_operands_mps, "AUM-Ø fused U-phase operand builder (MPS)");
   m.def("aum_epilogue", &aum_epilogue_mps, "AUM-Ø fused U-phase epilogue (MPS)");
   m.def("cross_entropy_fwd", &cross_entropy_fwd_mps, "fused CE forward -> (loss, lse) (MPS)");

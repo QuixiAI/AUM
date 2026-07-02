@@ -199,6 +199,9 @@ kernel void aum_silence_fwd(
     constant     uint  &L        [[buffer(10)]],  //   each segment start (backward replay)
     constant     float &kappa    [[buffer(11)]],
     constant     int   &forced   [[buffer(12)]],  // forced_depth, or -1
+    constant     int   &no_op    [[buffer(13)]],  // §14 no_op ablation (stage 1): carry sigma^0
+    constant     int   &haltmode [[buffer(14)]],  // 0: j* ~ invCDF(halt_u); 2: min{j: p_j>=delta}
+    constant     float &delta    [[buffer(15)]],  // inference halting threshold (§8)
     uint3 tgid [[threadgroup_position_in_grid]],
     uint  tid  [[thread_index_in_threadgroup]],
     uint  lane [[thread_index_in_simdgroup]],
@@ -429,6 +432,8 @@ kernel void aum_silence_fwd(
                 sv[SV_W + 0] = js == 0 ? 1.0f : 0.0f;
                 sv[SV_W + 1] = js == 1 ? 1.0f : 0.0f;
                 sv[SV_W + 2] = js == 2 ? 1.0f : 0.0f;
+            } else if (haltmode == 2) {                // inference: first p_j >= delta (p_J = 1)
+                js = (p0 >= delta) ? 0 : ((p1 >= delta) ? 1 : 2);
             } else {
                 const float u = halt_u[b * L + t];
                 js = (w0 >= u) ? 0 : ((w0 + w1 >= u) ? 1 : 2);
@@ -437,11 +442,631 @@ kernel void aum_silence_fwd(
             scal[3] = (float)js;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        const int js = (int)scal[3];
+        const int js = no_op ? 0 : (int)scal[3];   // no_op: revision discarded, sigma^0 carried
         for (int i = (int)tid; i < DS; i += TPB) {
             sigma[i] = sig[js * DS + i];
             sv[SV_SSTAR + i] = sigma[i];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BACKWARD — reverse march with exact per-token replay.
+//
+// Design: the kernel walks t = L-1 .. 0 carrying the two sequential gradients (d_sigma through
+// the register carry, dS through the evidence-state chain) and REPLAYS each token's small
+// nonlinear pipeline from the forward save pack (recomputing matvec pre-activations; LayerNorm
+// via saved mean/rstd). S_{t-1}/S_t come from a per-64-token segment replay off the forward's
+// S checkpoints — never 1/alpha reconstruction. Instead of accumulating weight gradients
+// in-kernel (an outer product per matvec per token — bandwidth-catastrophic), the kernel EMITS
+// the per-token d-vectors (dz of every gate/projection, dq of every read, LN output grads) into
+// a demit pack; the host then forms every weight and stream gradient as ONE batched GEMM over
+// (B*L) rows (silence_metal.py::silence_bwd_assemble). d_alpha / d_x / d_k are computed
+// in-kernel (they need dS_t and S_{t-1}).
+//
+// Incoming grads (dout pack): d sigma_stack | d g_hat | d r_stack | d E | d pi | d w.
+// (sigma_star / expected_J / o_stack / prediction-head grads arrive through those slots via the
+// host-side consumers.) When forced >= 0 the halting weights were one-hot (no p-path gradient),
+// so the halting backward is skipped — matching F.one_hot in the module.
+
+constant constexpr int DO_SIG  = 0;                    // (J+1) x DS
+constant constexpr int DO_GHAT = DO_SIG + (PJ + 1) * DS;
+constant constexpr int DO_RST  = DO_GHAT + D;          // (J+1) x D
+constant constexpr int DO_E    = DO_RST + (PJ + 1) * D;
+constant constexpr int DO_PI   = DO_E + (PJ + 1);
+constant constexpr int DO_W    = DO_PI + 1;
+constant constexpr int DO_SST  = DO_W + (PJ + 1);      // d sigma_star (routes to sigma^{j*})
+constant constexpr int DO      = DO_SST + DS;          // 2567
+
+constant constexpr int DE_PRE  = 0;                    // dpre (LN5 input grad)        (D)
+constant constexpr int DE_GHT  = DE_PRE + D;           // dGhat_tot                    (D)
+constant constexpr int DE_ZMU  = DE_GHT + D;           // dz_mu                        (DM)
+constant constexpr int DE_ETT  = DE_ZMU + DM;          // d e_tilde (collected)        (DM)
+constant constexpr int DE_ZI   = DE_ETT + DM;          // dz_init                      (DS)
+constant constexpr int DE_DS0  = DE_ZI + DS;           // d sigma^j totals (LN1 outs)  (DS)x3
+constant constexpr int DE_ZG0  = DE_DS0 + 3 * DS;      // dz_gate j=0,1                (DS)x2
+constant constexpr int DE_ZN0  = DE_ZG0 + 2 * DS;      // dz_cand j=0,1                (DS)x2
+constant constexpr int DE_QP   = DE_ZN0 + 2 * DS;      // dq_pred                      (D)
+constant constexpr int DE_QS0  = DE_QP + D;            // dq_sig j=0..2                (D)x3
+constant constexpr int DE_DG0  = DE_QS0 + 3 * D;       // d dG_j                       (DS)x3
+constant constexpr int DE_DR0  = DE_DG0 + 3 * DS;      // d dR_j                       (DS)x3
+constant constexpr int DE_MUG  = DE_DR0 + 3 * DS;      // d muG                        (DS)
+constant constexpr int DE_MUR  = DE_MUG + DS;          // d muR                        (DS)
+constant constexpr int DE_PPI  = DE_MUR + DS;          // d pre_pi                     (DS)
+constant constexpr int DE_ZPI  = DE_PPI + DS;          // dz_pi (scalar)               (1)
+constant constexpr int DE_H0   = DE_ZPI + 1;           // dh j=0,1                     (64)x2
+constant constexpr int DE_ZH   = DE_H0 + 2 * 64;       // dz_h j=0,1 (scalars)         (2)
+constant constexpr int DE      = DE_ZH + 2;            // 5443
+
+// (W^T x)[i] += sum_o W[o, i] * x[o]  — transposed matvec (column reads; SLC-cached weights).
+inline void matvec_t_add(threadgroup float *dst, device const float *wp,
+                         threadgroup const float *src, int OUT, int IN, uint tid) {
+    for (int i = (int)tid; i < IN; i += TPB) {
+        float acc = 0.0f;
+        for (int o = 0; o < OUT; ++o) acc = fma(wp[(long)o * IN + i], src[o], acc);
+        dst[i] += acc;
+    }
+}
+
+// LayerNorm backward with saved (mean, rstd): dv = rstd*(dyw - mean(dyw) - xhat*mean(dyw*xhat)),
+// dyw = dy .* w, xhat = (v - mean)*rstd. v (the pre-LN input) is recomputed by the caller into
+// `vin`; dy in `dy`; result ADDED into `dv`.
+inline void layer_norm_bwd(threadgroup const float *dy, threadgroup const float *vin,
+                           device const float *w, float mean, float rstd, int N,
+                           threadgroup float *dv, threadgroup float *scratch,
+                           threadgroup float *scal2, uint tid, uint lane, uint sid) {
+    float p1 = 0.0f, p2 = 0.0f;
+    for (int i = (int)tid; i < N; i += TPB) {
+        const float dyw = dy[i] * w[i];
+        const float xh = (vin[i] - mean) * rstd;
+        p1 += dyw;
+        p2 += dyw * xh;
+    }
+    const float m1 = block_sum(p1, scratch, tid, lane, sid) / N;
+    const float m2 = block_sum(p2, scratch, tid, lane, sid) / N;
+    for (int i = (int)tid; i < N; i += TPB) {
+        const float dyw = dy[i] * w[i];
+        const float xh = (vin[i] - mean) * rstd;
+        dv[i] += rstd * (dyw - m1 - xh * m2);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    (void)scal2;
+}
+
+// dqr[h, n] = sum_p S[h, p, n] * dr[h, p]   (the transposed read)
+inline void state_read_t(device const float *S, threadgroup const float *dr,
+                         threadgroup float *dqr, uint tid) {
+    for (int hn = (int)tid; hn < NH * DH; hn += TPB) {   // hn = h*DH + n
+        const int h = hn / DH, n = hn % DH;
+        float acc = 0.0f;
+        for (int p = 0; p < DH; ++p) acc = fma(S[((long)h * DH + p) * DH + n], dr[h * DH + p], acc);
+        dqr[hn] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// dq = R(-phi) dqr ; also emits nothing (host derives dcos/dsin by re-rotating emitted dq).
+inline void unrotate(threadgroup const float *dqr, device const float *cosv,
+                     device const float *sinv, threadgroup float *dq, uint tid) {
+    for (int i = (int)tid; i < D / 2; i += TPB) {
+        const float c = cosv[i], s = sinv[i];
+        const float g0 = dqr[2 * i], g1 = dqr[2 * i + 1];
+        dq[2 * i] = g0 * c + g1 * s;
+        dq[2 * i + 1] = -g0 * s + g1 * c;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+kernel void aum_silence_bwd(
+    device const float *streams  [[buffer(0)]],   // (B, L, SW)
+    device const float *alpha    [[buffer(1)]],
+    device const float *xw       [[buffer(2)]],
+    device const float *k_rot    [[buffer(3)]],
+    device const float *wpack    [[buffer(4)]],
+    device const float *save     [[buffer(5)]],   // (B, L, SV) forward save pack
+    device const int   *j_star   [[buffer(6)]],
+    device const float *S_ckpt   [[buffer(7)]],   // (B, nseg, NH, DH, DH)
+    device const float *dout     [[buffer(8)]],   // (B, L, DO) incoming grads
+    device       float *demit    [[buffer(9)]],   // (B, L, DE) emitted d-vectors
+    device       float *dalpha   [[buffer(10)]],  // (B, L, NH)
+    device       float *dxw      [[buffer(11)]],  // (B, L, NH*DH)
+    device       float *dkrot    [[buffer(12)]],  // (B, L, NH*DH)
+    device       float *S_seg    [[buffer(13)]],  // (B, 64, NH, DH, DH) segment replay scratch
+    device       float *dS       [[buffer(14)]],  // (B, NH, DH, DH) chain workspace, zeroed
+    constant     uint  &L        [[buffer(15)]],
+    constant     float &kappa    [[buffer(16)]],
+    constant     int   &forced   [[buffer(17)]],
+    constant     int   &no_op    [[buffer(18)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint  tid  [[thread_index_in_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]],
+    uint  sid  [[simdgroup_index_in_threadgroup]]) {
+
+    const long b = tgid.z;
+    const uint nseg = (L + 63) / 64;
+    device float *dSb = dS + b * (long)(NH * DH * DH);
+    device float *seg = S_seg + b * (long)(64 * NH * DH * DH);
+
+    threadgroup float sig[(PJ + 1) * DS];        // saved sigma^0..2 of the token
+    threadgroup float dsig[(PJ + 1) * DS];
+    threadgroup float dcarry[DS];                // d sigma^{*}_t coming from token t+1
+    threadgroup float dsprev[DS];                // d sigma_prev accumulated at this token
+    threadgroup float sprev[DS];                 // sigma_prev (= sigma^*_{t-1})
+    threadgroup float dr[(PJ + 1) * D];          // d r_j accumulators
+    threadgroup float big_a[D], big_b[D], big_c[D];
+    threadgroup float sm_a[DS], sm_b[DS], sm_c[DS];
+    threadgroup float muG[DS], muR[DS];
+    threadgroup float mu[DM], etil[DM], dmu[DM], detil[DM];
+    threadgroup float hv[64], dhv[64];
+    threadgroup float scratch[TPB / 32];
+    threadgroup float scal[8];
+
+    for (int i = (int)tid; i < DS; i += TPB) dcarry[i] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int s = (int)nseg - 1; s >= 0; --s) {
+        // ---- replay S forward through this segment: seg[i] = S_{t0+i} (post-update) ----
+        const int t0 = s * 64;
+        const int tend = min((int)L, t0 + 64);
+        device const float *ck = S_ckpt + (b * nseg + s) * (long)(NH * DH * DH);
+        for (int i = t0; i < tend; ++i) {
+            device const float *prev = (i == t0) ? ck : seg + (long)(i - 1 - t0) * NH * DH * DH;
+            device float *cur = seg + (long)(i - t0) * NH * DH * DH;
+            device const float *xt = xw + (b * L + i) * (long)(NH * DH);
+            device const float *kt = k_rot + (b * L + i) * (long)(NH * DH);
+            device const float *at = alpha + (b * L + i) * NH;
+            for (int hp = (int)tid; hp < NH * DH; hp += TPB) {
+                const int h = hp / DH;
+                const float a = at[h], xv = xt[hp];
+                device const float *pr = prev + (long)hp * DH;
+                device float *cu = cur + (long)hp * DH;
+                device const float *kh = kt + h * DH;
+                for (int n = 0; n < DH; ++n) cu[n] = a * pr[n] + xv * kh[n];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        for (int t = tend - 1; t >= t0; --t) {
+            device const float *st = streams + (b * L + t) * (long)SW;
+            device const float *sv = save + (b * L + t) * (long)SV;
+            device const float *dv = dout + (b * L + t) * (long)DO;
+            device float *de = demit + (b * L + t) * (long)DE;
+            device const float *S_t = seg + (long)(t - t0) * NH * DH * DH;
+            device const float *S_p = (t == t0) ? ck : seg + (long)(t - 1 - t0) * NH * DH * DH;
+            device const float *xt = xw + (b * L + t) * (long)(NH * DH);
+            device const float *kt = k_rot + (b * L + t) * (long)(NH * DH);
+            device const float *at = alpha + (b * L + t) * NH;
+            const int js = no_op ? 0 : j_star[b * L + t];
+
+            // load saved sigma trajectory, mu, e_tilde, sigma_prev; init accumulators
+            for (int i = (int)tid; i < (PJ + 1) * DS; i += TPB) {
+                sig[i] = sv[SV_SIGST + i];
+                dsig[i] = dv[DO_SIG + i];
+            }
+            for (int i = (int)tid; i < DS; i += TPB) {
+                sprev[i] = (t > 0) ? save[(b * L + t - 1) * (long)SV + SV_SSTAR + i] : 0.0f;
+                dsprev[i] = 0.0f;
+            }
+            for (int i = (int)tid; i < DM; i += TPB) {
+                mu[i] = sv[SV_MU + i];
+                etil[i] = sv[SV_ETIL + i];
+                dmu[i] = 0.0f;
+                detil[i] = 0.0f;
+            }
+            for (int i = (int)tid; i < (PJ + 1) * D; i += TPB) dr[i] = dv[DO_RST + i];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int i = (int)tid; i < DS; i += TPB)
+                dsig[js * DS + i] += dcarry[i] + dv[DO_SST + i];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const float pi_v = sv[SV_PI];
+            float dpi = dv[DO_PI];
+            float dE_tot[PJ + 1];
+            for (int j = 0; j <= PJ; ++j) dE_tot[j] = dv[DO_E + j];
+
+            // ---- halting backward (skipped when forced: w was one-hot) ----
+            if (forced < 0) {
+                // recompute p0, p1 (and h_j) from the halt MLP
+                float pj[2];
+                for (int j = 0; j < PJ; ++j) {
+                    for (int i = (int)tid; i < 64; i += TPB) hv[i] = 0.0f;
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    matvec_add(hv, wpack + W_H1S, sig + j * DS, 64, DS, tid);
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    float part = 0.0f;
+                    for (int i = (int)tid; i < 64; i += TPB) {
+                        hv[i] = tanh(hv[i] + wpack[W_H1PI + i] * pi_v
+                                     + wpack[W_H1E + i] * sv[SV_E + j]);
+                        part += wpack[W_H2 + i] * hv[i];
+                    }
+                    const float z = block_sum(part, scratch, tid, lane, sid);
+                    pj[j] = 1.0f / (1.0f + exp(-z));
+                    // stash h_j for the gradient pass below (hv reused per j — process grads now)
+                    const float dw0 = dv[DO_W + 0], dw1 = dv[DO_W + 1], dw2 = dv[DO_W + 2];
+                    float dp;
+                    if (j == 0) {
+                        // needs p1 too — defer j=0's dp to after the j loop? Instead compute
+                        // both p first. Handled by the two-pass structure below.
+                        dp = 0.0f; (void)dw0; (void)dw1; (void)dw2;
+                    }
+                    (void)dp;
+                    if (j == 0) { for (int i = (int)tid; i < 64; i += TPB) dhv[i] = hv[i]; }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                // dhv currently holds h_0; hv holds h_1. Cascade grads:
+                const float p0 = pj[0], p1 = pj[1];
+                const float dw0 = dv[DO_W + 0], dw1 = dv[DO_W + 1], dw2 = dv[DO_W + 2];
+                const float dp0 = dw0 - dw1 * p1 - dw2 * (1.0f - p1);
+                const float dp1 = dw1 * (1.0f - p0) - dw2 * (1.0f - p0);
+                const float dz0 = p0 * (1.0f - p0) * dp0;
+                const float dz1 = p1 * (1.0f - p1) * dp1;
+                if (tid == 0) { de[DE_ZH + 0] = dz0; de[DE_ZH + 1] = dz1; }
+                // per-j: dh = (1 - h^2) * w_h2 * dz ; dsig_j += Wh1s^T dh ; dpi/dE accumulate
+                for (int j = 0; j < PJ; ++j) {
+                    threadgroup float *hj = (j == 0) ? dhv : hv;
+                    const float dz = (j == 0) ? dz0 : dz1;
+                    float ppi = 0.0f, pE = 0.0f;
+                    for (int i = (int)tid; i < 64; i += TPB) {
+                        const float dh = (1.0f - hj[i] * hj[i]) * wpack[W_H2 + i] * dz;
+                        hj[i] = dh;                                   // reuse as dh
+                        de[DE_H0 + j * 64 + i] = dh;
+                        ppi += wpack[W_H1PI + i] * dh;
+                        pE += wpack[W_H1E + i] * dh;
+                    }
+                    dpi += block_sum(ppi, scratch, tid, lane, sid);
+                    dE_tot[j] += block_sum(pE, scratch, tid, lane, sid);
+                    matvec_t_add(dsig + j * DS, wpack + W_H1S, hj, 64, DS, tid);
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+            } else {
+                if (tid == 0) { de[DE_ZH] = 0.0f; de[DE_ZH + 1] = 0.0f; }
+                for (int i = (int)tid; i < 2 * 64; i += TPB) de[DE_H0 + i] = 0.0f;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            // ---- pressure backward: needs de_n = |e~|, dsR = |P_R r_0 - Q_R sigma^0| ----
+            {
+                float p2 = 0.0f;
+                for (int i = (int)tid; i < DM; i += TPB) p2 += etil[i] * etil[i];
+                const float de_n = sqrt(block_sum(p2, scratch, tid, lane, sid));
+                // dR_0 into sm_a
+                for (int i = (int)tid; i < DS; i += TPB) sm_a[i] = 0.0f;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                matvec_add(sm_a, wpack + W_QR, sig, DS, DS, tid);   // Q_R sigma^0
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                float p3 = 0.0f;
+                for (int i = (int)tid; i < DS; i += TPB) {
+                    float pr = 0.0f;
+                    device const float *row = wpack + W_PRR + (long)i * D;
+                    device const float *r0 = sv + SV_RST;
+                    for (int n = 0; n < D; ++n) pr = fma(row[n], r0[n], pr);
+                    sm_a[i] = pr - sm_a[i];                          // dR_0
+                    p3 += sm_a[i] * sm_a[i];
+                }
+                const float dsR = sqrt(block_sum(p3, scratch, tid, lane, sid));
+                const float dz_pi = (1.0f - exp(-pi_v)) * dpi;       // softplus' = sigmoid(z)
+                if (tid == 0) de[DE_ZPI] = dz_pi;
+                // dpre_pi_i = w_pi_i * (1 - tanh^2(pre_i)) * dz ; collect d_de, d_dsR
+                float pde = 0.0f, pds = 0.0f;
+                for (int i = (int)tid; i < DS; i += TPB) {
+                    const float pre = st[SW_CPRESS + i] + wpack[W_WPDE + i] * de_n
+                                      + wpack[W_WPDS + i] * dsR;
+                    const float th = tanh(pre);
+                    const float dpre = wpack[W_WPI + i] * (1.0f - th * th) * dz_pi;
+                    de[DE_PPI + i] = dpre;
+                    pde += wpack[W_WPDE + i] * dpre;
+                    pds += wpack[W_WPDS + i] * dpre;
+                }
+                const float d_de = block_sum(pde, scratch, tid, lane, sid);
+                const float d_ds = block_sum(pds, scratch, tid, lane, sid);
+                // d e~ += (e~/|e~|) d_de ; fold (dR_0/|dR_0|) d_dsR into the E-path ddR_0 below
+                if (de_n > 0.0f)
+                    for (int i = (int)tid; i < DM; i += TPB) detil[i] += etil[i] / de_n * d_de;
+                if (tid == 0) scal[0] = (dsR > 0.0f) ? d_ds / dsR : 0.0f;   // ddR0 scale
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                // keep dR_0 (sm_a) for the consistency pass: stash into big_c[0..DS)
+                for (int i = (int)tid; i < DS; i += TPB) big_c[i] = sm_a[i];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            // ---- consistency backward (mu detached) ----
+            for (int i = (int)tid; i < DS; i += TPB) { muG[i] = 0.0f; muR[i] = 0.0f; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            matvec_add(muG, wpack + W_PCG, mu, DS, DM, tid);
+            matvec_add(muR, wpack + W_PCR, mu, DS, DM, tid);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int i = (int)tid; i < DS; i += TPB) { sm_b[i] = 0.0f; sm_c[i] = 0.0f; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int j = 0; j <= PJ; ++j) {
+                threadgroup float *sj = sig + j * DS;
+                // dG_j = c_pg - Q_G sigma^j (sm_a); dR_j (reuse big_c for j=0, else recompute)
+                for (int i = (int)tid; i < DS; i += TPB) sm_a[i] = 0.0f;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                matvec_add(sm_a, wpack + W_QG, sj, DS, DS, tid);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (int i = (int)tid; i < DS; i += TPB) sm_a[i] = st[SW_CPG + i] - sm_a[i];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                threadgroup float *dRj = big_c;                       // (DS floats reused)
+                if (j > 0) {
+                    for (int i = (int)tid; i < DS; i += TPB) big_c[i] = 0.0f;
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    matvec_add(big_c, wpack + W_QR, sj, DS, DS, tid);
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    for (int i = (int)tid; i < DS; i += TPB) {
+                        float pr = 0.0f;
+                        device const float *row = wpack + W_PRR + (long)i * D;
+                        device const float *rj = sv + SV_RST + j * D;
+                        for (int n = 0; n < D; ++n) pr = fma(row[n], rj[n], pr);
+                        big_c[i] = pr - big_c[i];
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                // ddG (into sm_a, overwriting dG), ddR (dRj -> overwritten), dmu accumulators
+                for (int i = (int)tid; i < DS; i += TPB) {
+                    const float dG = sm_a[i], dRv = dRj[i];
+                    const float ddG = 2.0f * muG[i] * muG[i] * dG * dE_tot[j];
+                    float ddR = 2.0f * muR[i] * muR[i] * dRv * dE_tot[j];
+                    if (j == 0) ddR += scal[0] * dRv;                 // the dsR fold
+                    sm_b[i] += 2.0f * muG[i] * dG * dG * dE_tot[j];   // dmuG
+                    sm_c[i] += 2.0f * muR[i] * dRv * dRv * dE_tot[j]; // dmuR
+                    de[DE_DG0 + j * DS + i] = ddG;
+                    de[DE_DR0 + j * DS + i] = ddR;
+                    sm_a[i] = ddG;
+                    dRj[i] = ddR;
+                    // kappa term
+                    const float dk = 2.0f * kappa * (sj[i] - sprev[i]) * dE_tot[j];
+                    dsig[j * DS + i] += dk;
+                    dsprev[i] -= dk;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                // dsig_j -= Q_G^T ddG + Q_R^T ddR ; dr_j += P_R^T ddR
+                for (int i = (int)tid; i < DS; i += TPB) {
+                    float a1 = 0.0f, a2 = 0.0f;
+                    for (int o = 0; o < DS; ++o) {
+                        a1 = fma(wpack[W_QG + (long)o * DS + i], sm_a[o], a1);
+                        a2 = fma(wpack[W_QR + (long)o * DS + i], dRj[o], a2);
+                    }
+                    dsig[j * DS + i] -= a1 + a2;
+                }
+                matvec_t_add(dr + j * D, wpack + W_PRR, dRj, DS, D, tid);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            for (int i = (int)tid; i < DS; i += TPB) {
+                de[DE_MUG + i] = sm_b[i];
+                de[DE_MUR + i] = sm_c[i];
+            }
+
+            // ---- interleaved reverse through the revision loop ----
+            // dsig[j] is complete only after BOTH its E/halting/output grads AND the read-bwd of
+            // r_j (dq_j -> W_qsig^T) have landed; dr[j] is complete only after the revise-bwd
+            // that consumed r_j. The correct order is therefore:
+            //   read(2) -> revise(1) -> read(1) -> revise(0) -> read(0) -> init
+            for (int j = PJ; j >= 0; --j) {
+                // (a) read backward for r_j (dr[j] is final here)
+                for (int i = (int)tid; i < D; i += TPB) big_a[i] = 0.0f;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                matvec_add(big_a, wpack + W_QSIG, sig + j * DS, D, DS, tid);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                rotate_query(big_a, st + SW_COST, st + SW_SINT, big_b, tid);   // qr_j
+                for (int hp = (int)tid; hp < NH * DH; hp += TPB) {             // dS_t += dr (x) qr
+                    const int h = hp / DH;
+                    const float drv = dr[j * D + hp];
+                    device float *dSrow = dSb + (long)hp * DH;
+                    for (int n = 0; n < DH; ++n) dSrow[n] += drv * big_b[h * DH + n];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                state_read_t(S_t, dr + j * D, big_a, tid);                     // dqr_j
+                unrotate(big_a, st + SW_COST, st + SW_SINT, big_b, tid);       // dq_j
+                for (int i = (int)tid; i < D; i += TPB) de[DE_QS0 + j * D + i] = big_b[i];
+                matvec_t_add(dsig + j * DS, wpack + W_QSIG, big_b, D, DS, tid);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (j == 0) break;
+
+                // (b) revision backward for step jr = j-1 (consumes the now-complete dsig[j])
+                {
+                    const int jr = j - 1;
+                    threadgroup float *sj = sig + jr * DS;
+                    device const float *rj = sv + SV_RST + jr * D;
+                    // recompute gate (sm_a) / cand (sm_b) pre-activations
+                    for (int i = (int)tid; i < DS; i += TPB) {
+                        sm_a[i] = st[SW_CGATE + i];
+                        sm_b[i] = st[SW_CCAND + i];
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    matvec_add(sm_a, wpack + W_GS, sj, DS, DS, tid);
+                    matvec_add(sm_a, wpack + W_GET, etil, DS, DM, tid);
+                    matvec_add(sm_a, wpack + W_GMU, mu, DS, DM, tid);
+                    matvec_add(sm_b, wpack + W_NS, sj, DS, DS, tid);
+                    matvec_add(sm_b, wpack + W_NET, etil, DS, DM, tid);
+                    matvec_add(sm_b, wpack + W_NMU, mu, DS, DM, tid);
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    for (int i = (int)tid; i < DS; i += TPB) {
+                        float ag = 0.0f, an = 0.0f;
+                        device const float *rowg = wpack + W_GR + (long)i * D;
+                        device const float *rown = wpack + W_NR + (long)i * D;
+                        for (int n = 0; n < D; ++n) {
+                            ag = fma(rowg[n], rj[n], ag);
+                            an = fma(rown[n], rj[n], an);
+                        }
+                        const float gate = 1.0f / (1.0f + exp(-(sm_a[i] + ag)));
+                        const float cand = tanh(sm_b[i] + an);
+                        sm_a[i] = gate;
+                        sm_b[i] = cand;
+                        sm_c[i] = sj[i] + gate * cand;                // pre-LN input v
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    // LN1 backward: dy = dsig[jr+1]; emit dy; dv accumulates into dsig[jr]
+                    for (int i = (int)tid; i < DS; i += TPB) de[DE_DS0 + (jr + 1) * DS + i]
+                        = dsig[(jr + 1) * DS + i];
+                    for (int i = (int)tid; i < DS; i += TPB) big_c[i] = 0.0f;
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    layer_norm_bwd(dsig + (jr + 1) * DS, sm_c, wpack + W_LN1W,
+                                   sv[SV_LN1 + 2 * (jr + 1)], sv[SV_LN1 + 2 * (jr + 1) + 1], DS,
+                                   big_c, scratch, scal, tid, lane, sid);
+                    for (int i = (int)tid; i < DS; i += TPB) {
+                        const float dvv = big_c[i];
+                        const float gate = sm_a[i], cand = sm_b[i];
+                        dsig[jr * DS + i] += dvv;                     // through the residual
+                        const float dgate = dvv * cand, dcand = dvv * gate;
+                        sm_a[i] = gate * (1.0f - gate) * dgate;       // dz_g
+                        sm_b[i] = (1.0f - cand * cand) * dcand;       // dz_n
+                        de[DE_ZG0 + jr * DS + i] = sm_a[i];
+                        de[DE_ZN0 + jr * DS + i] = sm_b[i];
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    matvec_t_add(dsig + jr * DS, wpack + W_GS, sm_a, DS, DS, tid);
+                    matvec_t_add(dsig + jr * DS, wpack + W_NS, sm_b, DS, DS, tid);
+                    matvec_t_add(detil, wpack + W_GET, sm_a, DS, DM, tid);
+                    matvec_t_add(detil, wpack + W_NET, sm_b, DS, DM, tid);
+                    matvec_t_add(dmu, wpack + W_GMU, sm_a, DS, DM, tid);
+                    matvec_t_add(dmu, wpack + W_NMU, sm_b, DS, DM, tid);
+                    matvec_t_add(dr + jr * D, wpack + W_GR, sm_a, DS, D, tid);
+                    matvec_t_add(dr + jr * D, wpack + W_NR, sm_b, DS, D, tid);
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+            }
+
+            // ---- sigma^0 (init) backward ----
+            for (int i = (int)tid; i < DS; i += TPB) de[DE_DS0 + i] = dsig[i];
+            // recompute z_init = c_init + Wi_s sprev + Wi_et e~ + Wi_mu mu
+            for (int i = (int)tid; i < DS; i += TPB) sm_c[i] = st[SW_CINIT + i];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            matvec_add(sm_c, wpack + W_IS, sprev, DS, DS, tid);
+            matvec_add(sm_c, wpack + W_IET, etil, DS, DM, tid);
+            matvec_add(sm_c, wpack + W_IMU, mu, DS, DM, tid);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int i = (int)tid; i < DS; i += TPB) sm_a[i] = 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            layer_norm_bwd(dsig, sm_c, wpack + W_LN1W, sv[SV_LN1], sv[SV_LN1 + 1], DS,
+                           sm_a, scratch, scal, tid, lane, sid);                 // dz_init
+            for (int i = (int)tid; i < DS; i += TPB) de[DE_ZI + i] = sm_a[i];
+            matvec_t_add(dsprev, wpack + W_IS, sm_a, DS, DS, tid);
+            matvec_t_add(detil, wpack + W_IET, sm_a, DS, DM, tid);
+            matvec_t_add(dmu, wpack + W_IMU, sm_a, DS, DM, tid);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // ---- e_tilde / mu backward ----
+            // e~ = mu (.) (W_err e); e = g - g_hat (both saved/streamed)
+            for (int i = (int)tid; i < D; i += TPB) big_a[i] = st[SW_G + i] - sv[SV_GHAT + i]; // e
+            for (int i = (int)tid; i < DM; i += TPB) sm_a[i] = 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            matvec_add(sm_a, wpack + W_ERR, big_a, DM, D, tid);       // W_err e
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int i = (int)tid; i < DM; i += TPB) {
+                dmu[i] += sm_a[i] * detil[i];
+                sm_b[i] = mu[i] * detil[i];                           // d(W_err e)
+                de[DE_ETT + i] = detil[i];
+                sm_c[i] = mu[i] * (1.0f - mu[i]) * dmu[i];            // dz_mu
+                de[DE_ZMU + i] = sm_c[i];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // de_vec = W_err^T (mu.detil) + W_mue^T dz_mu   (into big_b)
+            for (int i = (int)tid; i < D; i += TPB) big_b[i] = 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            matvec_t_add(big_b, wpack + W_ERR, sm_b, DM, D, tid);
+            matvec_t_add(big_b, wpack + W_MUE, sm_c, DM, D, tid);
+            matvec_t_add(dsprev, wpack + W_MUS, sm_c, DM, DS, tid);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // ---- g_hat backward ----
+            // dGhat_tot = dghat_in - de_vec
+            for (int i = (int)tid; i < D; i += TPB) {
+                big_a[i] = dv[DO_GHAT + i] - big_b[i];
+                de[DE_GHT + i] = big_a[i];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // dy5 = W_P^T dGhat_tot
+            for (int i = (int)tid; i < D; i += TPB) big_c[i] = 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            matvec_t_add(big_c, wpack + W_P, big_a, D, D, tid);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // recompute pre = W_R r_pred + W_hyp sprev + c_phase (into big_a)
+            for (int i = (int)tid; i < D; i += TPB) big_a[i] = st[SW_CPHASE + i];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            {
+                // W_R r_pred: r_pred saved (device); row-major matvec with device src
+                for (int o = (int)tid; o < D; o += TPB) {
+                    float acc = 0.0f;
+                    device const float *row = wpack + W_R + (long)o * D;
+                    device const float *rp = sv + SV_RPRED;
+                    for (int i2 = 0; i2 < D; ++i2) acc = fma(row[i2], rp[i2], acc);
+                    big_a[o] += acc;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                matvec_add(big_a, wpack + W_HYP, sprev, D, DS, tid);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            for (int i = (int)tid; i < D; i += TPB) big_b[i] = 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            layer_norm_bwd(big_c, big_a, wpack + W_LN5W, sv[SV_LN5], sv[SV_LN5 + 1], D,
+                           big_b, scratch, scal, tid, lane, sid);                // dpre
+            for (int i = (int)tid; i < D; i += TPB) de[DE_PRE + i] = big_b[i];
+            matvec_t_add(dsprev, wpack + W_HYP, big_b, D, DS, tid);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // dr_pred = W_R^T dpre (into big_a)
+            for (int i = (int)tid; i < D; i += TPB) big_a[i] = 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            matvec_t_add(big_a, wpack + W_R, big_b, D, D, tid);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // ---- S-chain step at token t ----
+            // dalpha/dxw/dkrot from dS_t and S_{t-1}
+            for (int h = 0; h < NH; ++h) {
+                float part = 0.0f;
+                for (int pn = (int)tid; pn < DH * DH; pn += TPB)
+                    part += dSb[(long)h * DH * DH + pn] * S_p[(long)h * DH * DH + pn];
+                const float da = block_sum(part, scratch, tid, lane, sid);
+                if (tid == 0) dalpha[(b * L + t) * NH + h] = da;
+            }
+            for (int hp = (int)tid; hp < NH * DH; hp += TPB) {
+                const int h = hp / DH;
+                device const float *dSrow = dSb + (long)hp * DH;
+                device const float *kh = kt + h * DH;
+                float acc = 0.0f;
+                for (int n = 0; n < DH; ++n) acc = fma(dSrow[n], kh[n], acc);
+                dxw[(b * L + t) * (long)(NH * DH) + hp] = acc;
+            }
+            for (int hn = (int)tid; hn < NH * DH; hn += TPB) {
+                const int h = hn / DH, n = hn % DH;
+                float acc = 0.0f;
+                for (int p = 0; p < DH; ++p)
+                    acc = fma(dSb[((long)h * DH + p) * DH + n], xt[h * DH + p], acc);
+                dkrot[(b * L + t) * (long)(NH * DH) + hn] = acc;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // dS <- alpha_t (.) dS  (now dS_{t-1} sans the predictive read)
+            for (int hp = (int)tid; hp < NH * DH; hp += TPB) {
+                const int h = hp / DH;
+                const float a = at[h];
+                device float *dSrow = dSb + (long)hp * DH;
+                for (int n = 0; n < DH; ++n) dSrow[n] *= a;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // ---- predictive-read backward (reads S_{t-1}; contributes to dS_{t-1}) ----
+            // q_pred = W_qpred sprev ; qr = R(phi_{t-1}) q
+            for (int i = (int)tid; i < D; i += TPB) big_c[i] = 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            matvec_add(big_c, wpack + W_QPRED, sprev, D, DS, tid);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            rotate_query(big_c, st + SW_COSP, st + SW_SINP, big_b, tid);        // qr_pred
+            for (int hp = (int)tid; hp < NH * DH; hp += TPB) {
+                const int h = hp / DH;
+                const float drv = big_a[hp];                                    // dr_pred
+                device float *dSrow = dSb + (long)hp * DH;
+                for (int n = 0; n < DH; ++n) dSrow[n] += drv * big_b[h * DH + n];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            state_read_t(S_p, big_a, big_c, tid);                               // dqr_pred
+            unrotate(big_c, st + SW_COSP, st + SW_SINP, big_b, tid);            // dq_pred
+            for (int i = (int)tid; i < D; i += TPB) de[DE_QP + i] = big_b[i];
+            matvec_t_add(dsprev, wpack + W_QPRED, big_b, D, DS, tid);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // ---- carry to t-1 ----
+            for (int i = (int)tid; i < DS; i += TPB) dcarry[i] = dsprev[i];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
     }
 }

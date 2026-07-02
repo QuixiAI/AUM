@@ -52,6 +52,8 @@ class AumConfig:
     entropy_feature: bool = False     # optional H_t pressure feature — the registered §14 ablation
     silence_segment: int = 64         # C7: checkpoint the global recurrence every N tokens during
                                       # training (exact gradients, boundary states only; 0 = off)
+    silence_fused: bool = True        # fused Metal global-block kernel when eligible (roadmap
+                                      # step 4); False pins the per-token reference loop
 
     # ---- Loss weights (§10, §13 reference values) ----
     lambda_pred: float = 0.5          # lambda_P: prediction-head objective

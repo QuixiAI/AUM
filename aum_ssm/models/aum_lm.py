@@ -219,6 +219,22 @@ class AumBackbone(nn.Module):
         u = None
         if self.training and forced_depth is None:            # pre-drawn Categorical(w) uniforms
             u = torch.rand(B, L, device=g_t.device)
+
+        # Fused Metal path (kernel-roadmap step 4): the whole recurrence in one kernel launch per
+        # direction instead of ~50 tiny ops x L tokens. Exact (validated to fp32 noise against
+        # this loop, gradients included). Falls back for non-standard geometry / ablations other
+        # than no_op / top_gru / entropy_feature / stage-4 J(pi) inference / non-MPS.
+        if self._fused_silence_ok(ablation, H, Dv, g_t.device):
+            from aum_ssm.ops.metal.silence_metal import silence_fused
+            o_t, aux = silence_fused(self.silence, g_t, phi, m_t, s_t, alpha, xw, k_rot,
+                                     freqs, halt_u=u, forced_depth=forced_depth,
+                                     no_op=(ablation == "no_op"))
+            if inference_params is not None:                  # prefill: seed the carry slot
+                slot = self._silence_slot(inference_params, g_t.shape[0], g_t.device)
+                slot["sigma"].copy_(aux.sigma_star[:, -1].detach())
+                slot["phi_prev"].copy_(phi[:, -1:])
+            return (o_t, aux) if return_aux else o_t
+
         seg = getattr(self.config, "silence_segment", 0)
         use_ckpt = (self.training and torch.is_grad_enabled() and inference_params is None
                     and ablation is None and 0 < seg < L)
@@ -278,6 +294,27 @@ class AumBackbone(nn.Module):
                 a.g, a.g_hat, a.e, a.mu, a.e_tilde, a.sigma0,
                 torch.stack(a.sigma_traj, dim=2), torch.stack(a.r_traj, dim=2),
                 a.E_traj, a.pi, a.w, a.expected_J, a.o_stack, a.j_star, a.sigma_star, a.phi)
+
+    def _fused_silence_ok(self, ablation, H, Dv, device):
+        """Eligibility for the fused silence kernel (geometry hardcoded in the metal)."""
+        if getattr(self.config, "silence_fused", True) is False:
+            return False
+        c, s = self.config, self.silence
+        if ablation not in (None, "no_op") or s.top_gru or s.entropy_feature:
+            return False
+        if s.pi_trigger is not None and not self.training:
+            return False                                      # stage-4 J(pi) halting: loop path
+        if not (s.d_model == 512 and s.d_sigma == 128 and s.d_mu == 32 and s.j_max == 2
+                and H == 8 and Dv == 64):
+            return False
+        if getattr(c, "kernel_backend", "auto") not in ("auto", "metal") \
+                or device.type != "mps":
+            return False
+        try:
+            import kernels.metal  # noqa: F401
+            return True
+        except Exception:
+            return False
 
     def _silence_slot(self, inference_params, batch, device):
         kv = inference_params.key_value_memory_dict
