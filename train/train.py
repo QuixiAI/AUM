@@ -228,7 +228,9 @@ def main():
     ap.add_argument("--eval-batches", type=int, default=8)
     ap.add_argument("--r2-len", type=int, default=512, help="context length for the R^2 gate probe")
     ap.add_argument("--save-every", type=int, default=1000)
-    ap.add_argument("--log-every", type=int, default=10)
+    ap.add_argument("--log-every", type=int, default=1,
+                    help="optimizer steps between log lines / wandb points (steps are minutes "
+                         "at 4k context on MPS — log every one)")
     ap.add_argument("--no-tqdm", action="store_true", help="plain-print progress (logs/CI)")
     ap.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=None,
                     help="report to Weights & Biases (default: ON when the wandb package is "
