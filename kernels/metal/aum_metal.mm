@@ -394,6 +394,44 @@ static std::tuple<at::Tensor, at::Tensor> cross_entropy_fwd_mps(
   return {loss, lse};
 }
 
+// ---- aum_silence: the fused sequential global block (v6 §5-§9; roadmap step 4) ----
+// Marches the whole silence recurrence over L tokens in ONE kernel launch: one threadgroup per
+// batch row, 256 threads cooperating per token. Geometry hardcoded in the metal (D=512, DS=128,
+// DM=32, H=8, DH=64, J=2). Stream/weight/save pack layouts are defined by
+// aum_ssm/ops/metal/silence_flat.py + aum_ssm/ops/metal/silence_metal.py.
+static constexpr int kSilSW = 2720;                 // stream-pack width  (must match SW)
+static constexpr int kSilSV = 3151;                 // save-pack width    (must match SV)
+
+static std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> aum_silence_fwd_mps(
+    const at::Tensor& streams_in, const at::Tensor& alpha_in, const at::Tensor& xw_in,
+    const at::Tensor& krot_in, const at::Tensor& haltu_in, const at::Tensor& wpack_in,
+    double kappa, int64_t forced) {
+  auto streams = streams_in.contiguous(), alpha = alpha_in.contiguous();
+  auto xw = xw_in.contiguous(), krot = krot_in.contiguous();
+  auto haltu = haltu_in.contiguous(), wpack = wpack_in.contiguous();
+  TORCH_CHECK(streams.device().is_mps() && streams.scalar_type() == at::kFloat,
+              "aum_silence_fwd: fp32 MPS tensors required");
+  const int Bsz = streams.size(0);
+  const unsigned L = (unsigned)streams.size(1);
+  TORCH_CHECK(streams.size(2) == kSilSW, "aum_silence_fwd: stream pack width mismatch");
+  auto f32 = streams.options();
+  auto S = at::zeros({Bsz, 8, 64, 64}, f32);
+  const long nseg = (L + 63) / 64;
+  auto S_ckpt = at::empty({Bsz, nseg, 8, 64, 64}, f32);
+  auto save = at::empty({Bsz, (long)L, kSilSV}, f32);
+  auto jstar = at::empty({Bsz, (long)L}, streams.options().dtype(at::kInt));
+  const float kap = (float)kappa;
+  const int frc = (int)forced;
+  encode([&](Encoder& e) {
+    e.pipeline("aum_silence_fwd");
+    e.in(streams, 0); e.in(alpha, 1); e.in(xw, 2); e.in(krot, 3); e.in(haltu, 4);
+    e.in(wpack, 5); e.out(S, 6); e.out(save, 7); e.out(jstar, 8); e.out(S_ckpt, 9);
+    e.bytes(L, 10); e.bytes(kap, 11); e.bytes(frc, 12);
+    e.dispatch(1, 1, Bsz, 256, 1, 1);                // one threadgroup per batch row
+  });
+  return {save, jstar, S, S_ckpt};
+}
+
 static at::Tensor cross_entropy_bwd_mps(
     const at::Tensor& logits_in, const at::Tensor& targets_in, const at::Tensor& lse_in,
     const at::Tensor& grad_out_in, int64_t ignore_index, double label_smoothing,
@@ -421,6 +459,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("mamba2_bwd", &mamba2_bwd_mps, "AUM-Ø SSD backward (MPS, auto-routed)");
   m.def("mamba2_bwd_chunked", &mamba2_bwd_chunked_mps, "AUM-Ø SSD backward, forced chunked route");
   m.def("aum_decode", &aum_decode_mps, "AUM-Ø single-token U-phase decode step (MPS)");
+  m.def("aum_silence_fwd", &aum_silence_fwd_mps,
+        "AUM-Ø fused sequential global block, forward (MPS)");
   m.def("aum_operands", &aum_operands_mps, "AUM-Ø fused U-phase operand builder (MPS)");
   m.def("aum_epilogue", &aum_epilogue_mps, "AUM-Ø fused U-phase epilogue (MPS)");
   m.def("cross_entropy_fwd", &cross_entropy_fwd_mps, "fused CE forward -> (loss, lse) (MPS)");

@@ -21,7 +21,8 @@ _INCLUDE = os.path.join(_HERE, "include")
 _SRC = os.path.join(_HERE, "src")
 _METALLIB = os.path.join(_HERE, "aum.metallib")
 _METAL_SOURCES = [os.path.join(_SRC, "mamba2.metal"), os.path.join(_SRC, "aum_decode.metal"),
-                  os.path.join(_SRC, "aum_unfold.metal"), os.path.join(_SRC, "cross_entropy.metal")]
+                  os.path.join(_SRC, "aum_unfold.metal"), os.path.join(_SRC, "cross_entropy.metal"),
+                  os.path.join(_SRC, "aum_silence.metal")]
 
 
 def build_metallib(force: bool = False) -> str:
@@ -131,6 +132,16 @@ def fused_linear_cross_entropy_ce(h, W, targets, row_weight=None, divisor=None,
         dh[c0:c1] = (g @ W).to(h.dtype)
         dW += (g.T @ hc).to(W.dtype)
     return total / divisor, dh, dW, ce_all
+
+
+def aum_silence_fwd(streams, alpha, xw, k_rot, halt_u, wpack, kappa, forced=-1):
+    """Fused sequential global block, forward (§5-§9; roadmap step 4): the whole L-token silence
+    recurrence in ONE kernel launch (one threadgroup per batch row). streams (B,L,2720) fp32 is
+    the token-parallel precompute pack, wpack the flat weight pack (layouts:
+    aum_ssm/ops/metal/silence_metal.py). Returns (save (B,L,3151), j_star (B,L) int32, S_final,
+    S_ckpt (B,ceil(L/64),8,64,64) — the segment-start states the backward replays from)."""
+    return _ext.aum_silence_fwd(streams, alpha, xw, k_rot, halt_u, wpack, float(kappa),
+                                int(forced))
 
 
 def aum_decode(S, alpha, x, k_rot, q_rot):
