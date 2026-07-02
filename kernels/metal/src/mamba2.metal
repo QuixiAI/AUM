@@ -330,9 +330,10 @@ instantiate_ssd_chunk(128);
 //   dC_t  = intra(chunk-bounded) + w_t (dY_t Sex_c^T),  w_t = exp(cl_t - cl[r_{c-1}])   (K6)
 //   dX_j  = intra + w'_j (B_j dKV_c),   dB_j = intra + w'_j (X_j dKV_c^T),              (K7)
 //           w'_j = exp(cl[r_c] - cl_j)
-// dcl is the exact identity  dcl = <dY,Y> - <dX,X>  (rowsum - colsum of dSt.S), assembled on
-// the host from a linear-time Y recompute — it avoids the boundary-row scatter an in-kernel
-// chunked dcl would need. Same 64x64 quadrant tiling as the forward; Sex/dKV are read bf16.
+// dcl = rowsum(M) - colsum(M) (M = dSt∘S) is split IN-KERNEL: the inter-chunk halves collapse
+// to row dots against already-computed outputs — rowsum(M) = r_intra + <dC_inter, C_i> and
+// colsum(M) = cc_intra + <dX_inter, X_j> — so the host just combines (r+ri)-(cc+ci); no Y
+// recompute. Same 64x64 quadrant tiling as the forward; Sex/dKV are read bf16.
 // ---------------------------------------------------------------------------
 
 // K4: G_c quadrants (fp32). Same skeleton as ssd_chunk_kv with (B,X) -> (C,dY) and the weight
