@@ -19,8 +19,14 @@ Pieces it ties together:
              until the prediction head beats the trivial predictor on held-out data), the
              lambda_C 0 -> 5e-3 ramp inside stage 3, and the p_explore 0.2 -> 0.02 anneal.
 
-    # the reference run (20B tokens; override everything for local smoke)
+    # the default run: ONE PASS over the prepared corpus (train/data manifest sets the budget;
+    # --epochs N for more passes, --total-tokens to pin an explicit budget)
     python train/train.py
+
+    # hyperparameters: optimizer knobs are flags; loss weights / model constants are AumConfig
+    # fields, overridable with --set (validated against the config schema)
+    python train/train.py --muon-lr 0.01 --adamw-lr 3e-4 --warmup-steps 500 \
+        --set lambda_pred=0.7 --set lambda_pressure=0.5
 
     # a laptop smoke run: 30 optimizer steps at short context
     python train/train.py --total-tokens 500000 --seq-len 512 --batch-size 1 --grad-accum 4 \
@@ -46,6 +52,8 @@ num_processes=1 (or plain `python`) both work.
 """
 
 import argparse
+import ast
+import dataclasses
 import json
 import math
 import os
@@ -190,14 +198,24 @@ def main():
     ap.add_argument("--run-name", default="aum-tiny-v6")
     ap.add_argument("--out-dir", default=os.path.join(here, "checkpoints"))
     # §13 recipe knobs
-    ap.add_argument("--total-tokens", type=float, default=20e9, help="token budget (§13: 20B)")
+    ap.add_argument("--total-tokens", type=float, default=None,
+                    help="token budget (default: --epochs passes over the prepared corpus)")
+    ap.add_argument("--epochs", type=float, default=1.0,
+                    help="passes over the corpus when --total-tokens is not given")
     ap.add_argument("--seq-len", type=int, default=4096)
     ap.add_argument("--batch-size", type=int, default=2, help="micro-batch (sequences)")
     ap.add_argument("--grad-accum", type=int, default=8)
     ap.add_argument("--warmup-steps", type=int, default=1500)
-    ap.add_argument("--muon-lr", type=float, default=0.02)
-    ap.add_argument("--adamw-lr", type=float, default=6e-4)
+    ap.add_argument("--muon-lr", type=float, default=0.02,
+                    help="Muon peak lr, spectral-norm units (§13: 0.02)")
+    ap.add_argument("--muon-momentum", type=float, default=0.95)
+    ap.add_argument("--adamw-lr", type=float, default=6e-4,
+                    help="AdamW peak lr for embedding/scalars (§13: 6e-4)")
     ap.add_argument("--weight-decay", type=float, default=0.1, help="Muon matrices only")
+    ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                    help="override any AumConfig field (loss weights etc.), e.g. "
+                         "--set lambda_pred=0.7 --set lambda_pressure=0.5 --set kappa=0.2; "
+                         "repeatable, applied last")
     ap.add_argument("--lambda-compute-max", type=float, default=5e-3, help="stage-3 ramp target")
     ap.add_argument("--eta-r2", type=float, default=None,
                     help="override the §12 R^2 pressure gate (default 0.15; e.g. -1e9 to force "
@@ -232,6 +250,17 @@ def main():
     overrides = {"seq_len": args.seq_len, "silence_enabled": not args.no_silence}
     if args.kernel_backend:
         overrides["kernel_backend"] = args.kernel_backend
+    fields = {f.name for f in dataclasses.fields(AumConfig)}
+    for kv in args.set:                                  # --set KEY=VALUE, applied last
+        key, eq, val = kv.partition("=")
+        if not eq:
+            raise SystemExit(f"--set expects KEY=VALUE, got {kv!r}")
+        if key not in fields:
+            raise SystemExit(f"--set: {key!r} is not an AumConfig field ({sorted(fields)})")
+        try:
+            overrides[key] = ast.literal_eval(val)
+        except (ValueError, SyntaxError):
+            overrides[key] = val                         # plain string (e.g. kernel_backend)
     ckpt = os.path.join(args.resume) if args.resume else args.init
     model = load_model(ckpt, overrides)
     cfg = model.config
@@ -251,13 +280,16 @@ def main():
 
     # ---- steps / schedule
     tokens_per_step = args.batch_size * args.grad_accum * args.seq_len
-    total_steps = max(1, math.ceil(args.total_tokens / tokens_per_step))
+    total_tokens = args.total_tokens if args.total_tokens is not None \
+        else len(train_ds) * args.seq_len * args.epochs   # default: --epochs corpus passes
+    total_steps = max(1, math.ceil(total_tokens / tokens_per_step))
     schedule = ScheduleConfig() if args.eta_r2 is None else ScheduleConfig(eta_r2=args.eta_r2)
     ends = stage_boundaries(total_steps, schedule.stage_fractions)   # [s1_end, s2_end, s3_end]
 
     # ---- optimizer (§13 split) + trainer
     optimizer = build_optimizer(model, muon_lr=args.muon_lr, embed_lr=args.adamw_lr,
-                                scalar_lr=args.adamw_lr, weight_decay=args.weight_decay)
+                                scalar_lr=args.adamw_lr, momentum=args.muon_momentum,
+                                weight_decay=args.weight_decay)
     model, optimizer, train_loader, val_loader = accelerator.prepare(
         model, optimizer, train_loader, val_loader)
     base_lrs = [g["lr"] for g in optimizer.param_groups]
