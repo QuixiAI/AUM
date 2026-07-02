@@ -109,6 +109,29 @@ def test_ssd_chunked_bwd_matches_autograd(N, D):
     assert rel(dcl, clr.grad) < 0.03, ("dcl", N, D, rel(dcl, clr.grad))
 
 
+@pytest.mark.parametrize("bwd_fn", ["auto", "chunked"])
+def test_mamba2_bwd_all_ones_decay(bwd_fn):
+    """Degenerate decay (ported from ThunderMittens): a ≡ 1 so cumlog ≡ 0 and L ≡ 1 — no
+    exponential taper anywhere, S = tril(C·Bᵀ). Stresses the raw row/col-sum and inter/intra
+    dcl-split paths with no decay masking. Must still match the autograd oracle."""
+    Bt, H, N, Dd = 1, 1, 128, 64
+    torch.manual_seed(7)
+    C = torch.randn(Bt, H, N, Dd, device="mps") * 0.5
+    Bm = torch.randn(Bt, H, N, Dd, device="mps") * 0.5
+    X = torch.randn(Bt, H, N, Dd, device="mps")
+    cl = torch.zeros(Bt, H, N, device="mps")               # a == 1
+    dY = torch.randn(Bt, H, N, Dd, device="mps")
+    Cr, Br, Xr, clr = (t.clone().detach().requires_grad_() for t in (C, Bm, X, cl))
+    _ssd_fwd_ref(Cr, Br, Xr, clr).backward(dY.float())
+    fn = km.mamba2_bwd_chunked if bwd_fn == "chunked" else km.mamba2_bwd
+    dC, dB, dX, dcl = fn(C.bfloat16(), Bm.bfloat16(), X.bfloat16(), cl, dY.bfloat16())
+    torch.mps.synchronize()
+    rel = lambda u, v: ((u.float() - v).abs().max() / (v.abs().max() + 1e-6)).item()
+    for name, got, want in (("dC", dC, Cr.grad), ("dB", dB, Br.grad),
+                            ("dX", dX, Xr.grad), ("dcl", dcl, clr.grad)):
+        assert rel(got, want) < 0.03, (bwd_fn, name, rel(got, want))
+
+
 @pytest.mark.parametrize("N,D,route", [
     (128, 64, "chunked"), (256, 64, "chunked"),     # forced linear-time (64x64 quadrant state)
     (128, 128, "chunked"), (256, 128, "chunked"),   # ... at the reference head dim
@@ -164,6 +187,44 @@ def test_fused_pipeline_forward_and_grads_match_reference(H, D):
     for key in ("q", "k", "v", "z", "tau_bar", "theta", "dt_bias", "D", "nw"):
         rg = rel(a[key].grad, b[key].grad)
         assert rg < 0.08, (key, rg)
+
+
+def test_fused_mixture_ce_matches_plain():
+    # the §8 mixture LM loss via fused-linear-CE (never materializing (T,V) logits) vs the plain
+    # einops path — loss AND grads for o_stack, w, and the tied classifier weight
+    from aum_ssm.training.losses import lm_mixture_loss, _FusedMixtureCE
+    torch.manual_seed(0)
+    B, L, J1, d, V = 2, 16, 3, 32, 257
+    head = torch.nn.Linear(d, V, bias=False).to("mps")
+
+    def build():
+        torch.manual_seed(1)
+        o = torch.randn(B, L, J1, d, device="mps", requires_grad=True)
+        wl = torch.rand(B, L, J1, device="mps")
+        wl = (wl / wl.sum(-1, keepdim=True)).detach().requires_grad_(True)
+        t = torch.randint(0, V, (B, L), device="mps")
+        return o, wl, t
+
+    o1, w1, t1 = build()
+    loss_f = _FusedMixtureCE.apply(o1.reshape(-1, d), w1.reshape(-1), head.weight,
+                                   t1.unsqueeze(-1).expand(B, L, J1).reshape(-1), B * L)
+    loss_f.backward()
+    gW1 = head.weight.grad.clone()
+    head.weight.grad = None
+    o2, w2, t2 = build()
+    loss_p = lm_mixture_loss(o2, w2, torch.nn.Linear(d, V, bias=True).to("mps"), t2)  # bias -> plain
+    # plain path with the SAME head weights (rebuild a bias-free plain computation manually)
+    logits = o2.reshape(-1, d) @ head.weight.T
+    ce = torch.nn.functional.cross_entropy(logits, t2.unsqueeze(-1).expand(B, L, J1).reshape(-1),
+                                           reduction="none")
+    loss_ref = (w2.reshape(-1) * ce).sum() / (B * L)
+    loss_ref.backward()
+    torch.mps.synchronize()
+    rel = lambda u, v: ((u.float() - v.float()).abs().max() / (v.float().abs().max() + 1e-8)).item()
+    assert abs(loss_f.item() - loss_ref.item()) < 2e-3 * max(1.0, abs(loss_ref.item()))
+    assert rel(o1.grad, o2.grad) < 2e-2
+    assert rel(w1.grad, w2.grad) < 2e-2
+    assert rel(gW1, head.weight.grad) < 2e-2
 
 
 @pytest.mark.parametrize("D", [64, 128])

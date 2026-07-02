@@ -21,7 +21,7 @@ _INCLUDE = os.path.join(_HERE, "include")
 _SRC = os.path.join(_HERE, "src")
 _METALLIB = os.path.join(_HERE, "aum.metallib")
 _METAL_SOURCES = [os.path.join(_SRC, "mamba2.metal"), os.path.join(_SRC, "aum_decode.metal"),
-                  os.path.join(_SRC, "aum_unfold.metal")]
+                  os.path.join(_SRC, "aum_unfold.metal"), os.path.join(_SRC, "cross_entropy.metal")]
 
 
 def build_metallib(force: bool = False) -> str:
@@ -83,6 +83,54 @@ def aum_epilogue(Y, v, z, d_skip, norm_weight, eps=1e-5):
     """Fused U-phase epilogue: silu(z) * RMSNorm(Y + d_skip*v) * norm_weight. Y (B,H,N,D) bf16;
     v,z (B,N,H,Dh) bf16; d_skip flat (H*Dh) fp32; norm_weight (Dh) fp32. Writes (B,N,H,Dh)."""
     return _ext.aum_epilogue(Y, v, z, d_skip, norm_weight, float(eps))
+
+
+def cross_entropy_fwd(logits, targets, ignore_index=-100, label_smoothing=0.0, z_loss=0.0,
+                      softcap=0.0):
+    """Fused CE forward over the vocab axis -> (loss (T,), lse (T,)) fp32; logits (T,V) f32/f16/
+    bf16 MPS. Never materializes probabilities (vendored from ThunderMittens)."""
+    return _ext.cross_entropy_fwd(logits, targets, int(ignore_index), float(label_smoothing),
+                                  float(z_loss), float(softcap))
+
+
+def cross_entropy_bwd(logits, targets, lse, grad_out, ignore_index=-100, label_smoothing=0.0,
+                      z_loss=0.0, softcap=0.0):
+    """Fused CE backward -> grad_logits (T,V), scaled by per-row grad_out."""
+    return _ext.cross_entropy_bwd(logits, targets, lse, grad_out, int(ignore_index),
+                                  float(label_smoothing), float(z_loss), float(softcap))
+
+
+def fused_linear_cross_entropy_ce(h, W, targets, row_weight=None, divisor=None,
+                                  chunk_rows=2048, ignore_index=-100):
+    """Liger-style chunked fused-linear-CE core: per-row CE of (h @ W.T) vs targets WITHOUT ever
+    materializing the full (T,V) logits, with optional per-row loss weights (the §8 mixture w).
+
+    h (T,K), W (V,K), targets (T,), row_weight (T,) or None; divisor defaults to the number of
+    non-ignored rows. Returns (loss = sum(row_weight*ce)/divisor, dh (T,K), dW (V,K), ce (T,)) —
+    grads w.r.t. h and W for that weighted mean; the grad w.r.t. row_weight is ce/divisor.
+    """
+    import torch as _t
+    T = h.shape[0]
+    if divisor is None:
+        divisor = int((targets != ignore_index).sum().clamp(min=1).item())
+    dh = _t.zeros_like(h)
+    dW = _t.zeros_like(W)
+    ce_all = _t.empty(T, dtype=_t.float32, device=h.device)
+    total = _t.zeros((), dtype=_t.float32, device=h.device)
+    for c0 in range(0, T, chunk_rows):
+        c1 = min(c0 + chunk_rows, T)
+        hc, tc = h[c0:c1], targets[c0:c1]
+        logits = hc @ W.T                                      # (chunk, V) — the only big tensor
+        loss_c, lse_c = cross_entropy_fwd(logits, tc, ignore_index)
+        ce_all[c0:c1] = loss_c
+        rw = row_weight[c0:c1].float() if row_weight is not None else None
+        total = total + ((loss_c * rw).sum() if rw is not None else loss_c.sum())
+        go = (rw / divisor) if rw is not None \
+            else _t.full((c1 - c0,), 1.0 / divisor, device=h.device)
+        g = cross_entropy_bwd(logits, tc, lse_c, go, ignore_index)
+        dh[c0:c1] = (g @ W).to(h.dtype)
+        dW += (g.T @ hc).to(W.dtype)
+    return total / divisor, dh, dW, ce_all
 
 
 def aum_decode(S, alpha, x, k_rot, q_rot):

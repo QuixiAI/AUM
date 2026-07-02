@@ -209,11 +209,13 @@ static std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mamba2_bwd_chu
               "mamba2_bwd_chunked: N must be a multiple of 64 and >= 128");
   const int Cn = (int)(N / kSsdChunkL);
   const int QB = D / 64;
+  auto f32 = C.options().dtype(at::kFloat);
   auto dC = at::empty_like(C), dB = at::empty_like(C), dX = at::empty_like(C);
-  auto Y = at::empty_like(C);
-  auto s_raw = at::empty({Bsz, H, Cn, D, D}, C.options().dtype(at::kFloat));
+  auto s_raw = at::empty({Bsz, H, Cn, D, D}, f32);
   auto s_ex = at::empty({Bsz, H, Cn, D, D}, C.options());          // bf16
   auto dkv = at::empty({Bsz, H, Cn, D, D}, C.options());           // bf16
+  auto r = at::empty({Bsz, H, (long)N}, f32), ri = at::empty({Bsz, H, (long)N}, f32);
+  auto cc = at::empty({Bsz, H, (long)N}, f32), ci = at::empty({Bsz, H, (long)N}, f32);
   encode([&](Encoder& e) {                              // forward chunk states (recompute)
     e.pipeline("ssd_chunk_kv_" + std::to_string(D));
     e.in(B, 0); e.in(X, 1); e.in(cl, 2); e.out(s_raw, 3);
@@ -225,12 +227,6 @@ static std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mamba2_bwd_chu
     e.in(s_raw, 0); e.in(cl, 1); e.out(s_ex, 2);
     e.bytes((unsigned)Cn, 3); e.bytes(N, 4);
     e.dispatch(Bsz * H, 1, 1, 256, 1, 1);
-  });
-  encode([&](Encoder& e) {                              // Y recompute for the dcl identity
-    e.pipeline("ssd_chunk_out_" + std::to_string(D));
-    e.in(C, 0); e.in(B, 1); e.in(X, 2); e.in(cl, 3); e.in(s_ex, 4); e.out(Y, 5);
-    e.bytes(N, 6); e.bytes((unsigned)H, 7);
-    e.dispatch(Cn, H, Bsz, 256, 1, 1);           // cooperative
   });
   encode([&](Encoder& e) {                              // G_c = dSex_c (reuses s_raw: dead after scan)
     e.pipeline("ssd_chunk_gstate_" + std::to_string(D));
@@ -244,23 +240,23 @@ static std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mamba2_bwd_chu
     e.bytes((unsigned)Cn, 3); e.bytes(N, 4);
     e.dispatch(Bsz * H, 1, 1, 256, 1, 1);
   });
-  encode([&](Encoder& e) {                              // dC
+  encode([&](Encoder& e) {                              // dC + intra/inter rowsum(M)
     e.pipeline("ssd_chunk_bwd_row_" + std::to_string(D));
     e.in(C, 0); e.in(B, 1); e.in(X, 2); e.in(cl, 3); e.in(dY, 4); e.in(s_ex, 5); e.out(dC, 6);
-    e.bytes(N, 7); e.bytes((unsigned)H, 8);
+    e.out(r, 7); e.out(ri, 8);
+    e.bytes(N, 9); e.bytes((unsigned)H, 10);
     e.dispatch(Cn, H, Bsz, 256, 1, 1);           // cooperative
   });
-  encode([&](Encoder& e) {                              // dB, dX
+  encode([&](Encoder& e) {                              // dB, dX + intra/inter colsum(M)
     e.pipeline("ssd_chunk_bwd_col_" + std::to_string(D));
     e.in(C, 0); e.in(B, 1); e.in(X, 2); e.in(cl, 3); e.in(dY, 4); e.in(dkv, 5);
-    e.out(dB, 6); e.out(dX, 7);
-    e.bytes(N, 8); e.bytes((unsigned)H, 9);
+    e.out(dB, 6); e.out(dX, 7); e.out(cc, 8); e.out(ci, 9);
+    e.bytes(N, 10); e.bytes((unsigned)H, 11);
     e.dispatch(Cn, H, Bsz, 256, 1, 1);           // cooperative
   });
-  // dcl = rowsum(M) - colsum(M) = <dY,Y> - <dX,X>  (exact identity, fp32 on host)
-  auto dcl = (dY.to(at::kFloat) * Y.to(at::kFloat)).sum(-1)
-           - (dX.to(at::kFloat) * X.to(at::kFloat)).sum(-1);
-  return {dC, dB, dX, dcl};
+  // In-kernel split dcl (fp32, no Y recompute): rowsum(M) = r_intra + <dC_inter, C_i>,
+  // colsum(M) = cc_intra + <dX_inter, X_j>.
+  return {dC, dB, dX, (r + ri) - (cc + ci)};
 }
 
 static std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mamba2_bwd_mps(
@@ -365,6 +361,59 @@ static at::Tensor aum_epilogue_mps(const at::Tensor& Y_in, const at::Tensor& v_i
   return out;
 }
 
+// ---- fused cross-entropy over the vocab axis (vendored from ThunderMittens) ----
+// One simdgroup per row striding V; never materializes probabilities. fwd -> (loss, lse);
+// bwd recomputes p = exp(x - lse) and scales by per-row grad_out. The `mw` variants use 4
+// simdgroups per row (for small T / large V).
+static std::string ce_type(const at::Tensor& t) {
+  if (t.scalar_type() == at::kFloat) return "float32";
+  if (t.scalar_type() == at::kHalf) return "float16";
+  TORCH_CHECK(t.scalar_type() == at::kBFloat16, "cross_entropy: logits must be f32/f16/bf16");
+  return "bfloat16";
+}
+
+static std::tuple<at::Tensor, at::Tensor> cross_entropy_fwd_mps(
+    const at::Tensor& logits_in, const at::Tensor& targets_in, int64_t ignore_index,
+    double label_smoothing, double z_loss, double softcap) {
+  TORCH_CHECK(logits_in.device().is_mps() && logits_in.dim() == 2, "cross_entropy: logits (T,V) MPS");
+  TORCH_CHECK(targets_in.scalar_type() == at::kInt || targets_in.scalar_type() == at::kLong,
+              "cross_entropy: int targets");
+  auto logits = logits_in.contiguous();
+  auto targets = targets_in.to(at::kInt).contiguous();
+  const int T = logits.size(0), V = logits.size(1);
+  auto f32 = logits.options().dtype(at::kFloat);
+  auto loss = at::empty({T}, f32), lse = at::empty({T}, f32);
+  const bool mw = T < 1024;                       // small-T route: 4 simdgroups per row
+  const float ls = (float)label_smoothing, zl = (float)z_loss, sc = (float)softcap;
+  encode([&](Encoder& e) {
+    e.pipeline((mw ? "cross_entropy_fwd_mw_" : "cross_entropy_fwd_") + ce_type(logits));
+    e.in(logits, 0); e.in(targets, 1); e.out(loss, 2); e.out(lse, 3);
+    e.bytes(V, 4); e.bytes((int)ignore_index, 5); e.bytes(ls, 6); e.bytes(zl, 7); e.bytes(sc, 8);
+    e.dispatch(T, 1, 1, mw ? 128 : 32, 1, 1);
+  });
+  return {loss, lse};
+}
+
+static at::Tensor cross_entropy_bwd_mps(
+    const at::Tensor& logits_in, const at::Tensor& targets_in, const at::Tensor& lse_in,
+    const at::Tensor& grad_out_in, int64_t ignore_index, double label_smoothing,
+    double z_loss, double softcap) {
+  auto logits = logits_in.contiguous();
+  auto targets = targets_in.to(at::kInt).contiguous();
+  auto lse = lse_in.contiguous(), go = grad_out_in.to(at::kFloat).contiguous();
+  const int T = logits.size(0), V = logits.size(1);
+  auto grad = at::empty_like(logits);
+  const bool mw = T < 1024;
+  const float ls = (float)label_smoothing, zl = (float)z_loss, sc = (float)softcap;
+  encode([&](Encoder& e) {
+    e.pipeline((mw ? "cross_entropy_bwd_mw_" : "cross_entropy_bwd_") + ce_type(logits));
+    e.in(logits, 0); e.in(targets, 1); e.in(lse, 2); e.in(go, 3); e.out(grad, 4);
+    e.bytes(V, 5); e.bytes((int)ignore_index, 6); e.bytes(ls, 7); e.bytes(zl, 8); e.bytes(sc, 9);
+    e.dispatch(T, 1, 1, mw ? 128 : 32, 1, 1);
+  });
+  return grad;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("_set_library", &aum_set_library, "set the metallib path");
   m.def("mamba2", &mamba2_mps, "AUM-Ø SSD forward (MPS, auto-routed)");
@@ -374,4 +423,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("aum_decode", &aum_decode_mps, "AUM-Ø single-token U-phase decode step (MPS)");
   m.def("aum_operands", &aum_operands_mps, "AUM-Ø fused U-phase operand builder (MPS)");
   m.def("aum_epilogue", &aum_epilogue_mps, "AUM-Ø fused U-phase epilogue (MPS)");
+  m.def("cross_entropy_fwd", &cross_entropy_fwd_mps, "fused CE forward -> (loss, lse) (MPS)");
+  m.def("cross_entropy_bwd", &cross_entropy_bwd_mps, "fused CE backward -> grad_logits (MPS)");
 }

@@ -135,6 +135,16 @@ perf-handbook discipline; route thresholds are measured, not guessed.
 TM keeps its kernels operand-pure (no fusion hooks — that is what keeps a general library
 maintainable); AUM owns every fusion. TM algorithmic wins flow into AUM as file copies.
 
+**Cross-pollination log.** From TM (July 2 sync): the in-kernel dcl SPLIT for the chunked
+backward — rowsum(M) = r_intra + ⟨dC_inter, C_i⟩, colsum(M) = cc_intra + ⟨dX_inter, X_j⟩, two
+row-dot identities over registers already in hand — merged into our cooperative/quadrant-tiled
+backward (replaces the ⟨dY,Y⟩−⟨dX,X⟩ host identity and its Y-recompute pass; all-fp32 dcl);
+their all-ones-decay degenerate test ported. The fused cross-entropy family vendored
+(cross_entropy.metal) and wired as the §8/§10 mixture-LM-loss fast path via Liger-style chunked
+fused-linear-CE: at reference shapes (B=2, L=4096, J+1=3, V=49152) the (T,V) logits are never
+materialized — measured 2.2 GB vs 25.6 GB driver memory and 1.3× vs the plain path. To TM: the
+merged coop+quadrant+split-dcl backward ports back (patch in the session scratchpad).
+
 ## Verification (standing, all in `tests/test_metal.py` + the suite)
 
 - Kernel vs oracle: forward, backward (vs autograd through the PyTorch SSD core), and decode

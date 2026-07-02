@@ -21,6 +21,9 @@ Kernel sources (in ./src/):
   - aum_unfold.metal  : the AUM-only fused U-phase operand pipeline (aum_operands: rotation
                         ladder + k/v L2-norms + rho*tau + layout transpose; aum_epilogue:
                         D-skip + gated RMSNorm + transpose back). Written for AUM-Ø.
+  - cross_entropy.metal : fused CE fwd/bwd over the vocab axis (loss+lse; never materializes
+                        probabilities; ignore_index / label smoothing / z-loss / softcap; 1- and
+                        4-simdgroup-per-row variants). Vendored verbatim from ThunderMittens.
 
 Host dispatch (./aum_metal.mm) and build (./__init__.py):
   Written for AUM-Ø; the generic torch-MPS encoder/plumbing follows ThunderMittens' tk_torch

@@ -422,8 +422,10 @@ kernel void ssd_chunk_bwd_row(device   bf16     *Cq [[buffer(0)]],
                               device   bf16     *dY [[buffer(4)]],
                               device   const bf16 *Sex [[buffer(5)]],
                               device   bf16     *dC [[buffer(6)]],
-                              constant unsigned &N  [[buffer(7)]],
-                              constant unsigned &H  [[buffer(8)]],
+                              device   float    *r  [[buffer(7)]],   // rowsum(M) intra, (B,H,N)
+                              device   float    *ri [[buffer(8)]],   // <dC_inter, C_i>, (B,H,N)
+                              constant unsigned &N  [[buffer(9)]],
+                              constant unsigned &H  [[buffer(10)]],
                               uint3 blockIdx [[threadgroup_position_in_grid]],
                               uint  tid  [[thread_index_in_threadgroup]],
                               uint  warp [[simdgroup_index_in_threadgroup]],
@@ -438,6 +440,7 @@ kernel void ssd_chunk_bwd_row(device   bf16     *Cq [[buffer(0)]],
     gl_t  gX(X, nullptr, H, N, nullptr), gdY(dY, nullptr, H, N, nullptr);
     gl_t  gdC(dC, nullptr, H, N, nullptr);
     gl_cl gcl(cl, nullptr, H, nullptr, N);
+    gl_cl gr(r, nullptr, H, nullptr, N), gri(ri, nullptr, H, nullptr, N);
     const int c = blockIdx.x, head = blockIdx.y, batch = blockIdx.z;
     const int i = c * TPC + (int)warp;            // this warp's row tile
     const int C = (int)N / SSD_CHUNK_L;
@@ -452,6 +455,9 @@ kernel void ssd_chunk_bwd_row(device   bf16     *Cq [[buffer(0)]],
     #pragma clang loop unroll(full)
     for (int kq = 0; kq < QB; ++kq)
         zero(dc_blk[kq]);
+    typename rt_fl<8, 8>::col_vec r_acc, ri_acc;   // in-kernel dcl split: dcl = (r+ri)-(cc+ci)
+    zero(r_acc);
+    zero(ri_acc);
 
     // inter: dC_i[:, kq] += w_i * sum_xq dY_i[:, xq] @ Sex_c[kq, xq]^T   (skip chunk 0)
     threadgroup st_bf<64, 64> sS;                 // one staged state quadrant (8KB)
@@ -476,8 +482,16 @@ kernel void ssd_chunk_bwd_row(device   bf16     *Cq [[buffer(0)]],
         sub(w, cumlog_i, cl_ref);
         exp(w, w);
         #pragma clang loop unroll(full)
-        for (int kq = 0; kq < QB; ++kq)
+        for (int kq = 0; kq < QB; ++kq) {
             mul_row(dc_blk[kq], dc_blk[kq], w);
+            // r_inter = <dC_inter, C_i> rowwise — the inter part of rowsum(M) with no Y needed
+            rt_bf<8, 64> c_kq2;
+            load(c_kq2, gC, {batch, head, i, kq}, laneId);
+            rt_fl<8, 64> cxi;
+            copy(cxi, c_kq2);
+            mul(cxi, cxi, dc_blk[kq]);
+            row_sum(ri_acc, cxi, ri_acc, laneId);
+        }
     }
 
     // intra: the quadratic bwd_row loop, bounded to this chunk
@@ -498,10 +512,19 @@ kernel void ssd_chunk_bwd_row(device   bf16     *Cq [[buffer(0)]],
         exp(Ld, Ld);
         rt_fl<8, 8> dG;
         mul(dG, dSt, Ld);                          // dG = dSt ∘ L
+        rt_fl<8, 8> G;
+        zero(G);
+        mma_ABt(G, c_i, b_col, G);                 // C_i·B^T_j (for S = G∘L -> M)
+        rt_fl<8, 8> S;
+        mul(S, G, Ld);
         if (j == i) {
             float zf = 0.0f;
             make_causal(dG, dG, laneId, zf);
+            make_causal(S, S, laneId, zf);
         }
+        rt_fl<8, 8> M;
+        mul(M, dSt, S);                            // intra rowsum of dSt∘S
+        row_sum(r_acc, M, r_acc, laneId);
         rt_bf<8, 8> dG_bf;
         copy(dG_bf, dG);
         #pragma clang loop unroll(full)
@@ -514,6 +537,8 @@ kernel void ssd_chunk_bwd_row(device   bf16     *Cq [[buffer(0)]],
     #pragma clang loop unroll(full)
     for (int kq = 0; kq < QB; ++kq)
         store(gdC, dc_blk[kq], {batch, head, i, kq}, laneId);
+    store(gr, r_acc, {batch, head, 0, i}, laneId);
+    store(gri, ri_acc, {batch, head, 0, i}, laneId);
 }
 
 // K7: dB, dX — chunk-bounded intra tiles + the inter terms through dKV_c. COOPERATIVE:
@@ -528,8 +553,10 @@ kernel void ssd_chunk_bwd_col(device   bf16     *Cq [[buffer(0)]],
                               device   const bf16 *dKV [[buffer(5)]],
                               device   bf16     *dB [[buffer(6)]],
                               device   bf16     *dX [[buffer(7)]],
-                              constant unsigned &N  [[buffer(8)]],
-                              constant unsigned &H  [[buffer(9)]],
+                              device   float    *cc [[buffer(8)]],   // colsum(M) intra, (B,H,N)
+                              device   float    *ci [[buffer(9)]],   // <dX_inter, X_j>, (B,H,N)
+                              constant unsigned &N  [[buffer(10)]],
+                              constant unsigned &H  [[buffer(11)]],
                               uint3 blockIdx [[threadgroup_position_in_grid]],
                               uint  tid  [[thread_index_in_threadgroup]],
                               uint  warp [[simdgroup_index_in_threadgroup]],
@@ -544,6 +571,7 @@ kernel void ssd_chunk_bwd_col(device   bf16     *Cq [[buffer(0)]],
     gl_t  gX(X, nullptr, H, N, nullptr), gdY(dY, nullptr, H, N, nullptr);
     gl_t  gdB(dB, nullptr, H, N, nullptr), gdX(dX, nullptr, H, N, nullptr);
     gl_cl gcl(cl, nullptr, H, nullptr, N);
+    gl_cl gcc(cc, nullptr, H, nullptr, N), gci(ci, nullptr, H, nullptr, N);
     const int c = blockIdx.x, head = blockIdx.y, batch = blockIdx.z;
     const int j = c * TPC + (int)warp;            // this warp's col tile
     const int C = (int)N / SSD_CHUNK_L;
@@ -560,6 +588,10 @@ kernel void ssd_chunk_bwd_col(device   bf16     *Cq [[buffer(0)]],
         zero(db_blk[q]);
         zero(dx_blk[q]);
     }
+    typename rt_fl<8, 8>::row_vec c_acc;           // intra colsum(M)
+    typename rt_fl<8, 8>::col_vec ci_acc;          // <dX_inter, X_j> rowwise (rows = positions j)
+    zero(c_acc);
+    zero(ci_acc);
 
     // inter: dX_j += w'_j B_j@dKV_c ; dB_j += w'_j X_j@dKV_c^T   (dKV of the last chunk is 0)
     threadgroup st_bf<64, 64> sK;                 // one staged dKV quadrant (8KB)
@@ -595,6 +627,13 @@ kernel void ssd_chunk_bwd_col(device   bf16     *Cq [[buffer(0)]],
         for (int q = 0; q < QB; ++q) {
             mul_row(dx_blk[q], dx_blk[q], w);
             mul_row(db_blk[q], db_blk[q], w);
+            // c_inter = <dX_inter, X_j> rowwise — the inter part of colsum(M) with no Y needed
+            rt_bf<8, 64> x_q2;
+            load(x_q2, gX, {batch, head, j, q}, laneId);
+            rt_fl<8, 64> xdx;
+            copy(xdx, x_q2);
+            mul(xdx, xdx, dx_blk[q]);
+            row_sum(ci_acc, xdx, ci_acc, laneId);
         }
     }
 
@@ -627,6 +666,9 @@ kernel void ssd_chunk_bwd_col(device   bf16     *Cq [[buffer(0)]],
             make_causal(S, S, laneId, zf);
             make_causal(dG, dG, laneId, zf);
         }
+        rt_fl<8, 8> M;
+        mul(M, dSt, S);                            // intra colsum of dSt∘S
+        col_sum(c_acc, M, c_acc, laneId);
         rt_bf<8, 8> S_bf, dG_bf;
         copy(S_bf, S);
         copy(dG_bf, dG);
@@ -647,6 +689,8 @@ kernel void ssd_chunk_bwd_col(device   bf16     *Cq [[buffer(0)]],
         store(gdB, db_blk[q], {batch, head, j, q}, laneId);
         store(gdX, dx_blk[q], {batch, head, j, q}, laneId);
     }
+    store(gcc, c_acc, {batch, head, 0, j}, laneId);
+    store(gci, ci_acc, {batch, head, 0, j}, laneId);
 }
 
 #define instantiate_ssd_chunk_bwd(D)                                                 \
@@ -666,8 +710,9 @@ kernel void ssd_chunk_bwd_col(device   bf16     *Cq [[buffer(0)]],
   ssd_chunk_bwd_row<D>(device bf16 *Cq [[buffer(0)]], device bf16 *Bm [[buffer(1)]], \
     device bf16 *X [[buffer(2)]], device float *cl [[buffer(3)]],                    \
     device bf16 *dY [[buffer(4)]], device const bf16 *Sex [[buffer(5)]],             \
-    device bf16 *dC [[buffer(6)]], constant unsigned &N [[buffer(7)]],               \
-    constant unsigned &H [[buffer(8)]],                                              \
+    device bf16 *dC [[buffer(6)]], device float *r [[buffer(7)]],                    \
+    device float *ri [[buffer(8)]], constant unsigned &N [[buffer(9)]],              \
+    constant unsigned &H [[buffer(10)]],                                             \
     uint3 blockIdx [[threadgroup_position_in_grid]],                                 \
     uint tid [[thread_index_in_threadgroup]],                                        \
     uint warp [[simdgroup_index_in_threadgroup]],                                    \
@@ -677,7 +722,8 @@ kernel void ssd_chunk_bwd_col(device   bf16     *Cq [[buffer(0)]],
     device bf16 *X [[buffer(2)]], device float *cl [[buffer(3)]],                    \
     device bf16 *dY [[buffer(4)]], device const bf16 *dKV [[buffer(5)]],             \
     device bf16 *dB [[buffer(6)]], device bf16 *dX [[buffer(7)]],                    \
-    constant unsigned &N [[buffer(8)]], constant unsigned &H [[buffer(9)]],          \
+    device float *cc [[buffer(8)]], device float *ci [[buffer(9)]],                  \
+    constant unsigned &N [[buffer(10)]], constant unsigned &H [[buffer(11)]],        \
     uint3 blockIdx [[threadgroup_position_in_grid]],                                 \
     uint tid [[thread_index_in_threadgroup]],                                        \
     uint warp [[simdgroup_index_in_threadgroup]],                                    \
