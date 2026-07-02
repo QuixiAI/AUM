@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Initialize AUM-Ø-Tiny v5.3 (~78M) — random weights per the AUM-Ø.md recipe (Appendix A).
+"""Initialize AUM-Ø-Tiny v6 (~78M) — random weights per the AUM-Ø.md recipe (Appendix A).
 
 Unlike upstream Mamba, AUM keeps its training code in ./train. This is step one: materialize a
 fresh, randomly-initialized checkpoint for the reference config so later training scripts start
@@ -51,12 +51,13 @@ from aum_ssm.models.config_aum import AumConfig
 from aum_ssm.models.aum_lm import AumLMHeadModel
 
 SPEC_TARGET_M = 78.0                              # AUM-Ø.md Appendix A: total ~= 78M
-# Appendix-A tensors that stay F32 even in a bf16 export (the SSM decay base + gated-readout norm).
-_F32_KEEP = ("A_log", "unfold.norm.weight")
+# Appendix-A tensors that stay F32 even in a bf16 export (SSM decay base, gated-readout norm,
+# and the fixed rotation-ladder buffer).
+_F32_KEEP = ("A_log", "unfold.norm.weight", "rope_freqs")
 
 
 def build_model(seed: int = 0, **cfg_overrides):
-    """The reference AUM-Ø-Tiny v5.3 model (full silence block present), randomly initialized."""
+    """The reference AUM-Ø-Tiny v6 model (full silence block present), randomly initialized."""
     torch.manual_seed(seed)
     cfg = AumConfig(silence_enabled=True, **cfg_overrides)
     model = AumLMHeadModel(cfg)
@@ -115,9 +116,9 @@ def _forward_sanity(model, vocab_size, seed):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Initialize AUM-Ø-Tiny v5.3 (~78M) random weights.")
+    ap = argparse.ArgumentParser(description="Initialize AUM-Ø-Tiny v6 (~78M) random weights.")
     ap.add_argument("--out", default=os.path.join(_REPO_ROOT, "train", "checkpoints",
-                                                  "aum-tiny-v5.3-init"),
+                                                  "aum-tiny-v6-init"),
                     help="output checkpoint directory")
     ap.add_argument("--seed", type=int, default=0, help="RNG seed for reproducible weights")
     ap.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32",
@@ -135,7 +136,7 @@ def main():
     total, buckets = param_report(model)
     emb = buckets.get("backbone.embedding (tied classifier)", 0)
 
-    print(f"AUM-Ø-Tiny v5.3   seed={args.seed}  storage={args.dtype}")
+    print(f"AUM-Ø-Tiny v6   seed={args.seed}  storage={args.dtype}")
     print(f"  total params : {total / 1e6:8.3f} M   (spec target ~= {SPEC_TARGET_M} M)")
     for k, v in sorted(buckets.items(), key=lambda kv: -kv[1]):
         print(f"    {k:34s} {v / 1e6:8.3f} M")
@@ -158,7 +159,7 @@ def main():
     with open(os.path.join(args.out, "config.json"), "w") as f:
         json.dump(cfg.__dict__, f, indent=2)
     manifest = {
-        "model": "AUM-Ø-Tiny v5.3",
+        "model": "AUM-Ø-Tiny v6",
         "seed": args.seed,
         "storage_dtype": args.dtype,
         "params_total": total,
