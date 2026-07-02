@@ -112,7 +112,7 @@ def _cat_aux(auxes):
         E_traj=cat([a.E_traj for a in auxes]), pi=cat([a.pi for a in auxes]),
         w=cat([a.w for a in auxes]), expected_J=cat([a.expected_J for a in auxes]),
         o_stack=cat([a.o_stack for a in auxes]), j_star=cat([a.j_star for a in auxes]),
-        sigma_star=cat([a.sigma_star for a in auxes]),
+        sigma_star=cat([a.sigma_star for a in auxes]), phi=cat([a.phi for a in auxes]),
     )
 
 

@@ -1,5 +1,6 @@
-# AUM-Ø diagnostics (§21): calibration corr(pi,b), the Delta-sigma quartet, and the
-# sigma-decode probe (the primary instrument for interpreting a §23 gate failure).
+# AUM-Ø diagnostics (v6 §16): calibration corr(pi,b), the Delta-sigma quartet, the sigma-decode
+# probe (the primary instrument for interpreting a §15 gate failure), the phase-velocity
+# distribution (needed to interpret the §14 recency axis), and the sigma-relevance check.
 
 import torch
 import torch.nn.functional as F
@@ -27,6 +28,41 @@ def delta_sigma_quartet(aux):
         "expected_J": float(aux.expected_J.mean()),
         "pi": float(aux.pi.mean()),
     }
+
+
+def phase_velocity_stats(phi):
+    """The per-head phase-velocity distribution (§16): dphi_t = phi_t - phi_{t-1}, phi (B,L,H).
+
+    Needed to interpret the §14 recency axis — if learned velocities are ~constant, phase distance
+    and token-age coincide; if not, phase distance is the mechanistically correct axis.
+    """
+    dphi = phi[:, 1:] - phi[:, :-1]                                # (B, L-1, H)
+    return {
+        "dphi_mean": float(dphi.mean()),
+        "dphi_std": float(dphi.std()),
+        "dphi_mean_per_head": [float(v) for v in dphi.mean(dim=(0, 1))],
+    }
+
+
+@torch.no_grad()
+def sigma_relevance(model, input_ids):
+    """§16 sigma-relevance of the prediction head: relative g_hat degradation when the sigma
+    input to the head is zeroed. ~0 -> the head predicts from phase/state alone (W_q^pred -> 0),
+    silently severing C5's accountability loop — a failure no other diagnostic detects.
+    """
+    was_training = model.training
+    model.eval()
+    _, aux_on = model(input_ids, return_aux=True)
+    sil = model.backbone.silence
+    sil._zero_sigma_in_predict = True
+    try:
+        _, aux_off = model(input_ids, return_aux=True)
+    finally:
+        sil._zero_sigma_in_predict = False
+        model.train(was_training)
+    e_on = aux_on.e.norm(dim=-1).mean()
+    e_off = aux_off.e.norm(dim=-1).mean()
+    return float((e_off - e_on) / e_on.clamp_min(1e-9))
 
 
 def sigma_decode_probe(sigma, labels, n_classes, epochs=300, lr=0.05, train_frac=0.7):

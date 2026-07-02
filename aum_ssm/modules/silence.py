@@ -49,6 +49,7 @@ class SilenceAux:
     o_stack: torch.Tensor   # (B, L, Jmax+1, d) per-candidate outputs — the §8 loss mixture
     j_star: torch.Tensor    # (B, L) long — the single carried candidate index
     sigma_star: torch.Tensor  # (B, L, d_sigma) — sigma^{j*}, the ONLY register carried to t+1
+    phi: torch.Tensor       # (B, L, H) the per-head phase — for the §14 phase-distance falsifier
 
 
 class PredictiveGrounding(nn.Module):
@@ -161,6 +162,10 @@ class SilenceBlock(nn.Module):
             pre = (self.pool_proj(pooled) + self.predict.hyp_proj(sigma_prev)
                    + self.predict.phase_proj(_phase_embed(phi_prev, self.d_phase)))
         else:
+            if getattr(self, "_zero_sigma_in_predict", False):
+                # §16 sigma-relevance check: zero the sigma input to the prediction head and
+                # measure g_hat degradation — detects the silent W_q^pred -> 0 bypass failure.
+                sigma_prev = torch.zeros_like(sigma_prev)
             # The no-read control (§14) zeroes the SILENT read r^j only; the predictive read is
             # part of the prediction head (C5) and stays intact, so the control isolates r^j.
             q_pred = self.predict.query_proj(sigma_prev)
@@ -308,7 +313,7 @@ class SilenceBlock(nn.Module):
         o_t = o_stack.gather(-2, idx.expand(*lead, 1, self.d_model)).squeeze(-2)
 
         aux = SilenceAux(g_t, g_hat, e, mu, e_tilde, sigma0, sigma_traj, r_traj, E_traj, pi, w,
-                         expected_J, o_stack, j_star, sigma_star)
+                         expected_J, o_stack, j_star, sigma_star, phi_t)
         return o_t, aux
 
     def _output(self, g_t, sigma):
