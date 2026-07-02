@@ -37,7 +37,7 @@ The **AUM-Ø-Tiny v6 reference model (78,255,136 params)** is fully implemented 
   carried register — no state blending), integration pressure, and the fixed-depth-K
   counterfactual benefit pipeline.
 - **True sequential global recurrence** (§2/C7) with exact-gradient segment checkpointing, so
-  seq-2048 training never materializes the per-token state chain.
+  seq-8192 training never materializes the per-token state chain.
 - **Decode**: single-token generation is one more step of the same recurrence —
   decode ≡ full forward is a test invariant, silence on and off.
 - **Training harness**: staged schedule (§12) with the scale-free R² pressure gate, the seven-term

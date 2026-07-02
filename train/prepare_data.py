@@ -370,7 +370,7 @@ def main():
     ap.add_argument("--shard-size-tokens", type=int, default=100_000_000)
     ap.add_argument("--batch-docs", type=int, default=1000, help="documents per tokenizer batch")
     ap.add_argument("--val-fraction", type=float, default=0.01, help="hold out ~this fraction as val")
-    ap.add_argument("--seq-len", type=int, default=2048, help="manifest hint / sequence-count estimate")
+    ap.add_argument("--seq-len", type=int, default=8192, help="manifest hint / sequence-count estimate")
     ap.add_argument("--limit-docs", type=int, default=0, help="single-source mode: cap docs (0 = all)")
     ap.add_argument("--self-test", action="store_true", help="validate mechanics with synthetic data")
     args = ap.parse_args()
