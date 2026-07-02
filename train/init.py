@@ -8,7 +8,7 @@ from a well-defined point.
 What it builds
 --------------
 The reference ``AumConfig`` IS the Appendix-A physical layout: d_model=512, 12 evidence layers,
-GQA 8/2 x 64, U-phase 4 x 128, SwiGLU 1408, sigma=128, vocab=49152, tied embeddings. Instantiating
+GQA 8/2 x 64, U-phase 8 x 64, SwiGLU 1408, sigma=128, vocab=49152, tied embeddings. Instantiating
 ``AumLMHeadModel`` applies the init recipe:
 
   - token embedding      ~ N(0, 0.02)   (tied to the output classifier)

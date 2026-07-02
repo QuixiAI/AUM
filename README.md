@@ -28,7 +28,7 @@ normalization, and gating folded into its operands.
 
 ## Status
 
-The **AUM-Ø-Tiny v6 reference model (78,255,136 params)** is fully implemented and validated:
+The **AUM-Ø-Tiny v6 reference model (78,279,040 params)** is fully implemented and validated:
 
 - **Evidence core** (12 layers of A→U→M→MLP): bounded local GQA grounding, the resonant affine
   evidence recurrence with the multi-frequency rotation ladder (§4), error-free precision, SwiGLU.
@@ -84,7 +84,7 @@ tests/                the full suite (decode parity, kernel-vs-oracle, gate mach
 ## Quickstart
 
 ```bash
-# 1. materialize the reference checkpoint (78,255,136 params; validates the Appendix-A manifest)
+# 1. materialize the reference checkpoint (78,279,040 params; validates the Appendix-A manifest)
 python train/init.py
 
 # 2. verify the tokenizer against the model config (SmolLM2, vocab 49152 — an exact match)
@@ -147,9 +147,9 @@ opt = build_optimizer(model)   # Muon (lr 0.02 spectral, wd 0.1) on 2D hidden ma
 | d_model / evidence layers | 512 / 12 (+1 global block) |
 | Vocab (tied) | 49 152 (SmolLM2 BPE) |
 | A: heads / kv / head-dim / window | 8 / 2 / 64 / 256 |
-| U: heads / head-dim / rotation ladder | 4 / 128 / B=64, ω ∈ [10⁻³, 1] geometric |
+| U: heads / head-dim / rotation ladder | 8 / 64 / B=32, ω ∈ [10⁻³, 1] geometric |
 | Register d_σ / precision k_μ / J_max | 128 / 32 / 2 |
-| Params: total / silence / ablated core | 78,255,136 / 1,769,408 / 76,485,728 |
+| Params: total / silence / ablated core | 78,279,040 / 1,769,408 / 76,509,632 |
 
 ## Provenance
 

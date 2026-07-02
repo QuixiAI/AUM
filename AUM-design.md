@@ -7,7 +7,7 @@ This document records the repo survey, the keep/remove decisions, what each surv
 became, and the design consequences discovered during the build. It is the build record, not the
 architecture spec — the architecture lives in `AUM-Ø.md`, whose Appendix A is verified
 tensor-for-tensor against the built checkpoint. **Status: executed.** The v6 reference model
-(78,255,136 params) is implemented, tested (decode ≡ forward, kernel ≡ oracle, the §14/§15 gate
+(78,279,040 params) is implemented, tested (decode ≡ forward, kernel ≡ oracle, the §14/§15 gate
 machinery), and trains fwd+bwd on CPU and Apple MPS.
 
 ## Decisions (settled, executed)

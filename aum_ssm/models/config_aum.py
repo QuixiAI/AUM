@@ -34,6 +34,9 @@ class AumConfig:
     attn_cfg: dict = field(default_factory=dict)
 
     # ---- U phase: resonant affine evidence recurrence (§4) ----
+    u_num_heads: int = 8               # H_U. 8 x 64 (d_inner 512): the SSD state is H*d_h^2, so
+    u_head_dim: int = 64               # halving d_h at fixed d_inner halves the state work —
+                                       # measured ~1.5x U-phase training, ~2.6x forward vs 4 x 128
     kernel_backend: str = "auto"       # auto|reference|metal|triton
     chunk_size: int = 64
     ssm_cfg: dict = field(default_factory=dict)

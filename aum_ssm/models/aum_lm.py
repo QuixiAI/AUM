@@ -37,6 +37,8 @@ def create_evidence_layer(
     d_intermediate,
     chunk_size,
     kernel_backend,
+    u_num_heads,
+    u_head_dim,
     attn_num_heads,
     attn_num_heads_kv,
     attn_head_dim,
@@ -55,8 +57,8 @@ def create_evidence_layer(
         GroundAttn, num_heads=attn_num_heads, num_heads_kv=attn_num_heads_kv,
         head_dim=attn_head_dim, window_size=attn_window, layer_idx=layer_idx, **factory,
     )
-    unfold_cls = partial(Unfold, chunk_size=chunk_size, kernel_backend=kernel_backend,
-                         layer_idx=layer_idx, **factory)
+    unfold_cls = partial(Unfold, nheads=u_num_heads, headdim=u_head_dim, chunk_size=chunk_size,
+                         kernel_backend=kernel_backend, layer_idx=layer_idx, **factory)
     modulate_cls = partial(PrecisionModulate, **factory)
     mlp_cls = partial(GatedMLP, hidden_features=d_intermediate, out_features=d_model, **factory)
     block = EvidenceLayer(d_model, attn_cls, unfold_cls, modulate_cls, mlp_cls,
@@ -138,6 +140,7 @@ class AumBackbone(nn.Module):
         self.layers = nn.ModuleList([
             create_evidence_layer(
                 config.d_model, config.d_intermediate, config.chunk_size, config.kernel_backend,
+                getattr(config, "u_num_heads", 8), getattr(config, "u_head_dim", 64),
                 config.attn_num_heads, config.attn_num_heads_kv, config.attn_head_dim,
                 config.attn_window, norm_epsilon=config.norm_epsilon, rms_norm=config.rms_norm,
                 residual_in_fp32=config.residual_in_fp32, layer_idx=i, **factory,

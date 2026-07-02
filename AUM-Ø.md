@@ -58,7 +58,7 @@ These forks are settled. They are the architecture's rationale, recorded so futu
 
 **C6 — Phase-locked silent read with a frequency ladder.** The silent read uses the current phase under the multi-frequency rotation, giving graded recency-selective retrieval and the registered differential prediction of §14. Temporal search is excluded from v6 by design.
 
-**C7 — Honest parallelism.** The evidence core trains as a parallel scan. The global block is a sequential nonlinear token recurrence whose working state is $O(d_\sigma + d + H_U d_h^2)$ per batch row — the register, the grounded summary, and the top layer's evidence state $S$, which the block must step alongside $\sigma$ to serve its reads (≈ 66 K floats at Tiny scale; SRAM-resident for a fused kernel, but not "small" and never claimed scannable). Training memory is handled by exact-gradient segment checkpointing: only segment-boundary carries $(S, \sigma)$ are stored and in-segment states are recomputed on backward, so the recurrence trains at full sequence length without materializing the per-token $S$ chain (§12). At reference scale the wall-clock cost is small; at larger scales it is a known, stated bottleneck — not a surprise.
+**C7 — Honest parallelism.** The evidence core trains as a parallel scan. The global block is a sequential nonlinear token recurrence whose working state is $O(d_\sigma + d + H_U d_h^2)$ per batch row — the register, the grounded summary, and the top layer's evidence state $S$, which the block must step alongside $\sigma$ to serve its reads (≈ 33 K floats at Tiny scale; SRAM-resident for a fused kernel, but not "small" and never claimed scannable). Training memory is handled by exact-gradient segment checkpointing: only segment-boundary carries $(S, \sigma)$ are stored and in-segment states are recomputed on backward, so the recurrence trains at full sequence length without materializing the per-token $S$ chain (§12). At reference scale the wall-clock cost is small; at larger scales it is a known, stated bottleneck — not a surprise.
 
 **C8 — Benefit-gated silence with a policy-independent label.** Pressure is trained to predict measured counterfactual benefit on a fixed calibrated scale, with the label computed at fixed depth on an exploration subset and downstream silence frozen in both branches. Silence is allocated by learned usefulness, not by uncertainty.
 
@@ -352,7 +352,7 @@ $$
 | Vocab (tied) | 49 152 |
 | MLP $d_{\text{ff}}$ (SwiGLU) | 1408 |
 | A: heads / kv / head-dim / window | 8 / 2 / 64 / 256 |
-| U: heads $H_U$ / head-dim $d_h$ / ladder | 4 / 128 / $B{=}64$, $\omega\in[10^{-3},1]$ geometric |
+| U: heads $H_U$ / head-dim $d_h$ / ladder | 8 / 64 / $B{=}32$, $\omega\in[10^{-3},1]$ geometric |
 | Controller $d_c$ / precision $k_\mu$ / register $d_\sigma$ / phase-embed $d_\phi$ | 128 / 32 / 128 / 32 |
 | $J_{\max}$ / seq len | 2 / 4096 |
 | Params: total / silence block / ablated baseline | ≈ 78 M / ≈ 1.8 M / ≈ 76.5 M |
@@ -465,9 +465,9 @@ $$
 
 ---
 
-## Appendix A. Physical Layout — AUM-Ø-Tiny v6 (78,255,136 params)
+## Appendix A. Physical Layout — AUM-Ø-Tiny v6 (78,279,040 params)
 
-Format: `name,[shape],dtype` — these are the reference implementation's **actual state-dict keys** (the `backbone.` prefix written as `model.`; `lm_head.weight` is tied to the embedding and stored once), so the manifest is checkable against a checkpoint with one line of code. Evidence layers `[0-11]`; silence subsystem a single top-level block. Exact totals: **78,255,136** parameters; silence block **1,769,408**; silence-ablated evidence core **76,485,728**. The ladder buffer `rope_freqs` is fixed, non-trainable, and excluded from the counts.
+Format: `name,[shape],dtype` — these are the reference implementation's **actual state-dict keys** (the `backbone.` prefix written as `model.`; `lm_head.weight` is tied to the embedding and stored once), so the manifest is checkable against a checkpoint with one line of code. Evidence layers `[0-11]`; silence subsystem a single top-level block. Exact totals: **78,279,040** parameters; silence block **1,769,408**; silence-ablated evidence core **76,509,632**. The ladder buffer `rope_freqs` is fixed, non-trainable, and excluded from the counts.
 
 ```
 model.embedding.weight,[49152,512],BF16                  # tied to lm_head.weight
@@ -482,17 +482,17 @@ model.layers.[0-11].ground_attn.q_norm.weight,[64],BF16
 model.layers.[0-11].ground_attn.k_norm.weight,[64],BF16
 
 # ---- U: resonant AFFINE evidence recurrence + output gate (all layers) ----
-model.layers.[0-11].unfold.dt_bias,[4],BF16
-model.layers.[0-11].unfold.A_log,[4],F32
+model.layers.[0-11].unfold.dt_bias,[8],BF16
+model.layers.[0-11].unfold.A_log,[8],F32
 model.layers.[0-11].unfold.D,[512],BF16
-model.layers.[0-11].unfold.rope_freqs,[64],F32           # BUFFER: the fixed geometric ladder
+model.layers.[0-11].unfold.rope_freqs,[32],F32           # BUFFER: the fixed geometric ladder
 model.layers.[0-11].unfold.controller.weight,[128,512],BF16
 model.layers.[0-11].unfold.in_proj_qkv.weight,[1536,512],BF16
 model.layers.[0-11].unfold.in_proj_z.weight,[512,512],BF16
-model.layers.[0-11].unfold.in_proj_dyn.weight,[49,128],BF16
+model.layers.[0-11].unfold.in_proj_dyn.weight,[65,128],BF16
 model.layers.[0-11].unfold.conv1d.weight,[1536,1,4],BF16
 model.layers.[0-11].unfold.conv1d.bias,[1536],BF16
-model.layers.[0-11].unfold.norm.weight,[128],F32
+model.layers.[0-11].unfold.norm.weight,[64],F32
 model.layers.[0-11].unfold.out_proj.weight,[512,512],BF16
 
 # ---- M: error-free precision (all evidence layers) ----
@@ -549,7 +549,7 @@ model.silence.condition_norm.bias,[512],BF16
 model.norm_f.weight,[512],BF16
 ```
 
-**Shape notes.** `rope_freqs,[64]` is the per-head geometric ladder ($B{=}64$ blocks of 2 over $d_h{=}128$), fixed. `in_proj_z` is the U output gate ($\operatorname{silu}(z)\odot\cdot$). `in_proj_dyn,[49,128]` packs $(\bar\tau,\bar\lambda,r,\theta)$ per U-head $(4{\times}4)$ + $m(32)$ + $s(1)$. `register.read_proj` output (512) splits into 4 head-slices of 128, each rotated by that head's ladder at that head's $\phi$. `register.init_proj` in: $704=\sigma(128){+}g(512){+}\tilde e(32){+}\mu(32)$; `register.update_*` in: $1216=704{+}r^j(512)$; `modulate.in_proj_mu` in: $1184=g(512){+}e(512){+}\sigma(128){+}m(32)$; `pressure_in` in: $515=\zeta(512){+}\Delta^e{+}\Delta^{\sigma R}{+}s_t$ (516 when the optional entropy feature is enabled for its ablation); `halt_1` in: $130=\sigma(128){+}\pi{+}\mathcal{E}$ (no raw $g$ — see §8). Embeddings tied to the classifier. Loss-mixture halting adds no parameters — only up to $J_{\max}{+}1$ output-head evaluations on silence-fired tokens. The Top-GRU baseline additionally carries `silence.gru.*`, `silence.pool_proj.weight,[512,512]`, and `silence.pool_query,[512]` (§14) — baseline-only tensors, not part of this reference manifest. In the BF16 training configuration, `A_log`, `unfold.norm.weight`, and `rope_freqs` stay F32.
+**Shape notes.** `rope_freqs,[32]` is the per-head geometric ladder ($B{=}32$ blocks of 2 over $d_h{=}64$), fixed. `in_proj_z` is the U output gate ($\operatorname{silu}(z)\odot\cdot$). `in_proj_dyn,[65,128]` packs $(\bar\tau,\bar\lambda,r,\theta)$ per U-head $(4{\times}8)$ + $m(32)$ + $s(1)$. `register.read_proj` output (512) splits into 8 head-slices of 64, each rotated by that head's ladder at that head's $\phi$. `register.init_proj` in: $704=\sigma(128){+}g(512){+}\tilde e(32){+}\mu(32)$; `register.update_*` in: $1216=704{+}r^j(512)$; `modulate.in_proj_mu` in: $1184=g(512){+}e(512){+}\sigma(128){+}m(32)$; `pressure_in` in: $515=\zeta(512){+}\Delta^e{+}\Delta^{\sigma R}{+}s_t$ (516 when the optional entropy feature is enabled for its ablation); `halt_1` in: $130=\sigma(128){+}\pi{+}\mathcal{E}$ (no raw $g$ — see §8). Embeddings tied to the classifier. Loss-mixture halting adds no parameters — only up to $J_{\max}{+}1$ output-head evaluations on silence-fired tokens. The Top-GRU baseline additionally carries `silence.gru.*`, `silence.pool_proj.weight,[512,512]`, and `silence.pool_query,[512]` (§14) — baseline-only tensors, not part of this reference manifest. In the BF16 training configuration, `A_log`, `unfold.norm.weight`, and `rope_freqs` stay F32.
 
 ## Appendix B. Run Checklist
 

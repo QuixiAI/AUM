@@ -5,7 +5,7 @@
 #
 # mamba2(C,B,X,cumlog) computes ((C@Bᵀ) ⊙ exp(cumlog_i−cumlog_j) ⊙ causal) @ X, which is exactly the
 # AUM readout S_t·R(φ)q with C=R(φ)q, B=k_rot=R(φ)·L2norm(k), X=ρτ·L2norm(v), cumlog=cumsum(−λτ).
-# Headdim D=64 or D=128 (the Appendix-A reference is 4 heads x 128). The forward auto-routes to a
+# Headdim D=64 or D=128 (the Appendix-A reference is 8 heads x 64). The forward auto-routes to a
 # chunked LINEAR-TIME 3-kernel pipeline at D=64 (quadratic materialized form otherwise); the
 # backward (mamba2_bwd) returns dC,dB,dX and an fp32 in-kernel dcumlog = rowsum(M)−colsum(M).
 # `_ssd_core_ref` stays as the correctness oracle / fallback.

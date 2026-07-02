@@ -20,8 +20,8 @@ class Unfold(nn.Module):
     def __init__(
         self,
         d_model,
-        nheads=4,
-        headdim=128,
+        nheads=8,
+        headdim=64,
         d_conv=4,
         conv_bias=True,
         chunk_size=64,
