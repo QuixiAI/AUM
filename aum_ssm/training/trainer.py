@@ -1,6 +1,8 @@
 # AUM-Ø trainer (v6 §10-§12): stage-aware loop tying the model, the staged schedule, the
 # fixed-K counterfactual benefit signal, and the seven-term loss.
 
+import math
+
 import torch
 
 from aum_ssm.training.schedule import Stage, ScheduleConfig, active_loss_terms, pressure_gate_clear
@@ -61,8 +63,16 @@ class AumTrainer:
             logits = self.model(input_ids).logits
 
         if aux is not None:                                 # §8/§10 loss-mixture LM objective
-            parts["lm"] = L.lm_mixture_loss(aux.o_stack[:, :-1], aux.w[:, :-1],
-                                            self.raw.lm_head, input_ids[:, 1:])
+            if ablation == "no_op":
+                # All candidates are IDENTICAL under no_op (revision discarded), so the
+                # w-weighted mixture equals plain CE on candidate 0 — same loss, same grads
+                # (the w-path cancels analytically either way) at 1/3 the CE rows.
+                parts["lm"] = L.lm_mixture_loss(aux.o_stack[:, :-1, :1],
+                                                torch.ones_like(aux.w[:, :-1, :1]),
+                                                self.raw.lm_head, input_ids[:, 1:])
+            else:
+                parts["lm"] = L.lm_mixture_loss(aux.o_stack[:, :-1], aux.w[:, :-1],
+                                                self.raw.lm_head, input_ids[:, 1:])
             if "pred" in terms:
                 parts["pred"] = L.prediction_loss(aux.g_hat, aux.g, cfg.lambda_pred)
             # Regularizers only contribute when their lambda > 0 (avoids a 0*inf from the proxies).
@@ -118,6 +128,12 @@ class AumTrainer:
             metrics["pi_std"] = float(pi.std())
             metrics["dsigma"] = float((aux.sigma_star - aux.sigma_traj[0])
                                       .detach().float().norm(dim=-1).mean())
+            # p0/p1 directly — E[J] is a summary that hides WHICH sigmoid saturated. The
+            # halting params get no gradient in stage 1, but their INPUTS drift under LM
+            # training, so the frozen sigmoids can saturate (observed: p ~ 0.06 by step 240).
+            w = aux.w.detach().float()
+            metrics["p0_mean"] = float(w[..., 0].mean())
+            metrics["p1_mean"] = float((w[..., 1] / (1 - w[..., 0]).clamp_min(1e-6)).mean())
         if benefit is not None:
             metrics["benefit_mean"] = float(benefit.mean())
             # the §12 guard: is integration pressure tracking measured counterfactual benefit?
@@ -141,6 +157,36 @@ class AumTrainer:
             torch.stack(torch._foreach_norm(g)) if g else torch.zeros(1, device="cpu"))
             for g in (sil, evi)]
         return float(norms[0]), float(norms[1])
+
+    @torch.no_grad()
+    def recenter_halting(self, input_ids, z_target=0.3):
+        """Unsaturate the halting head at stage-3 entry (opt-in via --recenter-halting).
+
+        The halting params receive no gradient before stage 3, but their inputs drift under
+        LM training, saturating the frozen sigmoids (observed p ~ 0.06, where the sigmoid
+        gradient is ~4x smaller than at 0.5) — adaptive depth would start its learning phase
+        in a hole. halt_2 has no bias (and the fused-kernel ABI has no bias slot), so the
+        remedy is RESCALING halt_2.weight: z = w.h shrinks toward 0, p_j moves toward 0.5,
+        and the learned feature DIRECTION is preserved. p0/p1 are measured by an eval-mode
+        probe forward (forced_depth=None, so aux.w is the real cascade) and mean-reduced
+        across ranks — the scale must be identical everywhere or the distributed Muon's
+        all_gathered params diverge. Returns (scale, p0, p1)."""
+        was_training = self.model.training
+        self.model.eval()
+        _, aux = self.model(input_ids, return_aux=True)
+        if was_training:
+            self.model.train()
+        w = aux.w.float()
+        p = torch.stack([w[..., 0].mean(),
+                         (w[..., 1] / (1 - w[..., 0]).clamp_min(1e-6)).mean()])
+        if self.accelerator is not None and self.accelerator.num_processes > 1:
+            p = self.accelerator.reduce(p, reduction="mean")
+        p0, p1 = (float(v.clamp(1e-4, 1 - 1e-4)) for v in p)
+        z = max(abs(math.log(v / (1 - v))) for v in (p0, p1))
+        scale = 1.0 if z <= z_target else z_target / z
+        if scale < 1.0:
+            self.raw.backbone.silence.pressure_halt.halt_2.weight.mul_(scale)
+        return scale, p0, p1
 
     @torch.no_grad()
     def pred_val_r2(self, input_ids, return_parts=False):

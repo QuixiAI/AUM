@@ -391,6 +391,11 @@ def main():
                          "--set lambda_pred=0.7 --set lambda_pressure=0.5 --set kappa=0.2; "
                          "repeatable, applied last")
     ap.add_argument("--lambda-compute-max", type=float, default=5e-3, help="stage-3 ramp target")
+    ap.add_argument("--recenter-halting", action="store_true",
+                    help="at stage-3 entry, rescale halt_2.weight so the (input-drift-"
+                         "saturated) halting sigmoids restart near 0.5 — the halting head "
+                         "gets no gradient before stage 3, so it otherwise begins learning "
+                         "saturated (tiny sigmoid grads). Protocol addition, off by default")
     ap.add_argument("--eta-r2", type=float, default=None,
                     help="override the §12 R^2 pressure gate (default 0.15; e.g. -1e9 to force "
                          "stage progression in smoke tests)")
@@ -568,6 +573,10 @@ def main():
                 trainer.maybe_advance_stage(pred_r2)
                 say(f"step {step}: stage -> {int(trainer.stage)}")
                 health and health.on_stage(step, trainer.stage)
+                if args.recenter_halting:
+                    s_, p0_, p1_ = trainer.recenter_halting(next(val_iter)[:, :args.r2_len])
+                    say(f"step {step}: halting re-centered for stage 3 "
+                        f"(p0 {p0_:.3f}, p1 {p1_:.3f} -> halt_2 scale {s_:.3f})")
             elif trainer.stage == Stage.SOFT_HALTING and step >= ends[2]:
                 trainer.maybe_advance_stage(pred_r2)
                 say(f"step {step}: stage -> {int(trainer.stage)}")
@@ -629,6 +638,7 @@ def main():
                      **{f"train/{k}": step_metrics[k]
                         for k in ("benefit_mean", "expected_J", "corr_pi_b",
                                   "pred_r2_train", "pi_mean", "pi_std", "dsigma",
+                                  "p0_mean", "p1_mean",
                                   "grad_norm_silence", "grad_norm_evidence")
                         if k in step_metrics}},
                     step=step + 1)
