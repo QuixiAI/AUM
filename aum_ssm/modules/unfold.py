@@ -5,8 +5,10 @@
 #
 # Backend-pluggable: the recurrence is computed by one of {reference, metal, triton}. The
 # `reference` backend (pure PyTorch, aum_ssm.modules.ssd_reference) runs on CPU/MPS/CUDA and is
-# the correctness oracle; `metal` (ThunderMittens/tk_torch) and `triton` (NVIDIA, deferred) are
-# imported lazily so importing this module never requires Triton. See AUM-metal-plan.md.
+# the correctness oracle; `metal` (ThunderMittens/tk_torch) and `triton` (the vendored upstream
+# chunked-SSD kernels behind the cumlog<->dt*A adapter, aum_ssm/ops/triton/unfold_triton.py)
+# are imported lazily so importing this module never requires Triton. `auto` routes CUDA
+# chunk-aligned training to triton. See AUM-metal-plan.md / AUM-nvidia-plan.md.
 
 import math
 
@@ -86,7 +88,16 @@ class Unfold(nn.Module):
     def _dispatch(self, q, k, v, tau_bar, lam_bar, r, theta, z, D_hd):
         backend = self.kernel_backend
         if backend == "auto":
-            backend = "reference"   # metal/triton wired in later milestones
+            # CUDA -> the vendored-SSD triton path (chunk-aligned lengths; ragged tails and
+            # everything else stay on the reference oracle). Metal routes inside the ops.
+            if q.is_cuda and q.shape[1] % self.chunk_size == 0:
+                try:
+                    import triton  # noqa: F401
+                    backend = "triton"
+                except ImportError:
+                    backend = "reference"
+            else:
+                backend = "reference"
         if backend == "reference":
             from aum_ssm.modules.ssd_reference import aum_unfold_chunk_ref
             L = q.shape[1]
@@ -103,7 +114,11 @@ class Unfold(nn.Module):
                                       dt_bias=self.dt_bias, eps=self.eps,
                                       norm_weight=self.norm.weight, freqs=self.rope_freqs)
         if backend == "triton":
-            raise NotImplementedError("triton backend deferred to NVIDIA bring-up")
+            from aum_ssm.ops.triton.unfold_triton import unfold_triton_chunk
+            return unfold_triton_chunk(q, k, v, tau_bar, lam_bar, r, theta, z=z, D=D_hd,
+                                       dt_bias=self.dt_bias, eps=self.eps,
+                                       chunk_size=self.chunk_size,
+                                       norm_weight=self.norm.weight, freqs=self.rope_freqs)
         raise ValueError(f"unknown kernel_backend {backend!r}")
 
     def forward(self, x, inference_params=None, cache=None, return_read=False, **kwargs):

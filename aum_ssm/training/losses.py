@@ -17,13 +17,19 @@ def lm_loss(logits, targets):
     return F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
 
 
-def _metal_kernels():
-    """The vendored Metal kernels, if importable (MPS + Xcode toolchain); else None."""
+def _fused_kernels(device):
+    """The fused CE kernel package for this device (kernels.metal on MPS, kernels.triton on
+    CUDA — identical fused_linear_cross_entropy_ce contracts), or None if unavailable."""
     try:
-        import kernels.metal as km
-        return km
+        if device.type == "mps":
+            import kernels.metal as km
+            return km
+        if device.type == "cuda":
+            import kernels.triton as km
+            return km
     except Exception:
-        return None
+        pass
+    return None
 
 
 class _FusedMixtureCE(torch.autograd.Function):
@@ -34,7 +40,7 @@ class _FusedMixtureCE(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, o_flat, w_flat, weight, targets_flat, divisor):
-        km = _metal_kernels()
+        km = _fused_kernels(o_flat.device)
         loss, dh, dW, ce = km.fused_linear_cross_entropy_ce(
             o_flat.detach(), weight.detach(), targets_flat, row_weight=w_flat.detach(),
             divisor=divisor)
@@ -55,16 +61,16 @@ def lm_mixture_loss(o_stack, w, lm_head, targets):
     o_stack: (B, L, J+1, d) per-candidate outputs at the positions predicting `targets` (B, L).
     w: (B, L, J+1) halting weights. lm_head: the tied classifier (nn.Linear or callable).
 
-    On MPS with the vendored kernels available, uses the fused-linear-CE path — the (B,L,J+1,V)
-    logits (2.4 GB at the reference shapes) are never materialized. Everywhere else the
-    fallback runs in GRADIENT-CHECKPOINTED row chunks: each chunk's logits are recomputed on
-    backward, so peak memory is one (chunk, V) slab instead of the full (B*L*(J+1), V) tensor
-    (25.6 GB fp32 at B=2 reference shapes; a fused Triton CE is roadmap item B4).
+    With the fused kernels available (Metal on MPS, Triton on CUDA), uses the fused-linear-CE
+    path — the (B,L,J+1,V) logits (2.4 GB at the reference shapes) are never materialized.
+    Everywhere else the fallback runs in GRADIENT-CHECKPOINTED row chunks: each chunk's logits
+    are recomputed on backward, so peak memory is one (chunk, V) slab instead of the full
+    (B*L*(J+1), V) tensor (25.6 GB fp32 at B=2 reference shapes).
     """
     B, L, J1, d = o_stack.shape
     weight = getattr(lm_head, "weight", None)
-    if (o_stack.device.type == "mps" and weight is not None
-            and getattr(lm_head, "bias", None) is None and _metal_kernels() is not None):
+    if (weight is not None and getattr(lm_head, "bias", None) is None
+            and _fused_kernels(o_stack.device) is not None):
         t_flat = targets.unsqueeze(-1).expand(B, L, J1).reshape(-1)
         return _FusedMixtureCE.apply(o_stack.reshape(-1, d), w.reshape(-1), weight, t_flat,
                                      B * L)
