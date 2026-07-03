@@ -13,6 +13,12 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
+triton = pytest.importorskip("triton")
+if not hasattr(triton, "set_allocator"):
+    pytest.skip("SISO kernels need triton>=3.3 (TMA allocator API)", allow_module_level=True)
+if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9:
+    pytest.skip("SISO kernels are TMA-based (Hopper, sm90+)", allow_module_level=True)
+
 from aum_ssm.ops.triton.unfold.siso_combined import siso_combined
 from aum_ssm.ops.triton.unfold.siso_step import siso_step
 

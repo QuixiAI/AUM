@@ -6,7 +6,9 @@ import pytest
 import torch
 
 pytestmark = pytest.mark.skipif(not torch.backends.mps.is_available(), reason="no MPS")
-km = pytest.importorskip("kernels.metal")   # vendored, self-contained build (no ThunderMittens)
+# vendored, self-contained build (no ThunderMittens); exc_type=ImportError because
+# kernels/metal/__init__.py refuses non-MPS nodes with an explicit ImportError
+km = pytest.importorskip("kernels.metal", exc_type=ImportError)
 
 from aum_ssm.ops.metal.unfold_metal import unfold_metal_chunk
 from aum_ssm.modules.ssd_reference import aum_unfold_chunk_ref

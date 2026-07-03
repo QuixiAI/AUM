@@ -17,6 +17,16 @@ from aum_ssm.ops.metal.silence_flat import _cols
 SW, SV, J = 2720, 3151, 2                       # must match aum_silence.metal
 
 
+def _backend(device):
+    """The fused-silence kernel package for this device (identical ABIs; kernels/metal is the
+    spec, kernels/triton the CUDA twin)."""
+    if device.type == "cuda":
+        import kernels.triton as km
+    else:
+        import kernels.metal as km
+    return km
+
+
 def build_weight_pack(silence):
     """Flat fp32 weight pack in the kernel's offset order (differentiable cat)."""
     d, s, m = silence.d_model, silence.d_sigma, silence.d_mu
@@ -102,7 +112,7 @@ def silence_fwd_metal(silence, g, phi, m_t, s_t, alpha, xw, k_rot, freqs,
                       halt_u=None, forced_depth=None):
     """Run the fused forward (no autograd; tests/benchmarks).
     Returns (unpacked trajectories dict, j_star, save, packs)."""
-    import kernels.metal as km
+    km = _backend(g.device)
     streams = build_stream_pack(silence, g, phi, m_t, s_t, freqs)
     wpack = build_weight_pack(silence)
     B, L = g.shape[:2]
@@ -189,7 +199,7 @@ class _SilenceFused(torch.autograd.Function):
     @staticmethod
     def forward(ctx, streams, wpack, alpha, xwf, krotf, halt_u, kappa, forced, no_op,
                 halt_mode, delta):
-        import kernels.metal as km
+        km = _backend(streams.device)
         save, j_star, _S, S_ckpt = km.aum_silence_fwd(
             streams.detach(), alpha.detach(), xwf.detach(), krotf.detach(), halt_u,
             wpack.detach(), kappa, forced, no_op, halt_mode, delta)
@@ -199,8 +209,8 @@ class _SilenceFused(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, gsave, _gj):
-        import kernels.metal as km
         streams, wpack, alpha, xwf, krotf, save, j_star, S_ckpt = ctx.saved_tensors
+        km = _backend(streams.device)
         kappa, forced, no_op = ctx.meta
         B, L = save.shape[:2]
         T = B * L

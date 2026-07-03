@@ -220,10 +220,11 @@ class AumBackbone(nn.Module):
         if self.training and forced_depth is None:            # pre-drawn Categorical(w) uniforms
             u = torch.rand(B, L, device=g_t.device)
 
-        # Fused Metal path (kernel-roadmap step 4): the whole recurrence in one kernel launch per
-        # direction instead of ~50 tiny ops x L tokens. Exact (validated to fp32 noise against
-        # this loop, gradients included). Falls back for non-standard geometry / ablations other
-        # than no_op / top_gru / entropy_feature / stage-4 J(pi) inference / non-MPS.
+        # Fused kernel path (Metal on MPS, Triton on CUDA; kernel-roadmap step 4): the whole
+        # recurrence in one kernel launch per direction instead of ~50 tiny ops x L tokens.
+        # Exact (validated to fp32 noise against this loop, gradients included). Falls back for
+        # non-standard geometry / ablations other than no_op / top_gru / entropy_feature /
+        # stage-4 J(pi) inference / devices without a fused backend.
         if self._fused_silence_ok(ablation, H, Dv, g_t.device):
             from aum_ssm.ops.metal.silence_metal import silence_fused
             o_t, aux = silence_fused(self.silence, g_t, phi, m_t, s_t, alpha, xw, k_rot,
@@ -307,14 +308,20 @@ class AumBackbone(nn.Module):
         if not (s.d_model == 512 and s.d_sigma == 128 and s.d_mu == 32 and s.j_max == 2
                 and H == 8 and Dv == 64):
             return False
-        if getattr(c, "kernel_backend", "auto") not in ("auto", "metal") \
-                or device.type != "mps":
-            return False
-        try:
-            import kernels.metal  # noqa: F401
-            return True
-        except Exception:
-            return False
+        backend = getattr(c, "kernel_backend", "auto")
+        if device.type == "mps" and backend in ("auto", "metal"):
+            try:
+                import kernels.metal  # noqa: F401
+                return True
+            except Exception:
+                return False
+        if device.type == "cuda" and backend in ("auto", "triton"):
+            try:
+                import kernels.triton  # noqa: F401
+                return True
+            except Exception:
+                return False
+        return False
 
     def _silence_slot(self, inference_params, batch, device):
         kv = inference_params.key_value_memory_dict

@@ -16,6 +16,12 @@ import subprocess
 import torch  # noqa: F401  (extension links against torch)
 from torch.utils.cpp_extension import load
 
+if not torch.backends.mps.is_available():
+    # ImportError (not FileNotFoundError from xcrun) so pytest.importorskip and the model's
+    # fused-route eligibility try/except treat non-Mac nodes as "backend unavailable".
+    raise ImportError("kernels.metal requires PyTorch MPS (Apple GPU); "
+                      "on CUDA use kernels.triton")
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _INCLUDE = os.path.join(_HERE, "include")
 _SRC = os.path.join(_HERE, "src")
