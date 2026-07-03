@@ -25,6 +25,10 @@ class AumTrainer:
         # Under DDP, `model` is the WRAPPED module — forward must go through it for gradient
         # sync — while attribute access (.backbone, .lm_head) needs the unwrapped module.
         self.raw = raw if raw is not None else model
+        # Param split for per-group grad-norm attribution (silence block vs evidence core).
+        silence = getattr(getattr(self.raw, "backbone", None), "silence", None)
+        self._silence_pids = {id(p) for p in silence.parameters()} if silence is not None \
+            else set()
 
     def _ablation_for_stage(self):
         # Stage 1 trains A,U,M + the prediction head with J=0 -> every candidate output is sigma^0's.
@@ -80,14 +84,16 @@ class AumTrainer:
         # gradient accumulation (zeroing first would wipe the accumulated grads on the sync step).
         # clip_grad_norm_ returns the PRE-clip total norm — logged as the numerical-stability
         # signal (spikes = instability; the 1.0 clip caps what the optimizer actually applies).
-        grad_norm = None
+        grad_norm = gn_silence = gn_evidence = None
         if self.accelerator is not None:
             self.accelerator.backward(total)
             if self.accelerator.sync_gradients:
+                gn_silence, gn_evidence = self._group_grad_norms()   # PRE-clip attribution
                 grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(),
                                                              self.max_grad_norm)
         else:
             total.backward()
+            gn_silence, gn_evidence = self._group_grad_norms()
             grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(),
                                                        self.max_grad_norm)
         self.opt.step()
@@ -95,10 +101,23 @@ class AumTrainer:
         metrics = {"loss": float(total.detach()), "parts": used, "stage": int(self.stage)}
         if grad_norm is not None:                # present on sync micro-steps (the logged ones)
             metrics["grad_norm"] = float(grad_norm)
+            if gn_silence is not None:
+                metrics["grad_norm_silence"] = gn_silence
+                metrics["grad_norm_evidence"] = gn_evidence
         if aux is not None:
             # E[J] directly, NOT via lambda_C*E[J] (train/compute) — lambda_C is 0 until the
             # stage-3 ramp, and halting collapse is exactly what the ramp can cause (§12).
             metrics["expected_J"] = float(aux.expected_J.detach().mean())
+            # train-side R^2 (scale-free; the GATE reads the held-out version) + the silence-
+            # mechanism scalars: pressure spread and how far revision moves the register.
+            g = aux.g.detach().float()
+            base = (g - g.mean(dim=(0, 1), keepdim=True)).pow(2).sum().clamp_min(1e-12)
+            metrics["pred_r2_train"] = float(1.0 - aux.e.detach().float().pow(2).sum() / base)
+            pi = aux.pi.detach().float()
+            metrics["pi_mean"] = float(pi.mean())
+            metrics["pi_std"] = float(pi.std())
+            metrics["dsigma"] = float((aux.sigma_star - aux.sigma_traj[0])
+                                      .detach().float().norm(dim=-1).mean())
         if benefit is not None:
             metrics["benefit_mean"] = float(benefit.mean())
             # the §12 guard: is integration pressure tracking measured counterfactual benefit?
@@ -109,19 +128,38 @@ class AumTrainer:
         return metrics, aux
 
     @torch.no_grad()
-    def pred_val_r2(self, input_ids):
+    def _group_grad_norms(self):
+        """(silence, evidence) pre-clip grad norms — attributes instability to the sequential
+        sigma-chain vs the evidence core. One fused norm pass; ~ms."""
+        if not self._silence_pids:
+            return None, None
+        sil, evi = [], []
+        for p in self.model.parameters():
+            if p.grad is not None:
+                (sil if id(p) in self._silence_pids else evi).append(p.grad)
+        norms = [torch.linalg.vector_norm(
+            torch.stack(torch._foreach_norm(g)) if g else torch.zeros(1, device="cpu"))
+            for g in (sil, evi)]
+        return float(norms[0]), float(norms[1])
+
+    @torch.no_grad()
+    def pred_val_r2(self, input_ids, return_parts=False):
         """Held-out prediction-head R^2 = 1 - ||e||^2 / ||g - g_bar||^2 — the §12 gate criterion.
 
         g_bar is the held-out batch mean (the running-mean estimate at eval time).
+        return_parts=True also returns (resid, base) — if R^2 misbehaves, a stuck numerator
+        means the head isn't learning; a collapsing denominator means g itself is losing
+        variance (representation collapse), which raw R^2 would disguise as improvement.
         """
         if not self.config.silence_enabled:
-            return float("-inf")                        # no prediction head without silence
+            return (float("-inf"), 0.0, 0.0) if return_parts else float("-inf")
         self.raw.backbone.silence_enabled = True
         _, aux = self.model(input_ids, return_aux=True, ablation="no_op")
         g = aux.g
-        resid = (aux.e).pow(2).sum()
-        base = (g - g.mean(dim=(0, 1), keepdim=True)).pow(2).sum()
-        return float(1.0 - resid / base.clamp_min(1e-12))
+        resid = float((aux.e).pow(2).sum())
+        base = float((g - g.mean(dim=(0, 1), keepdim=True)).pow(2).sum().clamp_min(1e-12))
+        r2 = 1.0 - resid / base
+        return (r2, resid, base) if return_parts else r2
 
     def maybe_advance_stage(self, pred_r2):
         """Advance stages per §12. The load-bearing gate: do NOT enable L_pressure until the

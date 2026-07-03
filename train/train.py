@@ -627,21 +627,24 @@ def main():
                      "stage": int(trainer.stage), "p_explore": p_explore,
                      "lambda_compute": trainer.config.lambda_compute,
                      **{f"train/{k}": step_metrics[k]
-                        for k in ("benefit_mean", "expected_J", "corr_pi_b")
+                        for k in ("benefit_mean", "expected_J", "corr_pi_b",
+                                  "pred_r2_train", "pi_mean", "pi_std", "dsigma",
+                                  "grad_norm_silence", "grad_norm_evidence")
                         if k in step_metrics}},
                     step=step + 1)
             t0, tokens0 = time.time(), tokens_seen
 
         if (step + 1) % args.eval_every == 0 or step + 1 == total_steps:
             val_loss = evaluate(model, raw_model, cfg, val_iter, args.eval_batches)
-            pred_r2 = trainer.pred_val_r2(next(val_iter)[:, :args.r2_len]) \
-                if cfg.silence_enabled else float("-inf")
+            pred_r2, r2_resid, r2_base = trainer.pred_val_r2(
+                next(val_iter)[:, :args.r2_len], return_parts=True)
             if accelerator.num_processes > 1:
                 # §12 rank-synchronized gate: val loaders shard per rank, so mean the shard
                 # statistics — every rank sees the same numbers and advances stages identically
-                vm = torch.tensor([val_loss, pred_r2], device=accelerator.device)
+                vm = torch.tensor([val_loss, pred_r2, r2_resid, r2_base],
+                                  device=accelerator.device)
                 vm = accelerator.reduce(vm, reduction="mean")
-                val_loss, pred_r2 = float(vm[0]), float(vm[1])
+                val_loss, pred_r2, r2_resid, r2_base = (float(v) for v in vm)
             say(f"step {step + 1:>6}: val_loss {val_loss:.4f} "
                 f"pred_R^2 {pred_r2:.3f} (gate eta={schedule.eta_r2})")
             if health:
@@ -651,10 +654,12 @@ def main():
                     say(f"WARNING: health monitor error ({e}); continuing")
             if accelerator.is_main_process:
                 with open(log_path, "a") as f:
-                    json.dump({"step": step + 1, "val_loss": val_loss, "pred_r2": pred_r2}, f)
+                    json.dump({"step": step + 1, "val_loss": val_loss, "pred_r2": pred_r2,
+                               "r2_resid": r2_resid, "r2_base": r2_base}, f)
                     f.write("\n")
                 if args.wandb:
-                    accelerator.log({"val/loss": val_loss, "val/pred_r2": pred_r2},
+                    accelerator.log({"val/loss": val_loss, "val/pred_r2": pred_r2,
+                                     "val/r2_resid": r2_resid, "val/r2_base": r2_base},
                                     step=step + 1)
             model.train()
 
