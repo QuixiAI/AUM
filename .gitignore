@@ -1,5 +1,6 @@
 *__pycache__/
 *.egg-info/
+*.log
 build/
 **.so
 *.hip
@@ -11,3 +12,4 @@ kernels/metal/aum.metallib
 train/checkpoints/
 train/data/
 wandb/
+.reference/
