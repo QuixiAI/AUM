@@ -9,6 +9,7 @@
 
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 
 def lm_loss(logits, targets):
@@ -55,7 +56,10 @@ def lm_mixture_loss(o_stack, w, lm_head, targets):
     w: (B, L, J+1) halting weights. lm_head: the tied classifier (nn.Linear or callable).
 
     On MPS with the vendored kernels available, uses the fused-linear-CE path — the (B,L,J+1,V)
-    logits (2.4 GB at the reference shapes) are never materialized.
+    logits (2.4 GB at the reference shapes) are never materialized. Everywhere else the
+    fallback runs in GRADIENT-CHECKPOINTED row chunks: each chunk's logits are recomputed on
+    backward, so peak memory is one (chunk, V) slab instead of the full (B*L*(J+1), V) tensor
+    (25.6 GB fp32 at B=2 reference shapes; a fused Triton CE is roadmap item B4).
     """
     B, L, J1, d = o_stack.shape
     weight = getattr(lm_head, "weight", None)
@@ -64,12 +68,25 @@ def lm_mixture_loss(o_stack, w, lm_head, targets):
         t_flat = targets.unsqueeze(-1).expand(B, L, J1).reshape(-1)
         return _FusedMixtureCE.apply(o_stack.reshape(-1, d), w.reshape(-1), weight, t_flat,
                                      B * L)
-    logits = lm_head(o_stack)                                    # (B, L, J+1, V)
-    V = logits.shape[-1]
-    ce = F.cross_entropy(logits.reshape(-1, V),
-                         targets.unsqueeze(-1).expand(B, L, J1).reshape(-1),
-                         reduction="none").reshape(B, L, J1)
-    return (w * ce).sum(-1).mean()
+    o_flat = o_stack.reshape(-1, d)
+    w_flat = w.reshape(-1)
+    t_flat = targets.unsqueeze(-1).expand(B, L, J1).reshape(-1)
+
+    def chunk_ce(o_c, w_c, t_c):
+        ce = F.cross_entropy(lm_head(o_c).float(), t_c, reduction="none")
+        return (w_c * ce).sum()
+
+    rows = o_flat.shape[0]
+    chunk = 4096
+    total = torch.zeros((), device=o_flat.device, dtype=torch.float32)
+    for c0 in range(0, rows, chunk):
+        args = (o_flat[c0:c0 + chunk], w_flat[c0:c0 + chunk], t_flat[c0:c0 + chunk])
+        if torch.is_grad_enabled() and (o_flat.requires_grad or w_flat.requires_grad):
+            total = total + torch.utils.checkpoint.checkpoint(chunk_ce, *args,
+                                                              use_reentrant=False)
+        else:
+            total = total + chunk_ce(*args)
+    return total / (B * L)
 
 
 def prediction_loss(g_hat, g, lambda_pred):

@@ -45,9 +45,15 @@ loss-part lines, eval results, and stage transitions print above it and append t
 project, WANDB_MODE=offline works, --no-wandb to disable; an init failure degrades to a
 warning, never kills the run).
 
-Single-process only for now (MPS or one GPU): the vendored Muon here is the single-device
-variant and the silence-path trainer reaches through the raw module. `accelerate launch` with
-num_processes=1 (or plain `python`) both work.
+Multi-GPU: `accelerate launch --num_processes 8 train/train.py ...` (train/launch.sh does this
+automatically on a CUDA node). DDP averages gradients (find_unused_parameters=True — stage-gated
+heads have no grad path in early stages and the graph changes at stage boundaries); train/muon.py
+selects the DISTRIBUTED MuonWithAuxAdam under a multi-rank process group (Newton-Schulz sharded
+across ranks, params all_gathered). The §12 stage schedule is rank-synchronized: val loss and the
+R^2 gate statistic are all-reduced means, so every rank advances stages identically. Checkpoints:
+rank 0 saves the model + its trainer state; every other rank saves trainer_state_rank{r}.pt
+(Muon momentum is sharded by rank) — resume with the SAME num_processes to restore momentum
+exactly (a missing shard falls back to rank 0's state: fresh momentum, still correct).
 """
 
 import argparse
@@ -143,18 +149,20 @@ def stage_boundaries(total_steps, fractions):
 
 # --------------------------------------------------------------------------- eval
 @torch.no_grad()
-def evaluate(model, cfg, val_iter, n_batches):
-    """Held-out LM loss (the §8 mixture when the silence stack is on, plain CE otherwise)."""
+def evaluate(model, raw, cfg, val_iter, n_batches):
+    """Held-out LM loss (the §8 mixture when the silence stack is on, plain CE otherwise).
+    `model` may be DDP-wrapped (forward goes through it); `raw` is the unwrapped module for
+    attribute access. Per-rank shard mean — the caller reduces across ranks."""
     was_training = model.training
     model.eval()
-    model.backbone.silence_enabled = cfg.silence_enabled
+    raw.backbone.silence_enabled = cfg.silence_enabled
     losses = []
     for _ in range(n_batches):
         x = next(val_iter)
         if cfg.silence_enabled:
             _, aux = model(x, return_aux=True)
             losses.append(float(L.lm_mixture_loss(aux.o_stack[:, :-1], aux.w[:, :-1],
-                                                  model.lm_head, x[:, 1:])))
+                                                  raw.lm_head, x[:, 1:])))
         else:
             losses.append(float(L.lm_loss(model(x).logits[:, :-1], x[:, 1:])))
     if was_training:
@@ -175,14 +183,26 @@ def load_model(ckpt_dir, overrides):
 
 
 def save_checkpoint(accelerator, model, optimizer, run_dir, step, stage, tokens_seen):
+    """Called on ALL ranks: rank 0 saves the model + trainer_state.pt; every other rank saves
+    trainer_state_rank{r}.pt — the distributed Muon shards momentum by rank, so exact resume
+    needs each rank's optimizer state (Adam states are replicated; the duplication is the
+    price of a simple exact resume)."""
     path = os.path.join(run_dir, f"step-{step:06d}")
-    accelerator.unwrap_model(model).save_pretrained(path)
-    torch.save({"optimizer": optimizer.state_dict(), "step": step, "stage": int(stage),
-                "tokens_seen": tokens_seen}, os.path.join(path, "trainer_state.pt"))
-    latest = os.path.join(run_dir, "latest")
-    if os.path.islink(latest):
-        os.remove(latest)
-    os.symlink(os.path.basename(path), latest)
+    if accelerator.is_main_process:
+        os.makedirs(path, exist_ok=True)
+        accelerator.unwrap_model(model).save_pretrained(path)
+    accelerator.wait_for_everyone()                  # dir exists before non-zero ranks write
+    state = {"optimizer": optimizer.state_dict(), "step": step, "stage": int(stage),
+             "tokens_seen": tokens_seen}
+    name = "trainer_state.pt" if accelerator.is_main_process \
+        else f"trainer_state_rank{accelerator.process_index}.pt"
+    torch.save(state, os.path.join(path, name))
+    if accelerator.is_main_process:
+        latest = os.path.join(run_dir, "latest")
+        if os.path.islink(latest):
+            os.remove(latest)
+        os.symlink(os.path.basename(path), latest)
+    accelerator.wait_for_everyone()
     return path
 
 
@@ -221,7 +241,8 @@ def main():
                          "stage progression in smoke tests)")
     ap.add_argument("--no-silence", action="store_true",
                     help="evidence-core baseline: silence stack off, plain LM loss, no stages")
-    ap.add_argument("--kernel-backend", default=None, help="override config (auto|reference|metal)")
+    ap.add_argument("--kernel-backend", default=None,
+                    help="override config (auto|reference|metal|triton)")
     ap.add_argument("--mixed-precision", default="no", choices=["no", "bf16", "fp16"])
     # cadence
     ap.add_argument("--eval-every", type=int, default=250, help="optimizer steps between evals")
@@ -231,10 +252,12 @@ def main():
     ap.add_argument("--log-every", type=int, default=1,
                     help="optimizer steps between log lines / wandb points (steps are minutes "
                          "at 4k context on MPS — log every one)")
-    ap.add_argument("--empty-cache-every", type=int, default=10,
-                    help="release the MPS allocator cache every N optimizer steps (0 = never). "
-                         "The cache otherwise grows monotonically (~85GB/step peak at 8x4096), "
-                         "gets paged out, and step time decays as pages fault back in")
+    ap.add_argument("--empty-cache-every", type=int, default=None,
+                    help="release the allocator cache every N optimizer steps (0 = never; "
+                         "default 10 on MPS, 0 on CUDA). On MPS the cache otherwise grows "
+                         "monotonically (~85GB/step peak at 8x4096), gets paged out, and step "
+                         "time decays; on CUDA watch torch.cuda.memory_reserved() and enable "
+                         "this only if it creeps")
     ap.add_argument("--no-tqdm", action="store_true", help="plain-print progress (logs/CI)")
     ap.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=None,
                     help="report to Weights & Biases (default: ON when the wandb package is "
@@ -242,6 +265,8 @@ def main():
     ap.add_argument("--wandb-project", default="aum-ssm")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
+    if args.empty_cache_every is None:                  # MPS needs it; CUDA usually not
+        args.empty_cache_every = 10 if torch.backends.mps.is_available() else 0
 
     if args.wandb is None:                              # default: report whenever wandb exists
         try:
@@ -251,13 +276,15 @@ def main():
             args.wandb = False
 
     from accelerate import Accelerator
-    from accelerate.utils import set_seed
+    from accelerate.utils import DistributedDataParallelKwargs, set_seed
+    # find_unused_parameters: stage-gated heads (halting/consistency/pressure) have no grad
+    # path in stage 1, and the active graph changes at stage boundaries — the DDP graph is
+    # not static.
     accelerator = Accelerator(gradient_accumulation_steps=args.grad_accum,
                               mixed_precision=args.mixed_precision,
-                              log_with="wandb" if args.wandb else None)
-    if accelerator.num_processes > 1:
-        raise SystemExit("train.py is single-process for now (single-device Muon + the silence "
-                         "trainer reach through the raw module); run with num_processes=1.")
+                              log_with="wandb" if args.wandb else None,
+                              kwargs_handlers=[DistributedDataParallelKwargs(
+                                  find_unused_parameters=True)])
     set_seed(args.seed)
 
     # ---- model
@@ -293,7 +320,8 @@ def main():
     val_loader = make_loader(val_ds, args.batch_size, args.seed + 1)
 
     # ---- steps / schedule
-    tokens_per_step = args.batch_size * args.grad_accum * args.seq_len
+    tokens_per_step = (args.batch_size * args.grad_accum * args.seq_len
+                       * accelerator.num_processes)
     total_tokens = args.total_tokens if args.total_tokens is not None \
         else len(train_ds) * args.seq_len * args.epochs   # default: --epochs corpus passes
     total_steps = max(1, math.ceil(total_tokens / tokens_per_step))
@@ -307,13 +335,24 @@ def main():
     model, optimizer, train_loader, val_loader = accelerator.prepare(
         model, optimizer, train_loader, val_loader)
     base_lrs = [g["lr"] for g in optimizer.param_groups]
-    trainer = AumTrainer(accelerator.unwrap_model(model), optimizer, cfg, schedule,
-                         accelerator=accelerator)
+    raw_model = accelerator.unwrap_model(model)
+    # Forward through the WRAPPED model (DDP grad sync); attribute access through raw.
+    trainer = AumTrainer(model, optimizer, cfg, schedule, accelerator=accelerator,
+                         raw=raw_model)
 
     start_step, tokens_seen = 0, 0
     if args.resume:
-        st = torch.load(os.path.join(args.resume, "trainer_state.pt"),
-                        map_location="cpu", weights_only=False)
+        # Muon momentum is sharded by rank (train/muon.py) — each rank prefers its own saved
+        # shard; a missing shard (e.g. resuming with a different num_processes) falls back to
+        # rank 0's state: correct params, fresh momentum for that rank's Muon shard.
+        st_path = os.path.join(args.resume, f"trainer_state_rank{accelerator.process_index}.pt")
+        if accelerator.process_index == 0 or not os.path.exists(st_path):
+            if accelerator.process_index != 0:
+                accelerator.print(f"WARNING: {st_path} missing; rank "
+                                  f"{accelerator.process_index} resumes from rank 0's "
+                                  f"optimizer state (Muon momentum restarts for its shard)")
+            st_path = os.path.join(args.resume, "trainer_state.pt")
+        st = torch.load(st_path, map_location="cpu", weights_only=False)
         optimizer.load_state_dict(st["optimizer"])
         start_step, tokens_seen = st["step"], st["tokens_seen"]
         trainer.stage = Stage(st["stage"])
@@ -383,9 +422,11 @@ def main():
                 batch = next(train_iter)
                 step_metrics, _ = trainer.train_step(batch, p_explore=p_explore)
         tokens_seen += tokens_per_step
-        if args.empty_cache_every and (step + 1) % args.empty_cache_every == 0 \
-                and torch.backends.mps.is_available():
-            torch.mps.empty_cache()                      # stop allocator-cache -> swap creep
+        if args.empty_cache_every and (step + 1) % args.empty_cache_every == 0:
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()                  # stop allocator-cache -> swap creep
+            elif torch.cuda.is_available():
+                torch.cuda.empty_cache()
         bar.update(1)
         bar.set_postfix(loss=f"{step_metrics['loss']:.3f}", stage=int(trainer.stage),
                         lr=f"x{scale:.2f}", refresh=False)
@@ -414,9 +455,15 @@ def main():
             t0, tokens0 = time.time(), tokens_seen
 
         if (step + 1) % args.eval_every == 0 or step + 1 == total_steps:
-            val_loss = evaluate(trainer.model, cfg, val_iter, args.eval_batches)
+            val_loss = evaluate(model, raw_model, cfg, val_iter, args.eval_batches)
             pred_r2 = trainer.pred_val_r2(next(val_iter)[:, :args.r2_len]) \
                 if cfg.silence_enabled else float("-inf")
+            if accelerator.num_processes > 1:
+                # §12 rank-synchronized gate: val loaders shard per rank, so mean the shard
+                # statistics — every rank sees the same numbers and advances stages identically
+                vm = torch.tensor([val_loss, pred_r2], device=accelerator.device)
+                vm = accelerator.reduce(vm, reduction="mean")
+                val_loss, pred_r2 = float(vm[0]), float(vm[1])
             say(f"step {step + 1:>6}: val_loss {val_loss:.4f} "
                 f"pred_R^2 {pred_r2:.3f} (gate eta={schedule.eta_r2})")
             if accelerator.is_main_process:
@@ -428,11 +475,11 @@ def main():
                                     step=step + 1)
             model.train()
 
-        if ((step + 1) % args.save_every == 0 or step + 1 == total_steps) \
-                and accelerator.is_main_process:
+        if (step + 1) % args.save_every == 0 or step + 1 == total_steps:
             path = save_checkpoint(accelerator, model, optimizer, run_dir, step + 1,
                                    trainer.stage, tokens_seen)
-            say(f"saved {path}")
+            if accelerator.is_main_process:
+                say(f"saved {path}")
 
     bar.close()
     accelerator.print(f"done: {tokens_seen:,} tokens, final stage {int(trainer.stage)}")

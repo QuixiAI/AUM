@@ -26,7 +26,8 @@ def calibrated_target(b_t, beta=0.02):
     return torch.log1p(b_t.clamp_min(0) / beta)
 
 
-def rollout_benefit(model, input_ids, beta=0.02, ablation=None, K=None, train_forced_depth=None):
+def rollout_benefit(model, input_ids, beta=0.02, ablation=None, K=None, train_forced_depth=None,
+                    raw=None):
     """Fixed-K counterfactual benefit b_t = l_0 - l_K and target y_t (§11), plus the live forward.
 
     Three branches:
@@ -41,8 +42,9 @@ def rollout_benefit(model, input_ids, beta=0.02, ablation=None, K=None, train_fo
     NOTE: this is the practical all-at-K-vs-all-off, per-position label. The exact §11 policy
     fires silence ONCE at t with downstream frozen off; that per-t rollout is a later refinement.
     """
+    raw = raw if raw is not None else model      # unwrapped module for attribute access (DDP)
     if K is None:
-        K = model.backbone.silence.j_max
+        K = raw.backbone.silence.j_max
     result, aux = model(input_ids, return_aux=True, ablation=ablation,
                         forced_depth=train_forced_depth)
     if train_forced_depth == K:
@@ -51,11 +53,11 @@ def rollout_benefit(model, input_ids, beta=0.02, ablation=None, K=None, train_fo
         with torch.no_grad():
             l_K = per_token_ce(
                 model(input_ids, ablation=ablation, forced_depth=K).logits, input_ids)
-    was_on = model.backbone.silence_enabled
-    model.backbone.silence_enabled = False
+    was_on = raw.backbone.silence_enabled
+    raw.backbone.silence_enabled = False
     with torch.no_grad():
         l_0 = per_token_ce(model(input_ids).logits, input_ids)
-    model.backbone.silence_enabled = was_on
+    raw.backbone.silence_enabled = was_on
     b = (l_0 - l_K).detach()                     # (B, L-1), stop-gradient benefit label
     return b, calibrated_target(b, beta), aux, result
 

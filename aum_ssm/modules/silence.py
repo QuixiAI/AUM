@@ -11,8 +11,7 @@
 # candidate sigma^{j*} (aux.sigma_star) is carried to t+1. The cross-token recurrence
 # (sigma_prev = previous sigma_star) is the caller's job — this module is the per-token map.
 
-from dataclasses import dataclass
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 import torch.nn as nn
@@ -32,8 +31,12 @@ def _phase_embed(phi, d_phase):
     return emb[..., :d_phase]
 
 
-@dataclass
-class SilenceAux:
+class SilenceAux(NamedTuple):
+    # A NamedTuple (not a dataclass) on purpose: DistributedDataParallel's forward-output
+    # traversal only descends tuples/lists/dicts, and the halting/pressure/consistency heads
+    # reach the loss ONLY through these aux tensors — as a dataclass they would be invisible
+    # to the reducer and DDP would mark those parameters unused, then error when their
+    # gradients arrive.
     g: torch.Tensor         # g_t (the grounded summary the block conditioned on)
     g_hat: torch.Tensor
     e: torch.Tensor

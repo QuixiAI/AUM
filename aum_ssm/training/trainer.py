@@ -10,7 +10,7 @@ from aum_ssm.training.counterfactual import rollout_benefit
 
 class AumTrainer:
     def __init__(self, model, optimizer, config, schedule: ScheduleConfig = None,
-                 accelerator=None):
+                 accelerator=None, raw=None):
         self.model = model
         self.opt = optimizer
         self.config = config
@@ -22,6 +22,9 @@ class AumTrainer:
         # accelerator (mixed precision, gradient accumulation); step/zero_grad are the prepared
         # optimizer's, which no-op on non-sync accumulation steps.
         self.accelerator = accelerator
+        # Under DDP, `model` is the WRAPPED module — forward must go through it for gradient
+        # sync — while attribute access (.backbone, .lm_head) needs the unwrapped module.
+        self.raw = raw if raw is not None else model
 
     def _ablation_for_stage(self):
         # Stage 1 trains A,U,M + the prediction head with J=0 -> every candidate output is sigma^0's.
@@ -30,7 +33,7 @@ class AumTrainer:
     def train_step(self, input_ids, p_explore=None):
         cfg, terms = self.config, active_loss_terms(self.stage)
         use_silence = cfg.silence_enabled                   # False -> evidence-core baseline (LM only)
-        self.model.backbone.silence_enabled = use_silence
+        self.raw.backbone.silence_enabled = use_silence
         ablation = self.force_ablation if self.force_ablation is not None else self._ablation_for_stage()
         parts, benefit, aux = {}, None, None
 
@@ -40,7 +43,7 @@ class AumTrainer:
             train_depth = self.schedule.forced_K if self.stage == Stage.FORCED_REVISION else None
             b, y, aux, result = rollout_benefit(self.model, input_ids, cfg.beta, ablation,
                                                 K=self.schedule.forced_K,
-                                                train_forced_depth=train_depth)
+                                                train_forced_depth=train_depth, raw=self.raw)
             mask = None
             if self.stage >= Stage.SOFT_HALTING:            # §11 exploration subset (stage 2 = all
                 p = self.schedule.p_explore_floor if p_explore is None else p_explore  # forced)
@@ -55,12 +58,12 @@ class AumTrainer:
 
         if aux is not None:                                 # §8/§10 loss-mixture LM objective
             parts["lm"] = L.lm_mixture_loss(aux.o_stack[:, :-1], aux.w[:, :-1],
-                                            self.model.lm_head, input_ids[:, 1:])
+                                            self.raw.lm_head, input_ids[:, 1:])
             if "pred" in terms:
                 parts["pred"] = L.prediction_loss(aux.g_hat, aux.g, cfg.lambda_pred)
             # Regularizers only contribute when their lambda > 0 (avoids a 0*inf from the proxies).
             if "precision" in terms and cfg.lambda_precision > 0:
-                mus = [l._last_mu for l in self.model.backbone.layers if l._last_mu is not None]
+                mus = [l._last_mu for l in self.raw.backbone.layers if l._last_mu is not None]
                 if mus:                                     # PER-LAYER fields only, never global (§10)
                     parts["precision"] = L.precision_loss(mus, cfg.lambda_precision)
             if "state" in terms and cfg.lambda_state > 0:  # readout-energy proxy for ||S_t||^2
@@ -97,7 +100,7 @@ class AumTrainer:
         """
         if not self.config.silence_enabled:
             return float("-inf")                        # no prediction head without silence
-        self.model.backbone.silence_enabled = True
+        self.raw.backbone.silence_enabled = True
         _, aux = self.model(input_ids, return_aux=True, ablation="no_op")
         g = aux.g
         resid = (aux.e).pow(2).sum()

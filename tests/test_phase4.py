@@ -113,6 +113,32 @@ def test_lm_mixture_loss_matches_plain_ce_when_one_hot():
     assert torch.allclose(mix, plain, atol=1e-6)
 
 
+def test_lm_mixture_loss_chunked_matches_dense():
+    # the row-chunked (checkpointed) fallback — >4096 rows so it actually splits — must equal
+    # the dense (B,L,J+1,V) computation in loss AND in every grad
+    torch.manual_seed(0)
+    B, T, J1, d, V = 2, 800, 3, 16, 101                  # 4800 rows -> 2 chunks
+    head = torch.nn.Linear(d, V, bias=False)
+    o = torch.randn(B, T, J1, d, requires_grad=True)
+    w = torch.softmax(torch.randn(B, T, J1), -1).requires_grad_()
+    targets = torch.randint(0, V, (B, T))
+    logits = head(o)
+    ce = torch.nn.functional.cross_entropy(
+        logits.reshape(-1, V), targets.unsqueeze(-1).expand(B, T, J1).reshape(-1),
+        reduction="none").reshape(B, T, J1)
+    ref = (w * ce).sum(-1).mean()
+    ref.backward()
+    go, gw, gh = o.grad.clone(), w.grad.clone(), head.weight.grad.clone()
+    o.grad = w.grad = head.weight.grad = None
+    mix = L.lm_mixture_loss(o, w, head, targets)
+    mix.backward()
+    assert torch.allclose(mix, ref, rtol=1e-6)
+    for a, b in [(go, o.grad), (gw, w.grad), (gh, head.weight.grad)]:
+        assert torch.allclose(a, b, rtol=1e-5, atol=1e-8)
+    with torch.no_grad():                                # eval path takes the plain branch
+        assert torch.allclose(L.lm_mixture_loss(o, w, head, targets), ref, rtol=1e-6)
+
+
 def test_precision_loss_is_per_layer_only():
     mus = [torch.rand(2, 6, 4), torch.rand(2, 6, 4)]
     val = L.precision_loss(mus, 1e-3)
