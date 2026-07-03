@@ -147,6 +147,161 @@ def stage_boundaries(total_steps, fractions):
     return ends
 
 
+# --------------------------------------------------------------------------- health watchdog
+class HealthMonitor:
+    """Loud in-run alerts + an end-of-run report for the signals worth waking up for.
+
+    CRITICAL: NaN/inf loss or grad norm; repeated grad-norm spikes (sustained instability).
+    WARN: single grad-norm spike; LM loss rising over a sustained window; the §12 R^2 gate
+    still blocked long past the stage-1 boundary; halting collapse (E[J] ~ 0 in stage >= 3);
+    corr(pi, b) not positive while lambda_C ramps (§12 guard); throughput sag.
+
+    Main-process only, no collectives (rank-0's local view — safe by construction), and every
+    hook is exception-guarded by the caller: a monitor bug must never kill a 12-hour run.
+    Alerts print an unmissable banner and, when wandb is live, fire wandb.alert (email/Slack
+    per your wandb settings). The report goes to <run>/report.txt and the console.
+    """
+
+    SPIKE_FACTOR, SPIKE_FLOOR = 6.0, 15.0        # spike: > max(6x median, 15)
+    LM_WIN, LM_REF, LM_MARGIN = 25, 100, 0.15    # rising-loss window vs reference window
+
+    def __init__(self, say, wandb_on, total_steps, ends):
+        import collections
+        self.say, self.wandb_on = say, wandb_on
+        self.total_steps, self.ends = total_steps, ends
+        self.gnorms = collections.deque(maxlen=200)
+        self.lms = collections.deque(maxlen=self.LM_REF + self.LM_WIN)
+        self.tps = collections.deque(maxlen=50)
+        self.incidents = []                       # (step, level, message)
+        self.stage_log = []                       # (step, stage)
+        self.spike_steps = collections.deque(maxlen=10)
+        self.throttle = {}                        # kind -> last step warned
+        self.evals = []                           # (step, val_loss, pred_r2)
+        self.best_val = (float("inf"), None)
+        self.t_start = time.time()
+        self.start_step = None
+
+    def _alert(self, step, level, kind, msg, every=100):
+        if step - self.throttle.get(kind, -10**9) < every:
+            return
+        self.throttle[kind] = step
+        self.incidents.append((step, level, msg))
+        bar = "!" * 78
+        self.say(f"\n{bar}\n!!! {level} @ step {step}: {msg}\n{bar}")
+        if self.wandb_on:
+            try:
+                import wandb
+                if wandb.run is not None:
+                    wandb.alert(title=f"AUM {level}: {kind}", text=f"step {step}: {msg}")
+            except Exception:
+                pass
+
+    def on_step(self, step, metrics, tps):
+        if self.start_step is None:
+            self.start_step = step
+        loss = metrics.get("loss")
+        gn = metrics.get("grad_norm")
+        lm = metrics.get("parts", {}).get("lm")
+        if loss is not None and not math.isfinite(loss):
+            self._alert(step, "CRITICAL", "nan_loss", f"non-finite loss ({loss})", every=1)
+        if gn is not None:
+            if not math.isfinite(gn):
+                self._alert(step, "CRITICAL", "nan_grad", f"non-finite grad norm ({gn})",
+                            every=1)
+            elif len(self.gnorms) >= 50:
+                med = sorted(self.gnorms)[len(self.gnorms) // 2]
+                if gn > max(self.SPIKE_FACTOR * med, self.SPIKE_FLOOR):
+                    self.spike_steps.append(step)
+                    self._alert(step, "WARN", "grad_spike",
+                                f"grad-norm spike {gn:.1f} (recent median {med:.2f})",
+                                every=20)
+                    if len(self.spike_steps) >= 3 and step - self.spike_steps[-3] <= 50:
+                        self._alert(step, "CRITICAL", "grad_unstable",
+                                    f"3+ grad-norm spikes within 50 steps (latest {gn:.1f}) "
+                                    f"— sustained numerical instability")
+            if math.isfinite(gn):
+                self.gnorms.append(gn)
+        if lm is not None and math.isfinite(lm):
+            self.lms.append(lm)
+            if len(self.lms) == self.lms.maxlen:
+                recent = sum(list(self.lms)[-self.LM_WIN:]) / self.LM_WIN
+                ref = sum(list(self.lms)[:self.LM_REF]) / self.LM_REF
+                if recent > ref + self.LM_MARGIN:
+                    self._alert(step, "WARN", "lm_rising",
+                                f"LM loss rising: last-{self.LM_WIN} mean {recent:.3f} vs "
+                                f"prior-{self.LM_REF} mean {ref:.3f}")
+        stage = metrics.get("stage")
+        if stage is not None and stage >= 3:
+            ej = metrics.get("expected_J")
+            if ej is not None and ej < 0.05:
+                self._alert(step, "WARN", "halt_collapse",
+                            f"E[J] = {ej:.3f} — silence has (nearly) stopped firing under "
+                            f"the lambda_C ramp (§12 collapse guard)")
+            corr = metrics.get("corr_pi_b")
+            if corr is not None and corr < 0.05:
+                self._alert(step, "WARN", "corr_low",
+                            f"corr(pi, b) = {corr:.3f} — pressure is not tracking measured "
+                            f"benefit while lambda_C ramps (§12 guard)", every=200)
+        if tps and math.isfinite(tps):
+            if len(self.tps) >= 20:
+                med = sorted(self.tps)[len(self.tps) // 2]
+                if tps < 0.5 * med:
+                    self._alert(step, "WARN", "throughput",
+                                f"throughput sag: {tps / 1e3:.1f}k tok/s vs recent median "
+                                f"{med / 1e3:.1f}k (thermals / straggler rank?)")
+            self.tps.append(tps)
+
+    def on_eval(self, step, val_loss, pred_r2, stage):
+        self.evals.append((step, val_loss, pred_r2))
+        if val_loss < self.best_val[0]:
+            self.best_val = (val_loss, step)
+        if stage == 1 and self.ends and step >= self.ends[0] + 0.1 * self.total_steps:
+            self._alert(step, "WARN", "gate_stalled",
+                        f"still stage 1 at step {step} (boundary was {self.ends[0]}): "
+                        f"pred R^2 {pred_r2:.3f} has not cleared the §12 gate", every=250)
+
+    def on_stage(self, step, stage):
+        self.stage_log.append((step, int(stage)))
+
+    def report(self, run_dir, final_step, tokens_seen, final_stage):
+        hrs = (time.time() - self.t_start) / 3600
+        lines = ["=" * 78, "AUM-Ø TRAINING HEALTH REPORT", "=" * 78,
+                 f"steps {self.start_step or '?'}..{final_step} of {self.total_steps} | "
+                 f"{tokens_seen:,} tokens | {hrs:.2f} h wall | final stage {int(final_stage)}"]
+        if self.stage_log:
+            lines.append("stage transitions: "
+                         + ", ".join(f"->{s} @ step {t}" for t, s in self.stage_log))
+        else:
+            lines.append(f"stage transitions: NONE (boundary was step "
+                         f"{self.ends[0] if self.ends else '?'} — did the R^2 gate clear?)")
+        if self.evals:
+            v0, vN = self.evals[0], self.evals[-1]
+            pos = next((e for e in self.evals if e[2] > 0), None)
+            lines += [f"val loss: first {v0[1]:.4f} @ {v0[0]} | best {self.best_val[0]:.4f} "
+                      f"@ {self.best_val[1]} | final {vN[1]:.4f} @ {vN[0]}",
+                      f"pred R^2: first {v0[2]:.3f} | final {vN[2]:.3f} | first positive "
+                      + (f"@ step {pos[0]}" if pos else "NEVER")]
+        if self.gnorms:
+            gs = sorted(self.gnorms)
+            lines.append(f"grad norm (last {len(gs)} steps): median {gs[len(gs) // 2]:.2f} "
+                         f"p95 {gs[int(0.95 * (len(gs) - 1))]:.2f} max {gs[-1]:.2f}")
+        crit = [i for i in self.incidents if i[1] == "CRITICAL"]
+        warn = [i for i in self.incidents if i[1] == "WARN"]
+        lines.append(f"incidents: {len(crit)} CRITICAL, {len(warn)} WARN"
+                     + ("" if self.incidents else " — clean run"))
+        for step, level, msg in self.incidents[-30:]:
+            lines.append(f"  [{level}] step {step}: {msg}")
+        lines.append("=" * 78)
+        text = "\n".join(lines)
+        self.say(text)
+        try:
+            with open(os.path.join(run_dir, "report.txt"), "w") as f:
+                f.write(text + "\n")
+        except OSError:
+            pass
+        return text
+
+
 # --------------------------------------------------------------------------- eval
 @torch.no_grad()
 def evaluate(model, raw, cfg, val_iter, n_batches):
@@ -395,6 +550,10 @@ def main():
     pred_r2 = float("-inf")
     t0, tokens0 = time.time(), tokens_seen
     model.train()
+    # loud alerts + end-of-run report (rank 0 only; hooks are exception-guarded so a monitor
+    # bug can never kill the run)
+    health = HealthMonitor(say, args.wandb, total_steps, ends) \
+        if accelerator.is_main_process else None
 
     for step in range(start_step, total_steps):
         # §12 stage management on the token-budget boundaries; 1->2 additionally needs the R^2
@@ -404,12 +563,15 @@ def main():
                     and pressure_gate_clear(pred_r2, schedule):
                 trainer.maybe_advance_stage(pred_r2)
                 say(f"step {step}: stage -> {int(trainer.stage)} (R^2={pred_r2:.3f})")
+                health and health.on_stage(step, trainer.stage)
             elif trainer.stage == Stage.FORCED_REVISION and step >= ends[1]:
                 trainer.maybe_advance_stage(pred_r2)
                 say(f"step {step}: stage -> {int(trainer.stage)}")
+                health and health.on_stage(step, trainer.stage)
             elif trainer.stage == Stage.SOFT_HALTING and step >= ends[2]:
                 trainer.maybe_advance_stage(pred_r2)
                 say(f"step {step}: stage -> {int(trainer.stage)}")
+                health and health.on_stage(step, trainer.stage)
             if trainer.stage >= Stage.SOFT_HALTING:      # lambda_C ramp inside stage 3 (§12)
                 ramp = (step - ends[1]) / max(1, ends[2] - ends[1])
                 trainer.config.lambda_compute = args.lambda_compute_max * min(max(ramp, 0.0), 1.0)
@@ -431,6 +593,13 @@ def main():
                 torch.mps.empty_cache()                  # stop allocator-cache -> swap creep
             elif torch.cuda.is_available():
                 torch.cuda.empty_cache()
+        if health:
+            try:
+                dt_h = time.time() - t0
+                health.on_step(step + 1, step_metrics,
+                               (tokens_seen - tokens0) / dt_h if dt_h > 0 else None)
+            except Exception as e:
+                say(f"WARNING: health monitor error ({e}); continuing")
         bar.update(1)
         bar.set_postfix(loss=f"{step_metrics['loss']:.3f}", stage=int(trainer.stage),
                         lr=f"x{scale:.2f}", refresh=False)
@@ -475,6 +644,11 @@ def main():
                 val_loss, pred_r2 = float(vm[0]), float(vm[1])
             say(f"step {step + 1:>6}: val_loss {val_loss:.4f} "
                 f"pred_R^2 {pred_r2:.3f} (gate eta={schedule.eta_r2})")
+            if health:
+                try:
+                    health.on_eval(step + 1, val_loss, pred_r2, int(trainer.stage))
+                except Exception as e:
+                    say(f"WARNING: health monitor error ({e}); continuing")
             if accelerator.is_main_process:
                 with open(log_path, "a") as f:
                     json.dump({"step": step + 1, "val_loss": val_loss, "pred_r2": pred_r2}, f)
@@ -492,6 +666,11 @@ def main():
 
     bar.close()
     accelerator.print(f"done: {tokens_seen:,} tokens, final stage {int(trainer.stage)}")
+    if health:
+        try:
+            health.report(run_dir, total_steps, tokens_seen, trainer.stage)
+        except Exception as e:
+            accelerator.print(f"WARNING: health report failed ({e})")
     if args.wandb:
         accelerator.end_training()
 
