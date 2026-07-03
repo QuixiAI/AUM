@@ -457,8 +457,9 @@ def main():
                      "lr_scale": scale, "tokens": tokens_seen, "tokens_per_s": tps,
                      "stage": int(trainer.stage), "p_explore": p_explore,
                      "lambda_compute": trainer.config.lambda_compute,
-                     **({"train/benefit_mean": step_metrics["benefit_mean"]}
-                        if "benefit_mean" in step_metrics else {})},
+                     **{f"train/{k}": step_metrics[k]
+                        for k in ("benefit_mean", "expected_J", "corr_pi_b")
+                        if k in step_metrics}},
                     step=step + 1)
             t0, tokens0 = time.time(), tokens_seen
 

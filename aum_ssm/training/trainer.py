@@ -95,8 +95,17 @@ class AumTrainer:
         metrics = {"loss": float(total.detach()), "parts": used, "stage": int(self.stage)}
         if grad_norm is not None:                # present on sync micro-steps (the logged ones)
             metrics["grad_norm"] = float(grad_norm)
+        if aux is not None:
+            # E[J] directly, NOT via lambda_C*E[J] (train/compute) — lambda_C is 0 until the
+            # stage-3 ramp, and halting collapse is exactly what the ramp can cause (§12).
+            metrics["expected_J"] = float(aux.expected_J.detach().mean())
         if benefit is not None:
             metrics["benefit_mean"] = float(benefit.mean())
+            # the §12 guard: is integration pressure tracking measured counterfactual benefit?
+            pi_f = aux.pi[:, :-1].detach().float().reshape(-1)
+            b_f = benefit.float().reshape(-1)
+            if pi_f.numel() > 1 and float(pi_f.std()) > 0 and float(b_f.std()) > 0:
+                metrics["corr_pi_b"] = float(torch.corrcoef(torch.stack([pi_f, b_f]))[0, 1])
         return metrics, aux
 
     @torch.no_grad()
