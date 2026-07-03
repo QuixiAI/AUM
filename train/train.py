@@ -279,12 +279,16 @@ def main():
     from accelerate.utils import DistributedDataParallelKwargs, set_seed
     # find_unused_parameters: stage-gated heads (halting/consistency/pressure) have no grad
     # path in stage 1, and the active graph changes at stage boundaries — the DDP graph is
-    # not static.
+    # not static. broadcast_buffers=False: the only buffer (unfold.rope_freqs) is a fixed
+    # constant, and DDP's default per-forward buffer broadcast mutates it in place — which
+    # blows up stage>=2, where rollout_benefit runs a no-grad label forward BETWEEN the live
+    # forward and its backward ("variable needed for gradient computation has been modified
+    # by an inplace operation ... FloatTensor [32]").
     accelerator = Accelerator(gradient_accumulation_steps=args.grad_accum,
                               mixed_precision=args.mixed_precision,
                               log_with="wandb" if args.wandb else None,
                               kwargs_handlers=[DistributedDataParallelKwargs(
-                                  find_unused_parameters=True)])
+                                  find_unused_parameters=True, broadcast_buffers=False)])
     set_seed(args.seed)
 
     # ---- model

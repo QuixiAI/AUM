@@ -13,11 +13,20 @@ import torch
 import torch.nn.functional as F
 
 
-def per_token_ce(logits, input_ids):
-    """Per-position next-token cross-entropy (B, L-1), no reduction."""
+def per_token_ce(logits, input_ids, chunk=4096):
+    """Per-position next-token cross-entropy (B, L-1), no reduction.
+
+    Chunked over rows: a single F.cross_entropy call materializes the full fp32
+    (B*(L-1), V) log-softmax — 3 GiB at (4, 4096, 49152) — and the §11 label branches run
+    this up to three times per stage>=2 step, which OOMed 24GB cards the moment the R^2
+    gate cleared. Every call site passes detached / no-grad logits, but the chunked form
+    stays differentiable anyway."""
     B, L, V = logits.shape
-    ce = F.cross_entropy(logits[:, :-1].reshape(-1, V), input_ids[:, 1:].reshape(-1),
-                         reduction="none")
+    flat = logits[:, :-1].reshape(-1, V)
+    tgt = input_ids[:, 1:].reshape(-1)
+    ce = torch.cat([F.cross_entropy(flat[c0:c0 + chunk].float(), tgt[c0:c0 + chunk],
+                                    reduction="none")
+                    for c0 in range(0, flat.shape[0], chunk)])
     return ce.reshape(B, L - 1)
 
 

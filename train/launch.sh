@@ -9,11 +9,11 @@
 # appended flags OVERRIDE the script defaults below (argparse keeps the last occurrence).
 #
 # CUDA nodes: execs `accelerate launch --num_processes <all GPUs>` with bf16 and the §13 recipe
-# batch shape — 8 ranks x micro-batch 4 x grad-accum 4 x 4096 = 0.5M tokens/step. Micro-batch 4
-# runs at ~21.5GiB/24GiB and NEEDS the expandable-segments allocator (exported below): with the
-# default allocator, fragmentation that close to the ceiling collapses throughput 3x (measured
-# 28.7k vs 8.6k tok/s on the 8x3090 node). Override with NUM_GPUS / BATCH_SIZE / GRAD_ACCUM env
-# vars (e.g. NUM_GPUS=1 for a single-GPU run).
+# batch shape — 8 ranks x micro-batch 3 x grad-accum 5 x 4096 = 0.49M tokens/step (24.7k tok/s
+# measured on the 8x3090 node). Micro-batch 4 is ~16% faster in STAGE 1 but OOMs 24GB cards in
+# stage >= 2, where rollout_benefit's label branches add ~2GiB of forwards — do not raise the
+# default past 3 without re-testing `--eta-r2=-1e9` (forced stage advance) at that shape. The
+# expandable-segments allocator is exported for headroom either way.
 #
 # MPS (Mac) default batch shape: micro-batch 8 x grad-accum 2 = 65,536 tokens/step at seq 4096 —
 # sized for the 128GB machine (measured: batch 2 left system memory 84% free). If it OOMs or
@@ -32,8 +32,8 @@ WANDB_PROJECT="${WANDB_PROJECT:-aum-ssm}"
 if command -v nvidia-smi >/dev/null 2>&1 && [ -e /dev/nvidia0 ]; then
     CUDA=1
     NUM_GPUS="${NUM_GPUS:-$(nvidia-smi -L | wc -l)}"
-    BATCH_SIZE="${BATCH_SIZE:-4}"
-    GRAD_ACCUM="${GRAD_ACCUM:-4}"
+    BATCH_SIZE="${BATCH_SIZE:-3}"
+    GRAD_ACCUM="${GRAD_ACCUM:-5}"
     export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 else
     CUDA=0
