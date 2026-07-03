@@ -78,16 +78,23 @@ class AumTrainer:
         total, used = L.total_loss(parts, terms)
         # backward -> clip -> step -> zero_grad: zeroing AFTER the step keeps this correct under
         # gradient accumulation (zeroing first would wipe the accumulated grads on the sync step).
+        # clip_grad_norm_ returns the PRE-clip total norm — logged as the numerical-stability
+        # signal (spikes = instability; the 1.0 clip caps what the optimizer actually applies).
+        grad_norm = None
         if self.accelerator is not None:
             self.accelerator.backward(total)
             if self.accelerator.sync_gradients:
-                self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(),
+                                                             self.max_grad_norm)
         else:
             total.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(),
+                                                       self.max_grad_norm)
         self.opt.step()
         self.opt.zero_grad()
         metrics = {"loss": float(total.detach()), "parts": used, "stage": int(self.stage)}
+        if grad_norm is not None:                # present on sync micro-steps (the logged ones)
+            metrics["grad_norm"] = float(grad_norm)
         if benefit is not None:
             metrics["benefit_mean"] = float(benefit.mean())
         return metrics, aux

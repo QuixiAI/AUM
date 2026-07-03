@@ -439,9 +439,11 @@ def main():
             dt = time.time() - t0
             tps = (tokens_seen - tokens0) / max(dt, 1e-9)
             parts = " ".join(f"{k}={v:.4f}" for k, v in step_metrics["parts"].items())
+            gn = step_metrics.get("grad_norm")
             say(f"step {step + 1:>6}/{total_steps} stage {int(trainer.stage)} "
                 f"loss {step_metrics['loss']:.4f} [{parts}] "
-                f"lr x{scale:.3f} {tps / 1e3:.1f}k tok/s")
+                + (f"gnorm {gn:.2f} " if gn is not None else "")
+                + f"lr x{scale:.3f} {tps / 1e3:.1f}k tok/s")
             with open(log_path, "a") as f:
                 json.dump({"step": step + 1, "tokens": tokens_seen, "lr_scale": scale,
                            "p_explore": p_explore, **step_metrics}, f)
@@ -450,6 +452,8 @@ def main():
                 accelerator.log(
                     {"train/loss": step_metrics["loss"],
                      **{f"train/{k}": v for k, v in step_metrics["parts"].items()},
+                     **({"train/grad_norm": step_metrics["grad_norm"]}
+                        if "grad_norm" in step_metrics else {}),
                      "lr_scale": scale, "tokens": tokens_seen, "tokens_per_s": tps,
                      "stage": int(trainer.stage), "p_explore": p_explore,
                      "lambda_compute": trainer.config.lambda_compute,
