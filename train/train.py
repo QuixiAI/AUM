@@ -638,6 +638,7 @@ def main():
                      **{f"train/{k}": step_metrics[k]
                         for k in ("benefit_mean", "expected_J", "corr_pi_b",
                                   "pred_r2_train", "pi_mean", "pi_std", "dsigma",
+                                  "E_mean", "E_drop",
                                   "p0_mean", "p1_mean",
                                   "grad_norm_silence", "grad_norm_evidence")
                         if k in step_metrics}},

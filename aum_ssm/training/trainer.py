@@ -128,6 +128,14 @@ class AumTrainer:
             metrics["pi_std"] = float(pi.std())
             metrics["dsigma"] = float((aux.sigma_star - aux.sigma_traj[0])
                                       .detach().float().norm(dim=-1).mean())
+            # raw consistency energy E — the hinge (L_consistency) reads ~0 both when revision is
+            # working (E non-increasing) and when E is degenerate/unwired. The hinge alone can't
+            # tell those apart, so log the LEVEL (E_mean, confirms E is nonzero) and the DROP across
+            # silent steps (E(sigma^0) - E(sigma^{Jmax}); positive => revision is reducing tension,
+            # the actual revision-is-working signal the clamp_min(0) hinge hides).
+            E = aux.E_traj.detach().float()
+            metrics["E_mean"] = float(E.mean())
+            metrics["E_drop"] = float((E[..., 0] - E[..., -1]).mean())
             # p0/p1 directly — E[J] is a summary that hides WHICH sigmoid saturated. The
             # halting params get no gradient in stage 1, but their INPUTS drift under LM
             # training, so the frozen sigmoids can saturate (observed: p ~ 0.06 by step 240).
