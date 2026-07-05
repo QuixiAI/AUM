@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from train.syn import CORPUS_VERSION
+from train.syn import CORPUS_VERSION, MAX_ATTENTION_WINDOW_PLANNED
 from train.syn.alphabet import stable_seed
 from train.syn import gen_f1, gen_f2, gen_f3, gen_f4, gen_f5
 from train.syn.render import RenderRejected
@@ -22,9 +22,31 @@ DTYPE = np.uint16
 GENS = {"F1": gen_f1.generate, "F2": gen_f2.generate, "F3": gen_f3.generate,
         "F4": gen_f4.generate, "F5": gen_f5.generate}
 TRAIN_SHARES = {"F1": 0.30, "F2": 0.25, "F3": 0.28, "F4": 0.17}
-MAX_INSTANCES_PER_WINDOW = 32
-WINDOW_TASK_FRACTION_TARGET = (0.45, 0.60)
-WINDOW_TASK_FRACTION_QA = (0.35, 0.70)
+MAX_SYNTHETIC_INSTANCES_PER_WINDOW = 2
+MIN_TASK_FRACTION_BY_FAMILY = {
+    "F1": 0.25,
+    "F2": 0.25,
+    "F3": 0.25,
+    "F4": 0.25,
+    "F5": 0.25,
+}
+MIN_QUERIES_BY_FAMILY = {"F1": 4, "F2": 4, "F3": 2, "F4": 4}
+
+
+def _age_bin_bounds(age_bin: int) -> tuple[int, int]:
+    ratio = 3500 / 8
+    lo = int(8 * (ratio ** (age_bin / 10)))
+    hi = int(8 * (ratio ** ((age_bin + 1) / 10)))
+    return lo, 3500 if age_bin == 9 else hi
+
+
+def _gap_matches_age_bin(gap: dict) -> bool:
+    age_bin = gap.get("target_age_bin")
+    if age_bin is None:
+        return False
+    lo, hi = _age_bin_bounds(int(age_bin))
+    realized = int(gap.get("realized", -1))
+    return lo <= realized <= hi
 
 
 @dataclass
@@ -82,12 +104,22 @@ def log_uniform_len(rng, lo=256, hi=3968):
 
 
 def target_len_for_family(rng, family, age_bin):
-    if family == "F3":
+    if family == "F1":
+        if age_bin >= 8:
+            return rng.randint(2800, 3800)
         if age_bin >= 7:
-            return rng.randint(1500, 1800)
+            return rng.randint(1700, 2800)
+        if age_bin >= 5:
+            return rng.randint(1000, 1500)
+        return rng.randint(700, 1000)
+    if family == "F3":
+        if age_bin >= 8:
+            return rng.randint(2600, 3600)
+        if age_bin >= 7:
+            return rng.randint(1500, 2600)
         if age_bin >= 5:
             return rng.randint(900, 1200)
-        return rng.randint(320, 640)
+        return rng.randint(320, 720)
     if family == "F5":
         return rng.randint(160, 320)
     return rng.randint(256, 640)
@@ -108,6 +140,9 @@ def make_instance(alpha, registry, family, split, index, seed, target_len=None, 
     ids2 = alpha.tokenizer(text, add_special_tokens=False)["input_ids"]
     if ids2 != ids:
         raise RenderRejected(f"{family}: tokenize(instance_text) != emitted ids")
+    for gap in rec.get("controlled_gaps", []):
+        if not _gap_matches_age_bin(gap):
+            raise RenderRejected(f"{family}: controlled gap outside target age bin: {gap}")
     rec.update({
         "instance_id": f"{family.lower()}-s{index:09d}",
         "corpus_version": CORPUS_VERSION,
@@ -118,34 +153,24 @@ def make_instance(alpha, registry, family, split, index, seed, target_len=None, 
     return ids, rec
 
 
-def _next_family(targets, produced, allow_over_target=False):
-    families = [f for f, target in targets.items()
-                if allow_over_target or produced.get(f, 0) < target]
-    if not families:
-        return None
-    return min(families, key=lambda f: produced.get(f, 0) / max(1, targets[f]))
-
-
-def _fit_window(alpha, registry, split, targets, produced, counters, seed, seq_len=4096):
+def _fit_window(alpha, registry, split, family_queue, counters, seed, seq_len=4096):
     rng = random.Random(stable_seed("window", split, sum(counters.values()), seed))
     window = []
     records = []
     rejects = 0
-    local_produced = dict(produced)
-    task_tokens = 0
-    target_task_fraction = rng.uniform(*WINDOW_TASK_FRACTION_TARGET)
-    while len(records) < MAX_INSTANCES_PER_WINDOW:
-        if records and task_tokens / seq_len >= target_task_fraction:
+    for family in family_queue[:MAX_SYNTHETIC_INSTANCES_PER_WINDOW]:
+        if not family:
             break
         remaining = seq_len - len(window) - 1
         if remaining < 96:
             break
-        family = _next_family(targets, local_produced, allow_over_target=bool(records))
-        if family is None:
-            break
         idx = counters[family]
         age_bin = idx % 10
-        target = min(target_len_for_family(rng, family, age_bin), remaining)
+        target = target_len_for_family(rng, family, age_bin)
+        if target > remaining:
+            if records:
+                break
+            target = remaining
         for attempt in range(25):
             try:
                 ids, rec = make_instance(alpha, registry, family, split, idx + attempt, seed,
@@ -163,8 +188,6 @@ def _fit_window(alpha, registry, split, targets, produced, counters, seed, seq_l
         start = len(window)
         window.extend(ids)
         records.append((start, ids, rec))
-        task_tokens += int(rec.get("task_token_count", len(ids)))
-        local_produced[family] = local_produced.get(family, 0) + len(ids)
         if len(window) < seq_len:
             window.append(alpha.eos_id)
     if len(window) < seq_len:
@@ -193,7 +216,7 @@ def generate_split(alpha, registry, out_dir, split, targets, seed=1337,
             queue = _family_queue_for_targets(targets, produced)
             if not queue:
                 break
-            window, records, rejects = _fit_window(alpha, registry, split, targets, produced,
+            window, records, rejects = _fit_window(alpha, registry, split, queue[:2],
                                                   counters, seed, seq_len)
             rejected += rejects
             shard, window_index = writer.add_window(window)
@@ -235,14 +258,15 @@ def write_manifest(out_dir, tokenizer, vocab_size, eos_id, seq_len, split_result
         "packing_policy": {
             "unit": "fixed_window",
             "window_tokens": seq_len,
-            "max_synthetic_instances_per_window": MAX_INSTANCES_PER_WINDOW,
-            "window_background": "eos_padding",
-            "window_task_fraction_target": list(WINDOW_TASK_FRACTION_TARGET),
-            "window_task_fraction_qa": list(WINDOW_TASK_FRACTION_QA),
+            "max_synthetic_instances_per_window": MAX_SYNTHETIC_INSTANCES_PER_WINDOW,
+            "window_background": "eos_padding_for_standalone_dry_run",
+            "min_task_fraction_by_family": MIN_TASK_FRACTION_BY_FAMILY,
+            "min_queries_by_family": MIN_QUERIES_BY_FAMILY,
             "instance_boundary_mask": False,
             "eos_between_instances": True,
-            "note": "SYN shards are standalone synthetic windows; sidecar records identify task-bearing spans.",
+            "note": "Production SYN is web/code co-packed; standalone generator pads missing web stream with EOS.",
         },
+        "max_attention_window_planned": MAX_ATTENTION_WINDOW_PLANNED,
         "tokenizer_identity": tokenizer_identity,
         "splits": splits,
         "created_unix": int(time.time()),

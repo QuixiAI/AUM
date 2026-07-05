@@ -25,8 +25,20 @@ def iter_query_positions(records):
 
 
 def expand_active_rule_rle(record: dict):
+    """Compatibility shim for old v1.1 sidecars."""
     out = []
     for start, rule_id, length in record.get("active_rule_rle", []):
         out.extend([rule_id] * length)
     return out
 
+
+def expand_active_map_rle(record: dict):
+    out = []
+    for seg in record.get("active_map_rle", []):
+        length = int(seg["end"]) - int(seg["start"])
+        out.extend([seg.get("map", {})] * max(0, length))
+    return out
+
+
+def beyond_window(query: dict, attention_window: int) -> bool:
+    return int(query["minimal_sufficient_suffix_len"]) > int(attention_window)

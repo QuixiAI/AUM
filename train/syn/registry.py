@@ -32,8 +32,19 @@ def _perm(rng, n):
 
 
 def _f1_rule(rule_id, rng):
-    return Rule("F1", rule_id, rng.choice(["swap", "cycle", "mirror", "derange"]),
-                {"perm": _perm(rng, 8)})
+    changed_order = list(range(8))
+    rng.shuffle(changed_order)
+    return Rule(
+        "F1",
+        rule_id,
+        "transition",
+        {
+            "base_perm": _perm(rng, 8),
+            "changed_order": changed_order,
+            "delta3": _perm(rng, 3),
+            "delta8": _perm(rng, 8),
+        },
+    )
 
 
 def _f2_rule(rule_id, rng):
@@ -60,7 +71,7 @@ _BUILDERS = {"F1": _f1_rule, "F2": _f2_rule, "F3": _f3_rule, "F4": _f4_rule, "F5
 
 
 class Registry:
-    def __init__(self, seed: int = 1337, corpus_version: str = "syn-1b-v1.1"):
+    def __init__(self, seed: int = 1337, corpus_version: str = "syn-1b-v1.3"):
         self.seed = seed
         self.corpus_version = corpus_version
         self.rules = {}
@@ -80,4 +91,3 @@ class Registry:
         payload = {f: [asdict(r) for r in rs] for f, rs in self.rules.items()}
         raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(raw).hexdigest()
-

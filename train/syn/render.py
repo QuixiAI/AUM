@@ -15,6 +15,7 @@ class Renderer:
     text: str = ""
     spans: list[dict] = field(default_factory=list)
     filler_runs: list[tuple[int, int]] = field(default_factory=list)
+    controlled_gap_runs: list[tuple[int, int]] = field(default_factory=list)
     n_tokens: int = 0
 
     def add(self, word: str, label: dict | None = None):
@@ -36,10 +37,12 @@ class Renderer:
         for i, word in enumerate(self.alpha.variant_words(rng, name)):
             self.add(word, label_first if i == 0 else None)
 
-    def bg(self, rng, n: int):
+    def bg(self, rng, n: int, controlled: bool = False):
         words = self.alpha.bg_words(rng, n)
         if words:
             self.filler_runs.append((self.n_tokens, len(words)))
+            if controlled:
+                self.controlled_gap_runs.append((self.n_tokens, len(words)))
         for word in words:
             self.add(word)
 
@@ -83,12 +86,21 @@ class Renderer:
         if ids2 != ids:
             raise RenderRejected("tokenize(text) was not stable across calls")
         filler_tokens = sum(n for _, n in self.filler_runs)
+        controlled_gap_tokens = sum(n for _, n in self.controlled_gap_runs)
         task_tokens = len(ids) - filler_tokens
         record["label_positions"] = labels
         record["filler_rle"] = [[int(s), int(n)] for s, n in self.filler_runs if n > 0]
+        record["controlled_gap_rle"] = [
+            [int(s), int(n)] for s, n in self.controlled_gap_runs if n > 0
+        ]
         record["task_token_count"] = int(task_tokens)
         record["filler_token_count"] = int(filler_tokens)
+        record["controlled_gap_tokens"] = int(controlled_gap_tokens)
         record["task_fraction"] = float(task_tokens / max(1, len(ids)))
+        record["density_denominator"] = int(len(ids) - controlled_gap_tokens)
+        record["controlled_gap_adjusted_task_fraction"] = float(
+            task_tokens / max(1, len(ids) - controlled_gap_tokens)
+        )
         record["text_hash"] = __import__("hashlib").sha256(self.text.encode()).hexdigest()
         return ids, record, self.text
 

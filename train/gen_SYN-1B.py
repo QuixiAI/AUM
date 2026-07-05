@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Generate and inspect the SYN-1B v1.1 synthetic corpus."""
+"""Generate and inspect the SYN-1B v1.3 synthetic corpus."""
 
 from __future__ import annotations
 
@@ -130,7 +130,7 @@ def inspect_windows(out_dir, alpha, n, seq_len=4096):
                             f"{rec['family']}:{lab['role']}={lab['expected']}")
                     for q in rec.get("queries", []):
                         labels[base + q["answer_pos"] - 1].append(
-                            f"{rec['family']}:predicts={q.get('answer', q.get('correct_answer'))}")
+                            f"{rec['family']}:predicts={q['answer']}")
 
                 print("\n" + "=" * 100)
                 print(f"{split} window {shard['name']}:{window_index} labels={sum(len(v) for v in labels.values())}")
@@ -151,7 +151,7 @@ def inspect_windows(out_dir, alpha, n, seq_len=4096):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Generate SYN-1B v1.1 synthetic shards.")
+    ap = argparse.ArgumentParser(description="Generate SYN-1B v1.3 synthetic shards.")
     ap.add_argument("--out-dir", default=os.path.join("train", "data_syn"))
     ap.add_argument("--tokenizer", default=MODEL_TOKENIZER)
     ap.add_argument("--seq-len", type=int, default=4096)
