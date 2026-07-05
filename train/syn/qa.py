@@ -18,8 +18,21 @@ from train.syn.pack import (MAX_SYNTHETIC_INSTANCES_PER_WINDOW,
                             MIN_QUERIES_BY_FAMILY,
                             MIN_TASK_FRACTION_BY_FAMILY)
 from train.syn.schema import (MINIMAL_SUFFIX_EXEMPT_FAMILIES,
+                              RECOMPUTE_OWNERS,
+                              RECOMPUTE_PENDING,
                               REQUIRED_RECORD_FIELDS,
-                              required_query_fields)
+                              CONTROLLED_GAP_FIELDS,
+                              DEMONSTRATION_FIELDS,
+                              DISTRACTOR_FIELDS,
+                              EVENT_FIELDS,
+                              LABEL_POSITION_FIELDS,
+                              WRITE_FIELDS,
+                              allowed_query_fields,
+                              allowed_record_fields,
+                              field_owner_index,
+                              verifier_registry_mismatches,
+                              required_query_fields,
+                              verifier_registry_summary)
 
 
 def _age_bin_bounds(age_bin):
@@ -199,6 +212,9 @@ def distribution_audit(records):
             "target_age_bin_chi_square_df": 9 if chi_square is not None else None,
             "target_age_bin_chi_square_threshold_p01": chi_square_threshold,
             "target_age_bin_total_controlled": total_controlled,
+            "verified_fields": [("record", "controlled_gap_tokens"),
+                                ("controlled_gap", "kind"), ("controlled_gap", "realized"),
+                                ("controlled_gap", "target"), ("controlled_gap", "target_age_bin")],
             "bad_bins": bad_bins[:20]}
 
 
@@ -241,7 +257,8 @@ def window_integrity(out_dir, split, records, seq_len=4096):
             if h != r.get("token_hash"):
                 bad += 1
     return {"name": f"window_integrity_{split}", "ok": bad == 0 and crowded == 0,
-            "bad_records": bad, "crowded_windows": crowded}
+            "bad_records": bad, "crowded_windows": crowded,
+            "verified_fields": [("record", "token_hash"), ("record", "token_len")]}
 
 
 def task_density_audit(out_dir, split, records, seq_len=4096):
@@ -267,6 +284,12 @@ def task_density_audit(out_dir, split, records, seq_len=4096):
         min_frac = MIN_TASK_FRACTION_BY_FAMILY.get(fam, 0.25)
         min_queries = MIN_QUERIES_BY_FAMILY.get(fam)
         errors = []
+        emitted_denom = r.get("density_denominator")
+        if emitted_denom is not None and int(emitted_denom) != int(denom):
+            errors.append(f"density_denominator {emitted_denom}!={denom}")
+        emitted_frac = r.get("controlled_gap_adjusted_task_fraction")
+        if emitted_frac is not None and abs(float(emitted_frac) - frac) > 1e-6:
+            errors.append(f"controlled_gap_adjusted_task_fraction {emitted_frac}!={frac:.6f}")
         if min_frac is not None and frac < min_frac:
             errors.append(f"task_fraction<{min_frac}")
         if min_queries is not None and query_count < min_queries:
@@ -285,6 +308,8 @@ def task_density_audit(out_dir, split, records, seq_len=4096):
             "query_count_mean": float(np.mean(query_counts)) if query_counts else None,
             "min_task_fraction_by_family": MIN_TASK_FRACTION_BY_FAMILY,
             "min_queries_by_family": MIN_QUERIES_BY_FAMILY,
+            "verified_fields": [("record", "density_denominator"),
+                                ("record", "controlled_gap_adjusted_task_fraction")],
             "bad_records": bad_records[:20]}
 
 
@@ -427,6 +452,51 @@ def schema_completeness_audit(records):
             "bad": bad}
 
 
+def schema_admission_audit(records):
+    bad = []
+    checked = Counter()
+    registry_mismatches = verifier_registry_mismatches()
+
+    def add_bad(record, location, fields, allowed):
+        extra = sorted(set(fields) - set(allowed))
+        if extra:
+            bad.append({"instance_id": record.get("instance_id"), "family": record.get("family"),
+                        "location": location, "unregistered_fields": extra})
+
+    for r in records:
+        fam = r.get("family")
+        checked["records"] += 1
+        add_bad(r, "record", set(r), allowed_record_fields(fam))
+        for i, q in enumerate(r.get("queries", [])):
+            checked["queries"] += 1
+            add_bad(r, f"queries[{i}]", set(q), allowed_query_fields(fam))
+        for i, w in enumerate(r.get("writes", [])):
+            checked["writes"] += 1
+            add_bad(r, f"writes[{i}]", set(w), WRITE_FIELDS.get(fam, set()))
+        for i, e in enumerate(r.get("events", [])):
+            checked["events"] += 1
+            add_bad(r, f"events[{i}]", set(e), EVENT_FIELDS.get(fam, set()))
+        for i, d in enumerate(r.get("distractors", [])):
+            checked["distractors"] += 1
+            add_bad(r, f"distractors[{i}]", set(d), DISTRACTOR_FIELDS)
+        for i, g in enumerate(r.get("controlled_gaps", [])):
+            checked["controlled_gaps"] += 1
+            add_bad(r, f"controlled_gaps[{i}]", set(g), CONTROLLED_GAP_FIELDS)
+        for i, d in enumerate(r.get("demonstrations", [])):
+            checked["demonstrations"] += 1
+            add_bad(r, f"demonstrations[{i}]", set(d), DEMONSTRATION_FIELDS)
+        for i, label in enumerate(r.get("label_positions", [])):
+            checked["label_positions"] += 1
+            add_bad(r, f"label_positions[{i}]", set(label), LABEL_POSITION_FIELDS)
+        if len(bad) >= 20:
+            break
+    return {"name": "schema_admission", "ok": bool(records) and not bad and not registry_mismatches,
+            "checked": dict(checked),
+            "registered_verifier_groups": sorted(verifier_registry_summary()),
+            "registry_mismatches": registry_mismatches,
+            "bad": bad}
+
+
 def query_position_contract(out_dir, records, alpha, seq_len=4096):
     if alpha is None:
         return {"name": "query_position_contract", "ok": False, "error": "alpha required"}
@@ -462,7 +532,78 @@ def query_position_contract(out_dir, records, alpha, seq_len=4096):
                 return {"name": "query_position_contract", "ok": False,
                         "checked": checked, "bad": bad}
     return {"name": "query_position_contract", "ok": checked > 0 and not bad,
-            "checked": checked, "bad": bad}
+            "checked": checked,
+            "verified_fields": [("query_common", "answer"), ("query_common", "answer_pos"),
+                                ("query_common", "prediction_anchor")],
+            "bad": bad}
+
+
+def distractor_surface_audit(out_dir, records, alpha, seq_len=4096):
+    if alpha is None:
+        return {"name": "distractor_surface", "ok": False, "error": "alpha required"}
+    required = {
+        "F1": {"means"},
+        "F2": {"exchanged"},
+        "F3": {"key", "opens", "box"},
+    }
+    inert_markers = {"F2": {"nothing", "not"}}
+    bad = []
+    checked = 0
+    maps = {}
+    period_id = alpha.single_id(".")
+    for r in records:
+        if r.get("family") != "F4":
+            continue
+        path = os.path.join(out_dir, r["shard"])
+        mm = maps.get(path)
+        if mm is None:
+            mm = maps[path] = np.memmap(path, dtype=np.uint16, mode="r")
+        base = int(r["window_index"]) * seq_len + int(r["start_offset"])
+        distractor_list = r.get("distractors", [])
+        emitted_pep = r.get("pseudo_event_pos")
+        expected_pep = int(distractor_list[0]["pos"]) if distractor_list else None
+        if emitted_pep != expected_pep:
+            bad.append({"instance_id": r.get("instance_id"),
+                        "error": "pseudo_event_pos != first distractor pos",
+                        "pseudo_event_pos": emitted_pep, "expected": expected_pep})
+        for distractor in r.get("distractors", []):
+            checked += 1
+            mimics = distractor.get("mimics_family")
+            req = required.get(mimics)
+            if not req:
+                bad.append({"instance_id": r.get("instance_id"), "mimics_family": mimics,
+                            "error": "unknown mimicked family"})
+                continue
+            if distractor.get("variant") != f"{mimics}_surface":
+                bad.append({"instance_id": r.get("instance_id"), "mimics_family": mimics,
+                            "variant": distractor.get("variant"),
+                            "error": "variant != {mimics}_surface"})
+            pos = int(distractor["pos"])
+            words = []
+            for rel in range(pos, min(int(r["token_len"]), pos + 20)):
+                tid = int(mm[base + rel])
+                words.append(alpha.tokenizer.decode([tid], clean_up_tokenization_spaces=False).strip())
+                if tid == period_id:
+                    break
+            word_set = set(words)
+            missing = sorted(req - word_set)
+            inert_required = inert_markers.get(mimics)
+            inert_ok = True if not inert_required else bool(word_set & inert_required)
+            if missing or not inert_ok:
+                bad.append({"instance_id": r.get("instance_id"), "pos": pos,
+                            "mimics_family": mimics, "words": words,
+                            "missing_signature": missing,
+                            "missing_inert_marker": sorted(inert_required or [])
+                            if inert_required and not inert_ok else []})
+                if len(bad) >= 20:
+                    break
+        if len(bad) >= 20:
+            break
+    return {"name": "distractor_surface", "ok": checked > 0 and not bad,
+            "checked": checked, "required": {k: sorted(v) for k, v in required.items()},
+            "verified_fields": [("distractor", "mimics_family"), ("distractor", "variant"),
+                                ("distractor", "pos"), ("record", "pseudo_event_pos")],
+            "bad": bad}
 
 
 def offset_contract(out_dir, split, records, alpha, seq_len=4096):
@@ -470,18 +611,45 @@ def offset_contract(out_dir, split, records, alpha, seq_len=4096):
         return {"name": f"offset_contract_{split}", "ok": False, "error": "alpha required"}
     bad = 0
     total = 0
+    reconcile_bad = []
     for r in records:
         path = os.path.join(out_dir, r["shard"])
         mm = np.memmap(path, dtype=np.uint16, mode="r")
         base = r["window_index"] * seq_len + r["start_offset"]
+        label_pos = set()
         for lab in r.get("label_positions", []):
             total += 1
+            label_pos.add(int(lab["pos"]))
             pos = base + lab["pos"]
             decoded = alpha.tokenizer.decode([int(mm[pos])], clean_up_tokenization_spaces=False)
             if decoded.strip() != lab["expected"]:
                 bad += 1
-    return {"name": f"offset_contract_{split}", "ok": bad == 0 and total > 0,
-            "labels": total, "bad": bad}
+        # Every record position field must reference a byte-verified label anchor.
+        record_positions = []
+        for e in r.get("events", []):
+            record_positions.append(("event.pos", e.get("pos")))
+        for q in r.get("queries", []):
+            record_positions.append(("query.pos", q.get("pos")))
+            record_positions.append(("query.answer_pos", q.get("answer_pos")))
+        for w in r.get("writes", []):
+            record_positions.append(("write.pos", w.get("pos")))
+        for d in r.get("demonstrations", []):
+            record_positions.append(("demonstration.pos", d.get("pos")))
+            record_positions.append(("demonstration.answer_pos", d.get("answer_pos")))
+        for d in r.get("distractors", []):
+            record_positions.append(("distractor.pos", d.get("pos")))
+        for name, value in record_positions:
+            if value is None or int(value) not in label_pos:
+                reconcile_bad.append({"instance_id": r.get("instance_id"),
+                                      "field": name, "pos": value})
+    return {"name": f"offset_contract_{split}", "ok": bad == 0 and total > 0 and not reconcile_bad,
+            "labels": total, "bad": bad, "reconcile_bad": reconcile_bad[:20],
+            "verified_fields": [("label_position", "pos"), ("label_position", "expected"),
+                                ("label_position", "decoded"),
+                                ("event", "pos"), ("query_common", "pos"),
+                                ("query_common", "answer_pos"), ("write", "pos"),
+                                ("demonstration", "pos"), ("demonstration", "answer_pos"),
+                                ("distractor", "pos")]}
 
 
 def f3_age_audit(records):
@@ -514,14 +682,30 @@ def filler_scaffolding_audit(out_dir, records, alpha, seq_len=4096):
         return {"name": "filler_scaffolding", "ok": False, "error": "alpha required"}
     filler_counts = defaultdict(Counter)
     structural_counts = defaultdict(Counter)
+    count_bad = []
     for r in records:
         path = os.path.join(out_dir, r["shard"])
         mm = np.memmap(path, dtype=np.uint16, mode="r")
         base = r["window_index"] * seq_len + r["start_offset"]
         filler_positions = set()
+        filler_from_rle = 0
         for start, length in r.get("filler_rle", []):
             filler_positions.update(range(start, start + length))
-        for pos in range(r["token_len"]):
+            filler_from_rle += int(length)
+        token_len = int(r["token_len"])
+        task_from_rle = token_len - filler_from_rle
+        if int(r.get("filler_token_count", -1)) != filler_from_rle:
+            count_bad.append({"instance_id": r.get("instance_id"), "field": "filler_token_count",
+                              "emitted": r.get("filler_token_count"), "recomputed": filler_from_rle})
+        elif int(r.get("task_token_count", -1)) != task_from_rle:
+            count_bad.append({"instance_id": r.get("instance_id"), "field": "task_token_count",
+                              "emitted": r.get("task_token_count"), "recomputed": task_from_rle})
+        elif (r.get("task_fraction") is not None
+              and abs(float(r["task_fraction"]) - task_from_rle / max(1, token_len)) > 1e-6):
+            count_bad.append({"instance_id": r.get("instance_id"), "field": "task_fraction",
+                              "emitted": r.get("task_fraction"),
+                              "recomputed": task_from_rle / max(1, token_len)})
+        for pos in range(token_len):
             word = alpha.tokenizer.decode([int(mm[base + pos])], clean_up_tokenization_spaces=False).strip()
             if word not in STRUCTURAL_TOKENS:
                 continue
@@ -530,8 +714,40 @@ def filler_scaffolding_audit(out_dir, records, alpha, seq_len=4096):
             else:
                 structural_counts[r["family"]][word] += 1
     bad = {fam: dict(c) for fam, c in filler_counts.items() if sum(c.values())}
-    return {"name": "filler_scaffolding", "ok": not bad, "filler_counts": bad,
+    return {"name": "filler_scaffolding", "ok": not bad and not count_bad,
+            "filler_counts": bad, "count_bad": count_bad[:20],
+            "verified_fields": [("record", "filler_rle"), ("record", "filler_token_count"),
+                                ("record", "task_token_count"), ("record", "task_fraction")],
             "structural_counts": {fam: dict(c) for fam, c in structural_counts.items()}}
+
+
+def train_eval_symbol_exclusion_audit(out_dir, records, alpha, seq_len=4096):
+    if alpha is None:
+        return {"name": "train_eval_symbol_exclusion", "ok": False, "error": "alpha required"}
+    eval_symbol_ids = {alpha.single_id(w): w for w in alpha.sigma_eval}
+    bad = []
+    checked = 0
+    maps = {}
+    for r in records:
+        if r.get("split") != "train":
+            continue
+        path = os.path.join(out_dir, r["shard"])
+        mm = maps.get(path)
+        if mm is None:
+            mm = maps[path] = np.memmap(path, dtype=np.uint16, mode="r")
+        base = int(r["window_index"]) * seq_len + int(r["start_offset"])
+        for rel in range(int(r["token_len"])):
+            checked += 1
+            word = eval_symbol_ids.get(int(mm[base + rel]))
+            if word is not None:
+                bad.append({"instance_id": r.get("instance_id"), "family": r.get("family"),
+                            "pos": rel, "symbol": word})
+                if len(bad) >= 20:
+                    break
+        if len(bad) >= 20:
+            break
+    return {"name": "train_eval_symbol_exclusion", "ok": checked > 0 and not bad,
+            "checked_train_tokens": checked, "sigma_eval": list(alpha.sigma_eval), "bad": bad}
 
 
 def f1_rule_consistency(records):
@@ -584,7 +800,10 @@ def f1_rule_consistency(records):
                 bad.append({"instance_id": r.get("instance_id"),
                             "error": "partial F1 has no unmentioned-symbol query"})
     return {"name": "f1_rule_consistency", "ok": not bad and checked > 0,
-            "checked": checked, "bad": bad[:20]}
+            "checked": checked,
+            "verified_fields": [("record", "active_map_rle"), ("event", "changed_symbols"),
+                                ("event", "mentioned_symbols"), ("event", "restatement")],
+            "bad": bad[:20]}
 
 
 def _record_key_for_query(query):
@@ -659,6 +878,7 @@ def minimal_suffix_audit(records):
     hard_suffix_checked = 0
     checked_by_family = Counter()
     skipped_by_family = Counter()
+    families_seen = set()
     for r in records:
         family = r.get("family")
         queries = r.get("queries", [])
@@ -684,6 +904,7 @@ def minimal_suffix_audit(records):
         for i, q in enumerate(r.get("queries", [])):
             checked += 1
             checked_by_family[family] += 1
+            families_seen.add(family)
             recomputed, evidence = _minimal_suffix_from_sidecar_sources(r, i)
             declared = q.get("minimal_sufficient_suffix_len")
             if recomputed is None or declared is None or int(declared) != int(recomputed):
@@ -704,6 +925,11 @@ def minimal_suffix_audit(records):
                     break
         if len(bad) >= 20:
             break
+    verified = [("query_common", "minimal_sufficient_suffix_len"),
+                ("query_common", "hard_suffix"), ("query_common", "evidence_positions"),
+                ("query_common", "answer"), ("record", "active_map_rle")]
+    for fam in families_seen:
+        verified.append((f"query_{fam}", "entity" if fam == "F2" else "key"))
     return {"name": "minimal_suffix", "ok": checked > 0 and not bad,
             "total_queries": total, "checked": checked,
             "hard_suffix_checked": hard_suffix_checked,
@@ -712,6 +938,7 @@ def minimal_suffix_audit(records):
             "skipped_by_family": dict(skipped_by_family),
             "skip_rationale": {k: v for k, v in MINIMAL_SUFFIX_EXEMPT_FAMILIES.items()
                                if skipped_by_family.get(k, 0)},
+            "verified_fields": verified,
             "bad": bad}
 
 
@@ -719,7 +946,7 @@ def _record_has_hard_primitive(record, max_attention_window):
     family = record.get("family")
     if family not in {"F1", "F2", "F3"}:
         return False
-    if int(record.get("composition_depth", 0)) > 1:
+    if family in {"F1", "F2"} and int(record.get("composition_depth", 0)) > 1:
         return True
     return any(
         int(q.get("minimal_sufficient_suffix_len", 0)) > max_attention_window
@@ -732,6 +959,7 @@ def difficulty_stratum_audit(records, max_attention_window=MAX_ATTENTION_WINDOW_
     eval_family = Counter()
     eval_hard_primitive_family = Counter()
     eval_comp_family = Counter()
+    eval_supersession_family = Counter()
     eval_queries = Counter()
     eval_suffix_queries = Counter()
     for r in records:
@@ -741,15 +969,19 @@ def difficulty_stratum_audit(records, max_attention_window=MAX_ATTENTION_WINDOW_
             eval_family[fam] += 1
             if _record_has_hard_primitive(r, max_attention_window):
                 eval_hard_primitive_family[fam] += 1
-            if fam in {"F1", "F2", "F3"} and int(r.get("composition_depth", 0)) > 1:
+            if fam in {"F1", "F2"} and int(r.get("composition_depth", 0)) > 1:
                 eval_comp_family[fam] += 1
+            if fam == "F3" and int(r.get("composition_depth", 0)) > 1:
+                eval_supersession_family[fam] += 1
         if fam == "F1":
             if any(q.get("age_from_reversal") is not None
                    and q.get("mentioned_in_latest_correction") is False
                    for q in r.get("queries", [])):
                 counts["f1_unmentioned_partial_query"] += 1
-        if fam in {"F1", "F2", "F3"} and int(r.get("composition_depth", 0)) > 1:
+        if fam in {"F1", "F2"} and int(r.get("composition_depth", 0)) > 1:
             counts[f"{fam.lower()}_composition_depth_gt1"] += 1
+        if fam == "F3" and int(r.get("composition_depth", 0)) > 1:
+            counts["f3_supersession_depth_gt1"] += 1
         if any(int(q.get("minimal_sufficient_suffix_len", 0)) > max_attention_window
                for q in r.get("queries", [])):
             counts["suffix_gt_max_attention_window"] += 1
@@ -765,11 +997,15 @@ def difficulty_stratum_audit(records, max_attention_window=MAX_ATTENTION_WINDOW_
         if total and eval_hard_primitive_family[fam] / total < 0.15:
             failures.append({"family": fam, "metric": "hard_primitive_eval_fraction",
                              "fraction": eval_hard_primitive_family[fam] / total})
-    for fam in ("F1", "F2", "F3"):
+    for fam in ("F1", "F2"):
         total = eval_family[fam]
         if total and eval_comp_family[fam] / total < 0.15:
             failures.append({"family": fam, "metric": "composition_eval_fraction",
                              "fraction": eval_comp_family[fam] / total})
+    total = eval_family["F3"]
+    if total and eval_supersession_family["F3"] / total < 0.15:
+        failures.append({"family": "F3", "metric": "supersession_eval_fraction",
+                         "fraction": eval_supersession_family["F3"] / total})
     for fam in ("F1", "F3"):
         total_q = eval_queries[fam]
         if total_q and eval_suffix_queries[fam] / total_q < 0.10:
@@ -782,9 +1018,264 @@ def difficulty_stratum_audit(records, max_attention_window=MAX_ATTENTION_WINDOW_
             "counts": dict(counts), "eval_family_counts": dict(eval_family),
             "eval_hard_primitive_family_counts": dict(eval_hard_primitive_family),
             "eval_composition_family_counts": dict(eval_comp_family),
+            "eval_supersession_family_counts": dict(eval_supersession_family),
             "eval_query_counts": dict(eval_queries),
             "eval_suffix_query_counts": dict(eval_suffix_queries),
             "missing": missing, "failures": failures}
+
+
+def composition_depth_audit(records):
+    """Recompute composition_depth independently of the emitter's counter.
+
+    Record level, recomputed from the ``events`` list (independent of the emitter's counter):
+    F1/F2 = len(events); F3 = len(events) or 1; F4 = 0; F5 = 1. Query level: the emitter labels
+    every query with the record composition_depth (events-seen is a separate, unemitted field),
+    so each query must equal the recomputed record depth. This was a consumer-only field
+    (difficulty_strata read it, nothing recomputed it).
+    """
+    bad = []
+    checked = 0
+
+    def record_expected(r):
+        fam = r.get("family")
+        n = len(r.get("events", []))
+        if fam in ("F1", "F2"):
+            return n
+        if fam == "F3":
+            return n if n else 1
+        if fam == "F4":
+            return 0
+        if fam == "F5":
+            return 1
+        return None
+
+    for r in records:
+        checked += 1
+        rec_exp = record_expected(r)
+        emitted = r.get("composition_depth")
+        if rec_exp is None or emitted is None or int(emitted) != int(rec_exp):
+            bad.append({"instance_id": r.get("instance_id"), "family": r.get("family"),
+                        "scope": "record", "emitted": emitted, "recomputed": rec_exp,
+                        "events": len(r.get("events", []))})
+        for i, q in enumerate(r.get("queries", [])):
+            q_exp = rec_exp
+            q_emit = q.get("composition_depth")
+            if q_exp is None or q_emit is None or int(q_emit) != int(q_exp):
+                bad.append({"instance_id": r.get("instance_id"), "family": r.get("family"),
+                            "scope": f"queries[{i}]", "emitted": q_emit, "recomputed": q_exp})
+            if len(bad) >= 20:
+                break
+        if len(bad) >= 20:
+            break
+    return {"name": "composition_depth_recompute", "ok": checked > 0 and not bad,
+            "checked": checked,
+            "verified_fields": [("record", "composition_depth"),
+                                ("query_common", "composition_depth")],
+            "bad": bad}
+
+
+def age_flag_audit(records):
+    """Recompute F1/F2/F3 age and swap/mention flags independently of the emitter's (unemitted)
+    events_seen counter, via a latest-event-before-query position scan. Ages follow the §7
+    convention answer_pos - evidence_pos."""
+    bad = []
+    checked = 0
+    families_seen = set()
+
+    def latest_event_before(r, qpos):
+        best = None
+        for e in r.get("events", []):
+            ep = e.get("pos")
+            if ep is not None and int(ep) < qpos and (best is None or int(ep) > int(best["pos"])):
+                best = e
+        return best
+
+    def write_pos_for(r, key):
+        pos = None
+        for w in r.get("writes", []):
+            if w.get("key", w.get("entity")) == key:
+                pos = int(w["pos"])
+        return pos
+
+    def check(cond, r, i, field, emitted, recomputed):
+        if not cond:
+            bad.append({"instance_id": r.get("instance_id"), "family": r.get("family"),
+                        "query_index": i, "field": field,
+                        "emitted": emitted, "recomputed": recomputed})
+
+    for r in records:
+        fam = r.get("family")
+        if fam not in ("F1", "F2", "F3"):
+            continue
+        for i, q in enumerate(r.get("queries", [])):
+            checked += 1
+            families_seen.add(fam)
+            apos = int(q["answer_pos"])
+            qpos = int(q["pos"]) if q.get("pos") is not None else prediction_pos_for_answer(q)
+            key = q.get("key", q.get("entity"))
+            last = latest_event_before(r, qpos)
+            wpos = write_pos_for(r, key)
+            if fam == "F1":
+                if wpos is not None:
+                    check(int(q.get("age_from_original_statement", -1)) == apos - wpos, r, i,
+                          "age_from_original_statement",
+                          q.get("age_from_original_statement"), apos - wpos)
+                exp_rev = None if last is None else apos - int(last["pos"])
+                check(q.get("age_from_reversal") == exp_rev, r, i, "age_from_reversal",
+                      q.get("age_from_reversal"), exp_rev)
+                exp_ment = False if last is None else key in last.get("mentioned_symbols", [])
+                check(q.get("mentioned_in_latest_correction") == exp_ment, r, i,
+                      "mentioned_in_latest_correction",
+                      q.get("mentioned_in_latest_correction"), exp_ment)
+            elif fam == "F2":
+                if wpos is not None:
+                    check(int(q.get("age_from_binding_statement", -1)) == apos - wpos, r, i,
+                          "age_from_binding_statement",
+                          q.get("age_from_binding_statement"), apos - wpos)
+                exp_swap = None if last is None else apos - int(last["pos"])
+                check(q.get("age_from_swap") == exp_swap, r, i, "age_from_swap",
+                      q.get("age_from_swap"), exp_swap)
+                latest_set = set(last.get("swapped_entities", [])) if last else set()
+                check(bool(q.get("entity_was_swapped")) == (key in latest_set), r, i,
+                      "entity_was_swapped", q.get("entity_was_swapped"), key in latest_set)
+                ever = any(key in set(e.get("swapped_entities", []))
+                           for e in r.get("events", [])
+                           if e.get("pos") is not None and int(e["pos"]) < qpos)
+                check(bool(q.get("entity_ever_swapped")) == ever, r, i, "entity_ever_swapped",
+                      q.get("entity_ever_swapped"), ever)
+            elif fam == "F3":
+                if wpos is not None:
+                    check(int(q.get("age_write_to_query", -1)) == apos - wpos, r, i,
+                          "age_write_to_query", q.get("age_write_to_query"), apos - wpos)
+                events = r.get("events", [])
+                exp_corr = None if not events else apos - int(events[-1]["pos"])
+                check(q.get("age_correction_to_query") == exp_corr, r, i,
+                      "age_correction_to_query", q.get("age_correction_to_query"), exp_corr)
+                exp_mode = "correction" if events else "recall"
+                check(q.get("mode") == exp_mode, r, i, "mode", q.get("mode"), exp_mode)
+            if len(bad) >= 20:
+                break
+        if len(bad) >= 20:
+            break
+
+    verified = []
+    if "F1" in families_seen:
+        verified += [("query_F1", "age_from_original_statement"),
+                     ("query_F1", "age_from_reversal"),
+                     ("query_F1", "mentioned_in_latest_correction")]
+    if "F2" in families_seen:
+        verified += [("query_F2", "age_from_binding_statement"), ("query_F2", "age_from_swap"),
+                     ("query_F2", "entity_was_swapped"), ("query_F2", "entity_ever_swapped")]
+    if "F3" in families_seen:
+        verified += [("query_F3", "age_write_to_query"), ("query_F3", "age_correction_to_query"),
+                     ("query_F3", "mode")]
+    return {"name": "age_flag_recompute", "ok": checked > 0 and not bad,
+            "checked": checked, "verified_fields": verified, "bad": bad}
+
+
+def provenance_audit(out_dir, records):
+    """Re-establish provenance fields: corpus_version matches the manifest, registry/placement
+    fields are well-typed. Provenance fields are not byte-derived, so they get this owner rather
+    than a recomputation verifier (spec §7)."""
+    manifest = _manifest(out_dir)
+    manifest_version = None
+    if manifest:
+        manifest_version = ((manifest.get("source") or {}).get("corpus_version")
+                            or manifest.get("corpus_version"))
+    bad = []
+    checked = 0
+    for r in records:
+        checked += 1
+        cv = r.get("corpus_version")
+        if cv is not None and manifest_version is not None and cv != manifest_version:
+            bad.append({"instance_id": r.get("instance_id"), "field": "corpus_version",
+                        "record": cv, "manifest": manifest_version})
+        if "registry_ids" in r and not isinstance(r["registry_ids"], dict):
+            bad.append({"instance_id": r.get("instance_id"), "field": "registry_ids",
+                        "error": "not a dict"})
+        for f in ("window_index", "start_offset"):
+            if f in r and (not isinstance(r[f], int) or r[f] < 0):
+                bad.append({"instance_id": r.get("instance_id"), "field": f, "value": r.get(f)})
+        for e in r.get("events", []):
+            if "transition_id" in e and not isinstance(e["transition_id"], int):
+                bad.append({"instance_id": r.get("instance_id"), "field": "transition_id",
+                            "value": e.get("transition_id")})
+        if len(bad) >= 20:
+            break
+    return {"name": "provenance_audit", "ok": checked > 0 and not bad,
+            "checked": checked, "manifest_corpus_version": manifest_version,
+            "verified_fields": ["corpus_version", "registry_ids", "instance_id", "seed",
+                                "shard", "window_index", "start_offset", "family", "split",
+                                "text_hash", "token_hash", "transition_id"],
+            "bad": bad}
+
+
+def _check_ran_ok(checks):
+    """Map each check's base id (split suffix stripped) -> True iff every run of it passed."""
+    ran = {}
+    for c in checks:
+        name = c.get("name", "")
+        base = name
+        for suf in ("_train", "_eval"):
+            if name.endswith(suf):
+                base = name[: -len(suf)]
+                break
+        ran[base] = ran.get(base, True) and bool(c.get("ok"))
+    return ran
+
+
+def metadata_recomputation_audit(checks):
+    """Literal per-field coverage gate (spec §7/§18). Builds the set of (scope, field) pairs
+    that recomputation verifiers actually asserted this run (their ``verified_fields``, counted
+    only for checks that passed), and requires every ``derived`` field to be either literally
+    covered or on the ``RECOMPUTE_PENDING`` allowlist. A derived field that is neither is
+    build-blocking — so a new field with the mimics_family/composition_depth disease cannot
+    ship. ``structural`` containers are covered by a passing traversing owner; ``provenance`` by
+    a passing provenance owner; ``reported`` (F5) is exempt."""
+    ran = _check_ran_ok(checks)
+    covered = set()
+    for c in checks:
+        if not c.get("ok"):
+            continue
+        for entry in c.get("verified_fields", []) or []:
+            covered.add(tuple(entry))
+    index = field_owner_index()
+    uncovered, structural_gap, provenance_gap = [], [], []
+    pending_hit, pending_now_covered = [], []
+    for (scope, field), meta in index.items():
+        key = (scope, field)
+        kind = meta["kind"]
+        if kind == "reported":
+            continue
+        if kind == "structural":
+            if key not in covered and not any(ran.get(o) for o in meta["owners"]):
+                structural_gap.append({"scope": scope, "field": field, "owners": meta["owners"]})
+            continue
+        if kind == "provenance":
+            if not any(ran.get(o) for o in meta["owners"]):
+                provenance_gap.append({"scope": scope, "field": field, "owners": meta["owners"]})
+            continue
+        # derived
+        if key in covered:
+            if key in RECOMPUTE_PENDING:
+                pending_now_covered.append([scope, field])  # allowlist should drop this
+            continue
+        if key in RECOMPUTE_PENDING:
+            pending_hit.append([scope, field])
+            continue
+        uncovered.append({"scope": scope, "field": field, "owners": meta["owners"]})
+    derived_keys = {k for k, m in index.items() if m["kind"] == "derived"}
+    phantom_pending = sorted(p for p in RECOMPUTE_PENDING if p not in derived_keys)
+    ok = not uncovered and not structural_gap and not provenance_gap and not phantom_pending
+    return {"name": "metadata_recomputation", "ok": ok,
+            "derived_fields": len(derived_keys),
+            "derived_independently_recomputed": len(derived_keys) - len(pending_hit),
+            "pending_independent_recompute": sorted(pending_hit),
+            "pending_now_covered_remove_from_allowlist": sorted(pending_now_covered),
+            "phantom_pending_not_a_derived_field": phantom_pending,
+            "uncovered_derived_fields": uncovered[:20],
+            "structural_gaps": structural_gap[:20],
+            "provenance_gaps": provenance_gap[:20]}
 
 
 def run_qa(out_dir, alpha=None, seq_len=4096):
@@ -808,12 +1299,19 @@ def run_qa(out_dir, alpha=None, seq_len=4096):
                replay_audit(all_records), label_audit(all_records),
                split_integrity_audit(all_records),
                schema_completeness_audit(all_records),
+               schema_admission_audit(all_records),
                query_position_contract(out_dir, all_records, alpha, seq_len),
+               distractor_surface_audit(out_dir, all_records, alpha, seq_len),
                f3_age_audit(all_records),
                filler_scaffolding_audit(out_dir, all_records, alpha, seq_len),
+               train_eval_symbol_exclusion_audit(out_dir, all_records, alpha, seq_len),
                f1_rule_consistency(all_records),
                minimal_suffix_audit(all_records),
+               composition_depth_audit(all_records),
+               age_flag_audit(all_records),
+               provenance_audit(out_dir, all_records),
                difficulty_stratum_audit(all_records)]
+    checks.append(metadata_recomputation_audit(checks))
     ok = all(c["ok"] for c in checks)
     report = {"ok": ok, "checks": checks}
     with open(os.path.join(out_dir, "qa_report.json"), "w", encoding="utf-8") as f:

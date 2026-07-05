@@ -40,7 +40,7 @@ SCAFFOLDING = (
     "rule", "now", "means", "is", "becomes", "note", "update", "query",
     "answer", ":", ".", ",", "->", "the", "a", "so", "then", "still",
     "same", "key", "box", "opens", "holds", "where", "switch", "next",
-    "and", "were", "exchanged",
+    "and", "were", "exchanged", "nothing", "was", "not",
 )
 STRUCTURAL_TOKENS = frozenset(SCAFFOLDING)
 DIGIT_WORDS = ("one", "two", "three", "four", "five", "six", "seven", "eight", "nine")
@@ -96,6 +96,36 @@ PARAPHRASES = {
         ("now", ":", "still", "same", "."),
         ("update", ":", "the", "same", "rule", "."),
         ("note", ":", "the", "key", "still", "same", "."),
+    ],
+    "distractor_F1": [
+        ("note", ":", "the", "rule", "still", "means", "same", "."),
+        ("update", ":", "same", "means", "same", "."),
+        ("the", "rule", "now", ":", "same", "means", "same", "."),
+        ("note", "now", ":", "same", "rule", "means", "same", "."),
+        ("then", ":", "the", "same", "rule", "means", "same", "."),
+        ("so", "now", ":", "same", "means", "same", "."),
+        ("update", "now", ":", "the", "rule", "means", "same", "."),
+        ("note", ":", "rule", "means", "same", "."),
+    ],
+    "distractor_F2": [
+        ("note", ":", "nothing", "was", "exchanged", "."),
+        ("update", ":", "nothing", "was", "exchanged", "."),
+        ("now", ":", "nothing", "was", "exchanged", "."),
+        ("then", ":", "nothing", "was", "exchanged", "."),
+        ("note", "now", ":", "same", "and", "same", "were", "not", "exchanged", "."),
+        ("update", "now", ":", "same", "and", "same", "were", "not", "exchanged", "."),
+        ("the", "rule", "now", ":", "nothing", "was", "exchanged", "."),
+        ("so", "now", ":", "nothing", "was", "exchanged", "."),
+    ],
+    "distractor_F3": [
+        ("update", ":", "the", "key", "still", "opens", "box", "same", "."),
+        ("note", ":", "the", "key", "still", "opens", "box", "same", "."),
+        ("now", ":", "the", "key", "still", "opens", "box", "same", "."),
+        ("then", ":", "the", "key", "still", "opens", "box", "same", "."),
+        ("so", "now", ":", "the", "key", "still", "opens", "box", "same", "."),
+        ("note", "now", ":", "the", "key", "opens", "box", "same", "."),
+        ("update", "now", ":", "the", "key", "opens", "box", "same", "."),
+        ("the", "rule", "now", ":", "the", "key", "still", "opens", "box", "same", "."),
     ],
 }
 
@@ -240,7 +270,9 @@ def build_alphabet(tok, seed: int = 1337) -> SynAlphabet:
     ident = assert_model_tokenizer(tok)
     sigma = _derive_sigma(tok, seed)
     neutral = _derive_neutral_filler(tok, sigma)
-    bg_vocab = tuple(sigma) + neutral
+    sigma_train = sigma[:52]
+    sigma_eval = sigma[52:]
+    bg_vocab = tuple(sigma_train) + neutral
     leaked = set(bg_vocab) & STRUCTURAL_TOKENS
     if leaked:
         raise SystemExit(f"SYN filler vocabulary contains structural tokens: {sorted(leaked)}")
@@ -253,8 +285,8 @@ def build_alphabet(tok, seed: int = 1337) -> SynAlphabet:
         token_to_id=token_to_id,
         id_to_token={v: k for k, v in token_to_id.items()},
         sigma=sigma,
-        sigma_train=sigma[:52],
-        sigma_eval=sigma[52:],
+        sigma_train=sigma_train,
+        sigma_eval=sigma_eval,
         bg_vocab=bg_vocab,
         bg_matrix=_bg_matrix(len(bg_vocab), seed),
         eos_id=int(eos_id),

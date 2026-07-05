@@ -45,7 +45,13 @@ and QA independently recomputes minimal sufficient suffixes before shipping. QA 
 measured statistics into the manifest and missing/unrun checks fail closed. The sidecar does
 not emit a summary `difficulty` label; hard/easy strata are derived by the harness and QA from
 primitive fields such as `composition_depth`, `minimal_sufficient_suffix_len`, and
-family-specific control flags.
+family-specific control flags. Finally, sidecar metadata is promoted to a verified tier
+alongside bytes and semantics: every field is registered in `train/syn/schema.py` with a class
+(`derived`/`provenance`) and a recomputation or provenance owner, QA-18 admits a `derived`
+field only when a byte-independent verifier recomputes it and asserts `recomputed == emitted`
+over the QA sample, and any field whose owner names a nonexistent or unwired check fails closed.
+This closes the trusted-metadata tier that produced the `difficulty`, `mimics_family`, and
+`eval_sigma_ev` label bugs: a field that only a consumer reads back can no longer ship.
 
 ---
 
@@ -84,10 +90,14 @@ at events.
   Split: 52 **train symbols** Σ_tr, 12 **eval-only symbols** Σ_ev used only in held-out eval
   instances (tests transfer to unseen surface within known structure — mild, because the
   tokens themselves occur in web data).
-- **Scaffolding set:** ~24 function words/punctuation used identically across families:
-  `rule`, `now`, `means`, `is`, `becomes`, `note`, `update`, `query`, `answer`, `:`, `.`,
-  `,`, `->`, `the`, `a`, `so`, `then`, `still`, `same`, `key`, `box`, `opens`, `holds`,
-  `where`.
+- **Scaffolding set:** function words/punctuation used identically across families. The
+  canonical set is `SCAFFOLDING` in `train/syn/alphabet.py`; this list must equal it and is
+  not maintained as a second source. As of v1.3 it is the 32 tokens: `rule`, `now`, `means`,
+  `is`, `becomes`, `note`, `update`, `query`, `answer`, `:`, `.`, `,`, `->`, `the`, `a`, `so`,
+  `then`, `still`, `same`, `key`, `box`, `opens`, `holds`, `where`, `switch`, `next`, `and`,
+  `were`, `exchanged`, `nothing`, `was`, `not`. The last eight support F5 (`switch`, `next`)
+  and the family-keyed F4 distractor banks (`and`, `were`, `exchanged`, `nothing`, `was`,
+  `not`, per §5); all are excluded from BG filler by §1.2 and QA-9.
 - **Template paraphrase banks.** Every semantic slot (rule statement, correction, query,
   confirmation) has **8 surface variants**, sampled per use. No single marker token may
   deterministically signal an event — the primary anti-shortcut constraint, checked by QA-3.
@@ -97,11 +107,13 @@ at events.
 
 ### 1.2 Background filler process
 
-Filler between semantic segments is a **shared order-1 Markov stream over Σ plus neutral
+Filler between semantic segments is a **shared order-1 Markov stream over Σ_tr plus neutral
 whole-word filler tokens** with fixed transition matrix `BG-v1` (generated once, seeded,
-checked into the repo). The filler vocabulary explicitly excludes every scaffolding token
-(`update`, `query`, `answer`, `exchanged`, `->`, etc.); scaffolding appears only when a
-family generator places real structure. Identical process in all five families and in null.
+checked into the repo). The filler vocabulary explicitly excludes Σ_ev and every scaffolding
+token (`update`, `query`, `answer`, `exchanged`, `->`, etc.); scaffolding appears only when a
+family generator places real structure. Eval-only symbols therefore do not occur anywhere in
+train-split synthetic instances, including filler. Identical process in all five families and
+in null, modulo split-specific working-set selection.
 
 Filler length is a **construction rule**, not a remainder sink. A generator may emit BG filler
 only for one of two reasons:
@@ -312,12 +324,13 @@ instances carry a late correction. This family *is* the evidence-age axis, now s
   the key now opens box nine", 8 variants) → controlled filler gap → two or more queries.
   Two ages recorded: write→query and latest-correction→query.
 
-Difficulty amendment: correction mode samples `composition_depth` 1 or 2. Depth-2 instances
-include chained corrections before the query; hard-stratum queries require the final active
-table, not merely the original write or the first correction span. The controlled gap is
-placed so the oldest necessary evidence in the minimal sufficient set, not merely the latest
-event, can exceed the planned hard-suffix threshold. Recall mode remains the clean
-evidence-survival probe.
+Difficulty amendment: correction mode samples `composition_depth` 1 or 2. In F3, depth-2 is
+the **supersession stratum**, not the same multi-span composition claim as F1/F2: a later
+statement about the queried key can fully determine the answer by last-write-wins semantics.
+This stratum tests overwrite/revision behavior, while the hard mechanism-necessity gate for
+F3 comes from `minimal_sufficient_suffix_len > max_attention_window_planned`. The controlled
+gap is placed so unchanged-key queries can still require the original write plus subsequent
+corrections as evidence. Recall mode remains the clean evidence-survival probe.
 
 **Values** come from small closed sets (digits one–nine as words, or 8 symbols) so answers
 are single tokens (QA-5).
@@ -341,9 +354,10 @@ including **correction-like distractors**.
 
 **Construction:** sample a base family shape (F1-shaped 40% / F2-shaped 35% / F3-shaped 25%);
 generate identically **except no event occurs**. In place of events, insert distractor
-segments from an 8-variant bank of event-*resembling* but semantically inert statements:
-"note : the rule stays the same .", "update : still , red means blue ." (restating the
-*existing* rule), "as before , alpha is red .". Distractor positions follow the same
+segments from family-keyed 8-variant banks of event-*resembling* but semantically inert
+statements. The rendered surface must match `mimics_family`: F1 distractors contain
+`means`, F2 distractors contain the swap surface `exchanged` plus an inert marker such as
+`nothing`/`not`, and F3 distractors contain `key`/`opens`/`box`. Distractor positions follow the same
 [15%, 85%] distribution as real events; each instance records its matched **pseudo-event
 position** (the distractor slot) for QA-1's cut point.
 
@@ -435,8 +449,43 @@ including controlled gaps. `density_denominator = token_len - controlled_gap_tok
 `controlled_gap_tokens` is the sum of controlled age-gap filler.
 Every scaffolded answer-bearing query must have a corresponding entry in `queries`; per-query
 position, answer, evidence, suffix, anchor, stratum, and family-control fields are mandatory.
-The machine-readable canonical schema lives in `train/syn/schema.py`; QA-11 imports that file
-instead of maintaining a second field list.
+The machine-readable canonical schema and verifier registry live in `train/syn/schema.py`.
+QA-11 imports that file instead of maintaining a second field list.
+
+**Metadata is not trusted because the generator emitted it, and not trusted because a check
+name sits beside it.** The generator holds one ground-truth object per instance and emits two
+projections of it — the rendered token bytes and the sidecar — through separate code paths;
+any two projections of one object can diverge, so every sidecar field must be independently
+reconciled against the bytes or against generation inputs. Each field is classified as one of:
+
+- **derived** — its value is a function of the instance's rendered token bytes (optionally
+  plus the instance seed and registry). Its registered owner is a *recomputation verifier*: a
+  QA check that re-derives the value from the packed bytes along a code path independent of the
+  emitter and asserts `recomputed == emitted` for that field. A check that only *reads* the
+  field to bucket, aggregate, or gate instances (a *consumer*) is not a verifier and does not
+  admit the field.
+- **provenance** — its value comes from recorded generation inputs, not the bytes (e.g.
+  `seed`, `corpus_version`, `registry_ids`, `shard`, `window_index`, `start_offset`,
+  `instance_id`). Its owner re-establishes it by deterministic regeneration or the
+  packing/placement contract, not by byte recomputation.
+- **structural** — a container/list field (`queries`, `events`, `writes`, `distractors`,
+  `label_positions`, `active_map_rle`, `filler_rle`, ...) whose integrity is carried by the
+  verifiers that traverse its *elements* (the nested-scope fields) plus the offset/roundtrip
+  placement checks. It is covered when a traversing owner passes; it is not itself a scalar to
+  recompute.
+- **reported** — an F5 transfer-probe field, reported not gated (§6/§10).
+
+The registry records, per field, its class and the identifier of its owner. Every owner
+identifier must resolve to a QA check that is actually wired into the run — a verifier name
+with no runnable check is itself build-blocking, so the registry cannot point at checks that do
+not exist. Coverage is **literal and execution-driven**: each recomputation verifier reports the
+exact `(scope, field)` pairs it asserted `recomputed == emitted` for this run, and a `derived`
+field is covered only if it appears in some passing verifier's report. Fields that are genuinely
+`derived` but do not yet have an emitter-independent recomputation (surface *content* values
+awaiting a second text decoder) are enumerated on a checked-in `RECOMPUTE_PENDING` allowlist —
+the visible, shrinking backlog. A `derived` field that is neither covered nor on that allowlist
+is build-blocking, so a new field cannot enter unverified; adding it to the allowlist is a
+deliberate, reviewable act. New fields enter verified or do not enter.
 
 ---
 
@@ -471,10 +520,11 @@ control. In dry-run mode `--dry-run-tokens` targets synthetic instance tokens be
 padding, not final stream tokens, so the on-disk shard token count can be much larger than the
 flag when many windows contain one or two short inspection instances plus padding.
 Human inspection must not repeatedly decode deterministic shard heads as a proxy for corpus
-coverage. The generator's `--inspect-strata` mode samples decoded instances by seeded audit
-strata: controlled top age-bin gap, F3 depth-2 correction, F4 with F2-shaped distractor, and
-eval/Σ_ev usage. When `--inspect-out-dir` is set, the inspection output writes full decoded
-text and full sidecars with `elided: []`; stdout excerpts are explicitly non-normative.
+coverage. The generator's `--inspect-strata` mode samples distinct decoded instances by
+seeded audit strata: controlled top age-bin gap, F3 depth-2 correction, F4 with F2-shaped
+distractor, and eval/Σ_ev usage verified against the packed token bytes, not merely sidecar
+strings. When `--inspect-out-dir` is set, the inspection output writes full decoded text and
+full sidecars with `elided: []`; stdout excerpts are explicitly non-normative.
 
 ---
 
@@ -534,11 +584,13 @@ A check that cannot run because data or fields are missing reports FAIL, never S
     ≥ 0.25. F1/F2/F4 require at least 4 answer-bearing queries per instance; F3 requires at
     least 2.
 14. **Difficulty-stratum audit:** hard stratum is a fraction, not "nonzero." Eval instances
-    require primitive-derived hard examples ≥ 15% for F1/F2/F3, where hard means
-    `composition_depth > 1` or at least one query with
-    `minimal_sufficient_suffix_len > max_attention_window_planned`. Queries with suffix above
-    the planned attention window must be ≥ 10% of F1 and F3 query positions. Multi-event
-    composition-depth examples must be ≥ 15% of eval instances for F1/F2/F3.
+    require primitive-derived hard examples ≥ 15% for F1/F2/F3. For F1/F2, hard may come from
+    `composition_depth > 1` or from at least one query with
+    `minimal_sufficient_suffix_len > max_attention_window_planned`; for F3, hard is derived
+    from suffix length, while `composition_depth > 1` is reported as the supersession
+    stratum. Queries with suffix above the planned attention window must be ≥ 10% of F1 and
+    F3 query positions. Multi-event composition-depth examples must be ≥ 15% of eval
+    instances for F1/F2; F3 supersession examples must be ≥ 15% of eval F3 instances.
 15. **Minimal-sufficient-suffix audit:** recompute, from the rendered stream under each
     symbolic family semantics (F1-F4), the true shortest sufficient suffix for every query,
     counting rule statements, corrections, demonstrations, and previous answered queries as
@@ -549,6 +601,30 @@ A check that cannot run because data or fields are missing reports FAIL, never S
     `skipped_by_family`: its evidence sufficiency is recurrence-parameter inference over the
     modular stream rather than finite symbolic replay, and F5 remains a reported transfer
     probe rather than a mechanism gate. Any non-exempt mismatch is build-blocking.
+16. **Distractor-surface audit:** for every F4 distractor, decode the distractor span and
+    assert the bytes match the claimed `mimics_family` signature: F1 has `means`, F2 has
+    `exchanged` plus an inert marker, and F3 has `key`/`opens`/`box`. A mismatched
+    distractor label is build-blocking.
+17. **Train/eval symbol exclusion audit:** decode every train-split synthetic instance and
+    assert no Σ_ev token occurs anywhere, including filler. Eval-only symbol leakage into
+    train is build-blocking.
+18. **Schema-admission audit (fail-closed metadata gate):** every emitted sidecar field,
+    including nested query/event/write/distractor fields, must be registered in
+    `train/syn/schema.py` with a class and a recomputation/provenance owner (§7). The audit
+    enforces four properties, each build-blocking: (a) **coverage** — every emitted field is
+    registered, and every registered owner names a QA check that is actually wired into
+    `run_qa`; a verifier name with no runnable check fails; (b) **literal class discipline** —
+    each `derived` field must appear in the `verified_fields` report of some *passing*
+    recomputation verifier (which asserted `recomputed == emitted` for it this run) or be on
+    the checked-in `RECOMPUTE_PENDING` allowlist; a derived field that is neither, or one owned
+    only by a consumer, fails; `structural` containers must be traversed by a passing owner; (c)
+    **provenance closure** — every `provenance` field is re-established by deterministic
+    regeneration or the packing/placement contract; (d) **no unknown fields** — any emitted
+    field absent from the registry is build-blocking even if the record is otherwise
+    well-formed. Registry name-parity alone is necessary but not sufficient: the pass condition
+    is that each derived field was independently recomputed from the bytes and matched, or is an
+    enumerated pending item. A pending field that becomes covered is reported for removal so the
+    allowlist only shrinks.
 
 ---
 
@@ -601,18 +677,18 @@ generator truth label because W is run-specific.
 4. `train/syn/gen_f{1..5}.py` — instance generators emitting `(token_ids, sidecar_record)`.
 5. `train/syn/pack.py` — window-aware packing + mixing per §8; emits shards + sidecar index
    compatible with `train/prepare_data.py`'s manifest format.
-6. `train/syn/qa.py` — the fifteen QA checks; CI-style pass/fail report.
+6. `train/syn/qa.py` — the eighteen QA checks; CI-style pass/fail report.
 7. `train/syn/harness_readers.py` — sidecar readers implementing §10's metric↔label contract
    (including the `answer_pos − 1` shift).
 8. `train/syn/forward_probe.py` — model-side plumbing probe: verifies packed-window
    anchor/answer alignment through the real model input path and reports padding-excluded
    loss diagnostics.
 9. `train/gen_SYN-1B.py --inspect-strata --inspect-out-dir <dir>` — seeded human-audit
-   sample exporter covering top-age, F3 depth-2, F4/F2-distractor, and eval/Σ_ev strata with
-   full sidecars and no silent field elision.
+   sample exporter covering distinct top-age, F3 depth-2, F4/F2-distractor, and
+   byte-verified eval/Σ_ev strata with full sidecars and no silent field elision.
 10. `MANIFEST.syn-1b-v1.3.json` — seeds, hashes, counts, `max_attention_window_planned`, and
    per-check QA statistics.
 
 Estimated effort: the five generators are 100–200 lines each; `pack.py` and the QA suite are
 where the care goes — every gate metric inherits its validity from QA-4, QA-5, QA-7, QA-8,
-QA-10, QA-11, QA-12, QA-14, and QA-15.
+QA-10, QA-11, QA-12, QA-14, QA-15, QA-16, QA-17, and QA-18.

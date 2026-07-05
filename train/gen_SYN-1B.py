@@ -101,6 +101,11 @@ def _uses_eval_symbol(rec, alpha):
     return any(value in eval_symbols for value in _walk_strings(rec))
 
 
+def _uses_eval_symbol_bytes(out_dir, rec, alpha, seq_len=4096):
+    eval_ids = {alpha.single_id(word) for word in alpha.sigma_eval}
+    return any(tid in eval_ids for tid in _instance_ids(out_dir, rec, seq_len))
+
+
 def _record_max_controlled_gap_bin(rec):
     bins = [
         int(gap["target_age_bin"]) for gap in rec.get("controlled_gaps", [])
@@ -109,8 +114,13 @@ def _record_max_controlled_gap_bin(rec):
     return max(bins) if bins else None
 
 
-def _select_stratified_records(records, alpha, seed):
+def _select_stratified_records(records, alpha, seed, out_dir=None, seq_len=4096):
     rng = random.Random(seed)
+    uses_eval_symbol = (
+        (lambda r: _uses_eval_symbol_bytes(out_dir, r, alpha, seq_len))
+        if out_dir is not None else
+        (lambda r: _uses_eval_symbol(r, alpha))
+    )
     predicates = {
         "top_age_bin": lambda r: (_record_max_controlled_gap_bin(r) or -1) >= 8,
         "f3_depth2": lambda r: r.get("family") == "F3" and int(r.get("composition_depth", 0)) >= 2,
@@ -118,7 +128,7 @@ def _select_stratified_records(records, alpha, seed):
             r.get("family") == "F4"
             and any(d.get("mimics_family") == "F2" for d in r.get("distractors", []))
         ),
-        "eval_sigma_ev": lambda r: r.get("split") == "eval" and _uses_eval_symbol(r, alpha),
+        "eval_sigma_ev": lambda r: r.get("split") == "eval" and uses_eval_symbol(r),
     }
     selected = []
     missing = []
@@ -136,12 +146,14 @@ def _select_stratified_records(records, alpha, seed):
     return selected, missing
 
 
-def _select_random_records(records, n, seed):
+def _select_random_records(records, n, seed, exclude_ids=None):
     if n <= 0:
         return []
     rng = random.Random(seed)
+    exclude_ids = set(exclude_ids or [])
     pool = sorted(records, key=lambda r: (r.get("split", ""), r.get("family", ""),
                                           r.get("instance_id", "")))
+    pool = [rec for rec in pool if rec.get("instance_id") not in exclude_ids]
     n = min(n, len(pool))
     return [("random", rec) for rec in rng.sample(pool, n)]
 
@@ -232,9 +244,10 @@ def inspect_random_or_stratified(out_dir, alpha, random_n, stratified, seed, seq
     selected = []
     missing = []
     if stratified:
-        strata_selected, missing = _select_stratified_records(records, alpha, seed)
+        strata_selected, missing = _select_stratified_records(records, alpha, seed, out_dir, seq_len)
         selected.extend(strata_selected)
-    selected.extend(_select_random_records(records, random_n, seed))
+    selected_ids = {rec.get("instance_id") for _, rec in selected}
+    selected.extend(_select_random_records(records, random_n, seed, exclude_ids=selected_ids))
     if not selected:
         raise SystemExit("no records selected for inspection")
     _print_selected_instances(out_dir, alpha, selected, seq_len, text_chars)

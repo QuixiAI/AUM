@@ -22,8 +22,9 @@ def generate(alpha, registry, rng, split, instance_index, target_len, age_bin=0)
         r.add(key, {"role": "write", "path": ("writes", wi, "pos")})
         r.words("means", value, ".")
     r.bg(rng, rng.randint(3, 12))
-    distractors = [{"pos": None, "mimics_family": shape, "variant": "same"}]
-    r.variant(rng, "distractor", {"role": "distractor", "path": ("distractors", 0, "pos")})
+    distractors = [{"pos": None, "mimics_family": shape, "variant": f"{shape}_surface"}]
+    r.variant(rng, f"distractor_{shape}",
+              {"role": "distractor", "path": ("distractors", 0, "pos")})
 
     queries = []
     source_by_key = {key: ("write", key) for key in base}
