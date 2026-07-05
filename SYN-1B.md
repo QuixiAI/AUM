@@ -49,12 +49,13 @@ string: `syn-1b-v1.1`.
 All families draw from one shared token pool so families are surface-indistinguishable except
 at events.
 
-- **Symbol alphabet Σ:** 64 lowercase English words, each verified **single-token** under the
-  SmolLM2 49,152-BPE tokenizer via `tok(word, add_special_tokens=False)` (the
-  `train/prepare_data.py` convention; selection script filters a frequency-ranked list and
-  rejects multi-token words). Split: 52 **train symbols** Σ_tr, 12 **eval-only symbols** Σ_ev
-  used only in held-out eval instances (tests transfer to unseen surface within known
-  structure — mild, because the tokens themselves occur in web data).
+- **Symbol alphabet Σ:** 64 lowercase English words, each verified **single-token in
+  leading-space context** under the SmolLM2 49,152-BPE tokenizer via
+  `tok(" " + word, add_special_tokens=False)`. The generator renders text first, tokenizes
+  the rendered text once, and derives all sidecar offsets from tokenizer offset mappings.
+  Split: 52 **train symbols** Σ_tr, 12 **eval-only symbols** Σ_ev used only in held-out eval
+  instances (tests transfer to unseen surface within known structure — mild, because the
+  tokens themselves occur in web data).
 - **Scaffolding set:** ~24 function words/punctuation used identically across families:
   `rule`, `now`, `means`, `is`, `becomes`, `note`, `update`, `query`, `answer`, `:`, `.`,
   `,`, `->`, `the`, `a`, `so`, `then`, `still`, `same`, `key`, `box`, `opens`, `holds`,
@@ -65,15 +66,19 @@ at events.
 
 ### 1.2 Background filler process
 
-Filler between semantic segments is a **shared order-1 Markov stream over Σ ∪ scaffolding**
-with fixed transition matrix `BG-v1` (generated once, seeded, checked into the repo).
-Identical process in all five families and in null. Filler is the medium in which
-evidence-age is swept; it must carry zero rule information (QA-1).
+Filler between semantic segments is a **shared order-1 Markov stream over Σ plus neutral
+whole-word filler tokens** with fixed transition matrix `BG-v1` (generated once, seeded,
+checked into the repo). The filler vocabulary explicitly excludes every scaffolding token
+(`update`, `query`, `answer`, `exchanged`, `->`, etc.); scaffolding appears only when a
+family generator places real structure. Identical process in all five families and in null.
+Filler is the medium in which evidence-age is swept; it must carry zero rule information
+(QA-1).
 
 ### 1.3 Instance geometry (4096-token windows)
 
-- **Instance length:** log-uniform in **[256, 3968]** tokens (max leaves ≥128 tokens of
-  window headroom for co-packed web text and the EOS separator).
+- **Instance length:** variable and compact. F1/F2/F4/F5 are mostly task-bearing tokens with
+  only bounded local filler gaps; F3 alone emits long controlled filler gaps for the
+  evidence-survival age sweep. No generator pads an instance to fill a requested length.
 - **Loss:** plain LM loss over all tokens (pretraining data, not SFT). Eval metrics are
   computed at labeled positions by the harness (§10); no loss masking anywhere.
 - **Hard constraint — no window straddling.** The evidence state S and the register σ reset
@@ -95,16 +100,14 @@ masquerade as transfer.
 
 ### 1.5 Event-position and age distributions
 
-- **Event position** (reversal/swap/correction): uniform over the middle **[15%, 85%]** of
-  the instance, so events occur both shallow and deep in context.
+- **Event position** (reversal/swap/switch): kept away from boundaries for F1/F2/F5. F3
+  correction events may occur early because the controlled post-correction gap is the
+  measured survival variable.
 - **Evidence-age sweep** (the recency-gradient x-axis): distance from evidence write (or the
-  correction, per family definition) to the query, drawn **log-uniform over [8, 3500]
-  tokens**, stratified into **10 logarithmic bins** with equal instance counts per bin per
-  family. The 3500 ceiling is set by the 4096 window minus scaffolding — the age axis is
-  bounded by the context window *by design* (S is the only cross-token carrier and does not
-  survive window resets); state this bound when reporting the gradient. The sidecar records
-  the realized age exactly; the harness converts to per-head phase-distance Δφ from the
-  trained model at eval time.
+  correction, per family definition) to the query is a controlled input, not a side effect of
+  window padding. The generator samples the age bin first and emits that many filler tokens
+  only in the relevant F3 gap. The sidecar records the realized age exactly; the harness
+  converts to per-head phase-distance Δφ from the trained model at eval time.
 
 ---
 
@@ -172,11 +175,11 @@ instances carry a late correction. This family *is* the evidence-age axis, now s
 
 **Sub-modes (50/50):**
 - **Recall:** write `["the key opens box four" ...]` for m∈[3,8] associations → BG filler of
-  length = sampled age → query. No event. Measures whether evidence *survives and is
-  readable* at age; feeds the evidence-survival probe.
-- **Delayed correction:** writes → filler → correction ("update : the key now opens box
-  nine", 8 variants) → filler (second age sample) → query. Two ages recorded: write→query and
-  correction→query.
+  length = sampled age → one or more queries. No event. Measures whether evidence *survives
+  and is readable* at age; feeds the evidence-survival probe.
+- **Delayed correction:** writes → bounded local gap → correction ("update : the key now
+  opens box nine", 8 variants) → controlled filler gap → one or more queries. Two ages
+  recorded: write→query and correction→query.
 
 **Values** come from small closed sets (digits one–nine as words, or 8 symbols) so answers
 are single tokens (QA-5).
@@ -269,22 +272,24 @@ cuts fixed 4096-token windows, freely splitting documents) is kept for web/code 
 synthetic instances must NOT be split (§1.3), so synthetic mixing happens **inside window
 assembly**, not upstream:
 
-- `syn/pack.py` assembles the mixed stream window by window: it fills from the web/code
-  stream and, at the sampled synthetic-insertion points, places a synthetic instance only if
-  it fits entirely within the current window's remainder (else defers it and continues with
-  web text). Web documents still split freely across windows, exactly as today.
-- **≤ 2 synthetic instances per window, always co-packed with web text** (no synthetic-pure
-  windows). Purpose — this belongs with QA-3, not a packing footnote: a window is a fresh
-  S/σ context, so synthetic-pure windows would let the model learn a *window-level* "task
-  window" prior and pre-arm π from token 1, quietly defeating the F4 null control. Embedding
-  every instance in ordinary web text forces event detection to be *local* evidence
-  integration.
+- `syn/pack.py` assembles standalone 4096-token synthetic windows by placing whole instances
+  until the window reaches a sampled task-token fraction target. Instances are EOS-separated;
+  leftover space is EOS padding, never Markov filler.
+- **Task density is a construction rule.** Each packed window targets 45-60% task-bearing
+  tokens and must pass a 35-70% QA band. This prevents the corpus from spending most of its
+  synthetic budget training the filler Markov process.
 - Mixture: **5.0% synthetic (F1–F4, §0 proportions) / 85% web-edu / 10% code**, constant
   across stages; document-level global shuffle for web/code; synthetic insertion points
   Poisson-spaced to hit the 5% rate.
 - **Eval pack:** eval-split instances (F1–F4 eval rules + all of F5, ~40 M tokens) are
   excluded from the training corpus entirely and shipped separately with their sidecars,
   pre-packed one instance per window (eval never needs co-packing).
+
+Implementation note: `train/gen_SYN-1B.py` emits a standalone SYN artifact rather than
+directly splicing into the web/code stream. Its manifest records `packing_policy` including
+the task-density target, EOS separators, EOS padding, and the lack of an instance-boundary
+attention mask. Budget reports distinguish **family instance tokens**, **family task-bearing
+tokens**, and **on-disk total tokens**.
 
 ---
 
@@ -301,13 +306,25 @@ assembly**, not upstream:
 4. **Replay consistency:** 100% of instances regenerate byte-identically from seeds and pass
    stream↔label verification.
 5. **Tokenizer audit:** every Σ and scaffolding word single-token; every labeled `answer`
-   single-token; report exact token lengths.
+   single-token in leading-space context; generator tokenizer identity and hash must match
+   the manifest/model tokenizer; report exact token lengths.
 6. **Dedup:** no duplicate instance hashes; 13-gram collision rate with the web corpus
    < 1e-6.
 7. **Window integrity (post-packing):** for every sidecar record, the instance's
    `[start_offset, start_offset + token_len)` lies within one 4096-token window of the named
-   shard, the tokens there hash-match the regenerated instance, and no window holds > 2
-   instances.
+   shard, the tokens there hash-match the regenerated instance, and no window holds more
+   instances than the manifest's `max_synthetic_instances_per_window`.
+8. **Packed-window roundtrip:** for every packed 4096-token synthetic window,
+   `tokenizer.encode(tokenizer.decode(window_ids), add_special_tokens=False) == window_ids`.
+   This catches BPE re-segmentation at packing boundaries, not just inside instances.
+9. **Filler scaffolding exclusion:** scan both instance-local filler spans and window-level
+   background outside sidecar spans; any scaffolding token in filler is build-blocking.
+10. **Query-position contract:** for every query, the token at `answer_pos - 1` is the
+    prediction token (`->` for F1-F4, `:` for F5), and the next token decodes to the sidecar
+    answer.
+11. **Task-density audit:** compute task-bearing token fraction per packed window and per
+    split from sidecar `task_token_count`; every window must stay in the configured QA band,
+    and corpus-level density must do the same.
 
 ---
 
