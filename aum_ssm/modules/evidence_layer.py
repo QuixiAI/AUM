@@ -46,7 +46,8 @@ class EvidenceLayer(nn.Module):
         if self.residual_in_fp32:
             residual = residual.to(torch.float32)
 
-        x_bar = self.input_layernorm(residual)
+        compute_dtype = hidden_states.dtype
+        x_bar = self.input_layernorm(residual).to(compute_dtype)
         h_A = self.ground_attn(x_bar, inference_params=inference_params, cache=attn_cache)
         if return_silence_ctx:                            # top layer: expose the read source + phase
             h_U, m_t, s_t, phi, read_src = self.unfold(
@@ -57,7 +58,7 @@ class EvidenceLayer(nn.Module):
         self._last_mu = _mu                               # exposed for the per-layer-only l1 (§10)
 
         residual = residual + h_M
-        x2 = self.post_attention_layernorm(residual)
+        x2 = self.post_attention_layernorm(residual).to(compute_dtype)
         hidden_states = self.mlp(x2)
         if return_silence_ctx:
             # "read" is a per-token closure when decoding, or the write-tensor pack (alpha, x,

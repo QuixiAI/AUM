@@ -97,11 +97,11 @@ def _token_read(S_prev, S_cur, headdim, freqs):
         if pooled:
             if query is None:
                 return S.mean(-1).reshape(S.shape[0], 1, -1)
-            qh = query.reshape(*query.shape[:-1], -1, headdim)      # (B,1,H,Dqk), no rotation
+            qh = query.reshape(*query.shape[:-1], -1, headdim).to(S.dtype)  # (B,1,H,Dqk), no rotation
             r = torch.einsum("bhpn,blhn->blhp", S, qh)
             return r.reshape(r.shape[0], r.shape[1], -1)
         qh = query.reshape(*query.shape[:-1], -1, headdim)          # (B,1,H,Dqk)
-        q_rot = _rotate_ladder(qh, phi_arg, freqs)
+        q_rot = _rotate_ladder(qh, phi_arg, freqs).to(S.dtype)
         r = torch.einsum("bhpn,blhn->blhp", S, q_rot)
         return r.reshape(r.shape[0], r.shape[1], -1)
     return read
@@ -179,8 +179,9 @@ class AumBackbone(nn.Module):
             else:
                 hidden_states, residual = layer(
                     hidden_states, residual, inference_params=inference_params, **kwargs)
+        compute_dtype = hidden_states.dtype
         residual = (hidden_states + residual) if residual is not None else hidden_states
-        g_t = self.norm_f(residual)                        # top-of-stack grounded summary
+        g_t = self.norm_f(residual).to(compute_dtype)      # top-of-stack grounded summary
         if not self.silence_enabled:
             return (g_t, None) if return_aux else g_t
 
@@ -189,7 +190,7 @@ class AumBackbone(nn.Module):
         logits_fn = lambda o: F.linear(o, self.embedding.weight)  # tied classifier (per-j LM mixture)
         decoding = inference_params is not None and inference_params.seqlen_offset > 0
         if decoding:               # one more step of the same recurrence: sigma_{t-1} lives in the slot
-            slot = self._silence_slot(inference_params, g_t.shape[0], g_t.device)
+            slot = self._silence_slot(inference_params, g_t.shape[0], g_t.device, dtype=g_t.dtype)
             o_t, aux = self.silence(g_t, read_src, phi, slot["phi_prev"], slot["sigma"].unsqueeze(1),
                                     m_t, s_t, logits_fn, ablation, forced_depth)
             slot["sigma"].copy_(aux.sigma_star[:, 0])
@@ -231,7 +232,7 @@ class AumBackbone(nn.Module):
                                      freqs, halt_u=u, forced_depth=forced_depth,
                                      no_op=(ablation == "no_op"))
             if inference_params is not None:                  # prefill: seed the carry slot
-                slot = self._silence_slot(inference_params, g_t.shape[0], g_t.device)
+                slot = self._silence_slot(inference_params, g_t.shape[0], g_t.device, dtype=g_t.dtype)
                 slot["sigma"].copy_(aux.sigma_star[:, -1].detach())
                 slot["phi_prev"].copy_(phi[:, -1:])
             return (o_t, aux) if return_aux else o_t
@@ -265,7 +266,7 @@ class AumBackbone(nn.Module):
             o_stack=cat(13), j_star=cat(14), sigma_star=cat(15), phi=cat(16),
         )
         if inference_params is not None:                      # prefill: seed the silence carry slot
-            slot = self._silence_slot(inference_params, g_t.shape[0], g_t.device)
+            slot = self._silence_slot(inference_params, g_t.shape[0], g_t.device, dtype=g_t.dtype)
             slot["sigma"].copy_(sigma[:, 0].detach())
             slot["phi_prev"].copy_(phi[:, -1:])
         return (o_t, aux) if return_aux else o_t
@@ -323,12 +324,13 @@ class AumBackbone(nn.Module):
                 return False
         return False
 
-    def _silence_slot(self, inference_params, batch, device):
+    def _silence_slot(self, inference_params, batch, device, dtype=None):
         kv = inference_params.key_value_memory_dict
         if "silence" not in kv:
             H = self.layers[-1].unfold.nheads
+            dtype = dtype or self.embedding.weight.dtype
             kv["silence"] = {
-                "sigma": torch.zeros(batch, self.silence.d_sigma, device=device, dtype=torch.float32),
+                "sigma": torch.zeros(batch, self.silence.d_sigma, device=device, dtype=dtype),
                 "phi_prev": torch.zeros(batch, 1, H, device=device, dtype=torch.float32),
             }
         return kv["silence"]
@@ -339,8 +341,9 @@ class AumBackbone(nn.Module):
         if self.silence_enabled:
             dev = self.embedding.weight.device
             H = self.layers[-1].unfold.nheads
+            dtype = dtype or self.embedding.weight.dtype
             cache["silence"] = {
-                "sigma": torch.zeros(batch_size, self.silence.d_sigma, device=dev, dtype=torch.float32),
+                "sigma": torch.zeros(batch_size, self.silence.d_sigma, device=dev, dtype=dtype),
                 "phi_prev": torch.zeros(batch_size, 1, H, device=dev, dtype=torch.float32),
             }
         return cache

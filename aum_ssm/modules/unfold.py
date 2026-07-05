@@ -176,7 +176,7 @@ class Unfold(nn.Module):
                 q, k, v, tau_bar, lam_bar, r, theta, z=z, D=D_hd, dt_bias=self.dt_bias,
                 eps=self.eps, S0=S_cache, phi0=phi_cache, norm_weight=nw, freqs=self.rope_freqs)
             S_cache.copy_(S_new); phi_cache.copy_(phi_new)
-            out = self.out_proj(rearrange(h, "b l h p -> b l (h p)"))
+            out = self.out_proj(rearrange(h, "b l h p -> b l (h p)").to(self.out_proj.weight.dtype))
             if not return_read:
                 return out, m_t, s_t
             phi_1H = phi_new                                       # (B,H) current phase
@@ -186,12 +186,12 @@ class Unfold(nn.Module):
                 if pooled:                                     # Pool(S) = S q_pool: phase-free learned
                     if query is None:                          # static query (§14); None -> mean pool
                         return rearrange(S.mean(-1), "b h p -> b (h p)").unsqueeze(1)
-                    qh = rearrange(query, "b l (h p) -> b l h p", p=self.headdim)
+                    qh = rearrange(query, "b l (h p) -> b l h p", p=self.headdim).to(S.dtype)
                     rr = torch.einsum("bhpn,blhn->blhp", S, qh)     # no rotation
                     return rearrange(rr, "b l h p -> b l (h p)")
                 ph = phi_1H.unsqueeze(1) if phi_arg is None else phi_arg    # honor the caller's phase
                 qh = rearrange(query, "b l (h p) -> b l h p", p=self.headdim)
-                q_rot = _rotate_ladder(qh, ph, self.rope_freqs)
+                q_rot = _rotate_ladder(qh, ph, self.rope_freqs).to(S.dtype)
                 rr = torch.einsum("bhpn,blhn->blhp", S, q_rot)
                 return rearrange(rr, "b l h p -> b l (h p)")
 
@@ -205,7 +205,7 @@ class Unfold(nn.Module):
             S_cache.copy_(S_T); phi_cache.copy_(phi_T)
         else:                                                     # training
             h = self._dispatch(q, k, v, tau_bar, lam_bar, r, theta, z, D_hd)
-        out = self.out_proj(rearrange(h, "b l h p -> b l (h p)"))
+        out = self.out_proj(rearrange(h, "b l h p -> b l (h p)").to(self.out_proj.weight.dtype))
         if not return_read:
             return out, m_t, s_t
 

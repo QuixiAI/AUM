@@ -66,6 +66,33 @@ def test_generate_api_matches_forward():
     assert (scores.float() - ref[:, prompt - 1:T - 1].float()).abs().max().item() < 2e-3
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="bf16 inference regression is CUDA-only")
+def test_bf16_generate_without_external_autocast_cuda():
+    torch.manual_seed(0)
+    cfg = AumConfig(
+        n_layer=1,
+        vocab_size=128,
+        d_model=64,
+        d_intermediate=128,
+        attn_num_heads=2,
+        attn_num_heads_kv=1,
+        attn_head_dim=32,
+        u_num_heads=2,
+        u_head_dim=32,
+        d_sigma=32,
+        d_phase=8,
+        silence_enabled=True,
+        kernel_backend="reference",
+    )
+    model = AumLMHeadModel(cfg, device="cuda", dtype=torch.bfloat16).eval()
+    x = torch.randint(0, 128, (1, 6), device="cuda")
+    with torch.inference_mode():
+        result = model(x)
+        out = model.generate(x[:, :3], max_length=6, teacher_outputs=x, cg=False)
+    assert result.logits.dtype == torch.bfloat16
+    assert tuple(out.shape) == (1, 6)
+
+
 if __name__ == "__main__":
     print("silence off, cpu diff:", _run("cpu", False))
     print("silence on,  cpu diff:", _run("cpu", True))

@@ -168,9 +168,9 @@ class SilenceBlock(nn.Module):
             # replaces the sigma-conditioned read, so e_t is not handicapped and the ablated
             # factor is precisely the silent read of S through sigma.
             q = self.pool_query.expand(*sigma_prev.shape[:-1], -1)
-            pooled = evidence_read(q, phi_prev, exclude_current=True, pooled=True)
+            pooled = evidence_read(q, phi_prev, exclude_current=True, pooled=True).to(g_t.dtype)
             pre = (self.pool_proj(pooled) + self.predict.hyp_proj(sigma_prev)
-                   + self.predict.phase_proj(_phase_embed(phi_prev, self.d_phase)))
+                   + self.predict.phase_proj(_phase_embed(phi_prev, self.d_phase).to(g_t.dtype)))
         else:
             if getattr(self, "_zero_sigma_in_predict", False):
                 # §16 sigma-relevance check: zero the sigma input to the prediction head and
@@ -179,9 +179,9 @@ class SilenceBlock(nn.Module):
             # The no-read control (§14) zeroes the SILENT read r^j only; the predictive read is
             # part of the prediction head (C5) and stays intact, so the control isolates r^j.
             q_pred = self.predict.query_proj(sigma_prev)
-            r_pred = evidence_read(q_pred, phi_prev, exclude_current=True)
+            r_pred = evidence_read(q_pred, phi_prev, exclude_current=True).to(g_t.dtype)
             pre = (self.predict.read_proj(r_pred) + self.predict.hyp_proj(sigma_prev)
-                   + self.predict.phase_proj(_phase_embed(phi_prev, self.d_phase)))
+                   + self.predict.phase_proj(_phase_embed(phi_prev, self.d_phase).to(g_t.dtype)))
         g_hat = self.predict.out_proj(self.predict.norm(pre))
         return g_hat, g_t - g_hat
 
@@ -233,7 +233,7 @@ class SilenceBlock(nn.Module):
             phi_t = phi_t[..., perm, :]
 
         def read(sigma):
-            r = evidence_read(self.register.read_proj(sigma), phi_t, exclude_current=False)
+            r = evidence_read(self.register.read_proj(sigma), phi_t, exclude_current=False).to(g_t.dtype)
             return torch.zeros_like(r) if no_read else r
 
         # §5 predictive grounding, §6 precision, §7 register init
@@ -338,4 +338,7 @@ class SilenceBlock(nn.Module):
         return o_t, aux
 
     def _output(self, g_t, sigma):
+        dtype = self.condition_out.weight.dtype
+        g_t = g_t.to(dtype)
+        sigma = sigma.to(dtype)
         return self.condition_out(self.condition_norm(g_t + self.condition_out_sigma(sigma)))

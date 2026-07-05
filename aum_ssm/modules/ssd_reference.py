@@ -45,6 +45,9 @@ def ssd_minimal_discrete(X, A, B, C, block_len, initial_states=None, exclude_dia
     state S_{t-1}, before the current token's write) — used by the §4 predictive grounding read.
     """
     assert X.shape[1] % block_len == 0
+    calc_dtype = torch.promote_types(torch.promote_types(X.dtype, A.dtype),
+                                    torch.promote_types(B.dtype, C.dtype))
+    X, A, B, C = (t.to(calc_dtype) for t in (X, A, B, C))
     X, A, B, C = [rearrange(t, "b (c l) ... -> b c l ...", l=block_len) for t in (X, A, B, C)]
     A = rearrange(A, "b c l h -> b h c l")
     A_cumsum = torch.cumsum(A, dim=-1)
@@ -153,8 +156,9 @@ def aum_unfold_step_ref(q, k, v, tau_bar, lam_bar, r, theta, z=None, D=None,
     B, L, H, Dqk = q.shape
     Dv = v.shape[-1]
     dtype = q.dtype
-    S = torch.zeros(B, H, Dv, Dqk, dtype=dtype, device=q.device) if S0 is None else S0.clone()
-    phi = torch.zeros(B, H, dtype=dtype, device=q.device) if phi0 is None else phi0.clone()
+    state_dtype = torch.promote_types(dtype, freqs.dtype if freqs is not None else dtype)
+    S = torch.zeros(B, H, Dv, Dqk, dtype=state_dtype, device=q.device) if S0 is None else S0.clone()
+    phi = torch.zeros(B, H, dtype=state_dtype, device=q.device) if phi0 is None else phi0.clone()
 
     outs = []
     for t in range(L):
@@ -167,6 +171,7 @@ def aum_unfold_step_ref(q, k, v, tau_bar, lam_bar, r, theta, z=None, D=None,
         q_rot = _rotate_ladder(q[:, t], phi, freqs)
         k_rot = _rotate_ladder(k_hat, phi, freqs)
         w = (rho * tau).unsqueeze(-1).unsqueeze(-1)             # (B,H,1,1)
+        alpha_log = alpha_log.to(S.dtype)
         S = torch.exp(alpha_log).unsqueeze(-1).unsqueeze(-1) * S
         S = S + w * (v_hat.unsqueeze(-1) * k_rot.unsqueeze(-2))  # v_hat (x) k_rot -> (B,H,Dv,Dqk)
         out = torch.einsum("bhpn,bhn->bhp", S, q_rot)            # S_t q_rot
