@@ -480,12 +480,14 @@ identifier must resolve to a QA check that is actually wired into the run — a 
 with no runnable check is itself build-blocking, so the registry cannot point at checks that do
 not exist. Coverage is **literal and execution-driven**: each recomputation verifier reports the
 exact `(scope, field)` pairs it asserted `recomputed == emitted` for this run, and a `derived`
-field is covered only if it appears in some passing verifier's report. Fields that are genuinely
-`derived` but do not yet have an emitter-independent recomputation (surface *content* values
-awaiting a second text decoder) are enumerated on a checked-in `RECOMPUTE_PENDING` allowlist —
-the visible, shrinking backlog. A `derived` field that is neither covered nor on that allowlist
-is build-blocking, so a new field cannot enter unverified; adding it to the allowlist is a
-deliberate, reviewable act. New fields enter verified or do not enter.
+field is covered only if it appears in some passing verifier's report. Surface *content* values (write/event/demonstration keys, values, swapped entities) are
+recomputed by an independent text decoder (`content_decode`) that parses the rendered family
+grammars and, for F3, replays key state. Any `derived` field still lacking an
+emitter-independent recomputation is enumerated on a checked-in `RECOMPUTE_PENDING` allowlist —
+the visible, shrinking backlog (currently only `target_age_bin`, whose ground truth is the
+sampled age bin and is not recoverable from the bytes). A `derived` field that is neither
+covered nor on that allowlist is build-blocking, so a new field cannot enter unverified; adding
+it to the allowlist is a deliberate, reviewable act. New fields enter verified or do not enter.
 
 ---
 

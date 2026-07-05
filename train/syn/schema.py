@@ -29,8 +29,8 @@ WIRED_VERIFIERS = frozenset({
     "schema_completeness", "schema_admission", "query_position_contract",
     "distractor_surface", "f3_age", "filler_scaffolding", "train_eval_symbol_exclusion",
     "f1_rule_consistency", "minimal_suffix", "difficulty_strata",
-    "composition_depth_recompute", "age_flag_recompute", "provenance_audit",
-    "metadata_recomputation",
+    "composition_depth_recompute", "age_flag_recompute", "content_decode",
+    "provenance_audit", "metadata_recomputation",
 })
 
 # Owners that re-derive their field from the bytes (or from bytes-verified sibling fields) along
@@ -39,7 +39,7 @@ RECOMPUTE_OWNERS = frozenset({
     "window_integrity", "offset_contract", "query_position_contract", "distractor_surface",
     "filler_scaffolding", "minimal_suffix", "f1_rule_consistency", "controlled_distribution",
     "instance_task_density", "composition_depth_recompute", "age_flag_recompute",
-    "train_eval_symbol_exclusion",
+    "content_decode", "train_eval_symbol_exclusion",
 })
 
 REQUIRED_RECORD_FIELDS = {
@@ -159,10 +159,10 @@ WRITE_FIELDS = {
 }
 
 WRITE_FIELD_VERIFIERS = {
-    "entity": "minimal_suffix",
-    "key": "minimal_suffix",
+    "entity": "content_decode",
+    "key": "content_decode/minimal_suffix",
     "pos": "offset_contract/minimal_suffix",
-    "value": "minimal_suffix",
+    "value": "content_decode",
 }
 
 EVENT_FIELDS = {
@@ -178,18 +178,18 @@ EVENT_FIELDS = {
 
 EVENT_FIELD_VERIFIERS = {
     "changed_symbols": "f1_rule_consistency",
-    "event_index": "minimal_suffix",
-    "key": "minimal_suffix",
+    "event_index": "content_decode",
+    "key": "content_decode",
     "mentioned_symbols": "f1_rule_consistency",
-    "new": "minimal_suffix",
-    "old": "minimal_suffix",
+    "new": "content_decode",
+    "old": "content_decode",
     "pos": "offset_contract/minimal_suffix",
     "restatement": "f1_rule_consistency",
-    "source_state": "f1_rule_consistency",
-    "swapped_entities": "minimal_suffix",
-    "target_state": "f1_rule_consistency",
+    "source_state": "content_decode/f1_rule_consistency",
+    "swapped_entities": "content_decode",
+    "target_state": "content_decode/f1_rule_consistency",
     "transition_id": "provenance_audit",
-    "type": "minimal_suffix",
+    "type": "content_decode",
 }
 
 DISTRACTOR_FIELDS = {"mimics_family", "pos", "variant"}
@@ -209,9 +209,9 @@ CONTROLLED_GAP_FIELD_VERIFIERS = {
 
 DEMONSTRATION_FIELDS = {"answer", "answer_pos", "key", "pos"}
 DEMONSTRATION_FIELD_VERIFIERS = {
-    "answer": "minimal_suffix",
+    "answer": "content_decode/minimal_suffix",
     "answer_pos": "query_position_contract",
-    "key": "minimal_suffix",
+    "key": "content_decode/minimal_suffix",
     "pos": "offset_contract/minimal_suffix",
 }
 
@@ -220,7 +220,7 @@ LABEL_POSITION_FIELD_VERIFIERS = {
     "decoded": "offset_contract",
     "expected": "offset_contract",
     "pos": "offset_contract",
-    "role": "offset_contract",
+    "role": "content_decode",
 }
 
 # Field class overrides. Anything not listed here is ``derived`` and must be covered, per QA
@@ -253,13 +253,10 @@ STRUCTURAL_FIELDS = {
 # ``metadata_recomputation_audit``: a NEW derived field that is not covered and not listed here
 # is build-blocking, so nothing slips in unverified. Shrinks as decoders are added.
 RECOMPUTE_PENDING = {
+    # target_age_bin's ground truth is the sampled age_bin, which is not recoverable from the
+    # bytes independently of the field itself (the realized controlled gap only bounds F1/F3
+    # gap instances, not F2/F4/F5 or gap-less instances). Left as the honest residual.
     ("query_common", "target_age_bin"),
-    ("write", "key"), ("write", "value"), ("write", "entity"),
-    ("event", "key"), ("event", "new"), ("event", "old"), ("event", "swapped_entities"),
-    ("event", "type"), ("event", "event_index"),
-    ("event", "source_state"), ("event", "target_state"),
-    ("demonstration", "answer"), ("demonstration", "key"),
-    ("label_position", "role"),
 }
 
 

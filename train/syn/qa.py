@@ -1173,6 +1173,147 @@ def age_flag_audit(records):
             "checked": checked, "verified_fields": verified, "bad": bad}
 
 
+def content_decode_audit(out_dir, records, alpha, seq_len=4096):
+    """Independent surface decoder: recompute write/event/demonstration *content* values from
+    the rendered token bytes and construction rules, and assert equality with the sidecar. This
+    is the emitter-independent parser that drains the RECOMPUTE_PENDING content fields.
+
+    - write.key/entity: byte at write.pos; write.value: token before the statement's period.
+    - F1 demo.key/answer: bytes at demo.pos/answer_pos.
+    - event.type/event_index/source_state/target_state: construction rules.
+    - F2 event.swapped_entities: the Sigma symbols in the swap sentence.
+    - F3 event.key/new: swap-sentence surface; event.old: replayed key state from writes+events.
+    - F5 event.old/new: the switch registry ids (not byte content).
+    """
+    if alpha is None:
+        return {"name": "content_decode", "ok": False, "error": "alpha required"}
+    sigma = set(alpha.sigma)
+    event_type_by_family = {"F1": "reversal", "F2": "swap", "F3": "correction", "F5": "switch"}
+    allowed_roles = {"write", "demo", "demo_answer", "query", "answer", "event", "distractor"}
+    bad = []
+    seen = set()
+    maps = {}
+
+    def flag(r, **kw):
+        kw["instance_id"] = r.get("instance_id")
+        kw["family"] = r.get("family")
+        bad.append(kw)
+
+    for r in records:
+        fam = r.get("family")
+        path = os.path.join(out_dir, r["shard"])
+        mm = maps.get(path)
+        if mm is None:
+            mm = maps[path] = np.memmap(path, dtype=np.uint16, mode="r")
+        base = int(r["window_index"]) * seq_len + int(r["start_offset"])
+        token_len = int(r["token_len"])
+
+        def word(rel):
+            if rel < 0 or rel >= token_len:
+                return None
+            return alpha.tokenizer.decode([int(mm[base + rel])],
+                                          clean_up_tokenization_spaces=False).strip()
+
+        def span_words(start):
+            out = []
+            for rel in range(int(start), token_len):
+                w = word(rel)
+                out.append(w)
+                if w == ".":
+                    break
+            return out
+
+        for lab in r.get("label_positions", []):
+            seen.add(("label_position", "role"))
+            if lab.get("role") not in allowed_roles:
+                flag(r, field="label_position.role", role=lab.get("role"))
+
+        for w in r.get("writes", []):
+            pos = int(w["pos"])
+            key_field = "entity" if fam == "F2" else "key"
+            seen.add(("write", "key"))
+            if word(pos) != w.get("key"):
+                flag(r, field="write.key", pos=pos, decoded=word(pos), emitted=w.get("key"))
+            if fam == "F2":
+                seen.add(("write", "entity"))
+                if word(pos) != w.get("entity"):
+                    flag(r, field="write.entity", pos=pos, decoded=word(pos),
+                         emitted=w.get("entity"))
+            seen.add(("write", "value"))
+            sw = span_words(pos)
+            value = sw[-2] if len(sw) >= 2 and sw[-1] == "." else None
+            if value != w.get("value"):
+                flag(r, field="write.value", pos=pos, decoded=value, emitted=w.get("value"))
+
+        for d in r.get("demonstrations", []):
+            seen.add(("demonstration", "key"))
+            seen.add(("demonstration", "answer"))
+            if word(int(d["pos"])) != d.get("key"):
+                flag(r, field="demonstration.key", decoded=word(int(d["pos"])),
+                     emitted=d.get("key"))
+            if word(int(d["answer_pos"])) != d.get("answer"):
+                flag(r, field="demonstration.answer", decoded=word(int(d["answer_pos"])),
+                     emitted=d.get("answer"))
+
+        # F3 key state replay for event.old
+        table = {w.get("key"): w.get("value") for w in r.get("writes", [])} if fam == "F3" else {}
+        events = sorted(r.get("events", []), key=lambda e: int(e["pos"]) if e.get("pos") is not None else 0)
+        for idx, e in enumerate(events):
+            if "type" in e:
+                seen.add(("event", "type"))
+                if e.get("type") != event_type_by_family.get(fam):
+                    flag(r, field="event.type", emitted=e.get("type"),
+                         expected=event_type_by_family.get(fam))
+            if "event_index" in e:
+                seen.add(("event", "event_index"))
+                if int(e.get("event_index", -1)) != idx:
+                    flag(r, field="event.event_index", emitted=e.get("event_index"), expected=idx)
+            if fam == "F1":
+                seen.add(("event", "source_state"))
+                seen.add(("event", "target_state"))
+                if e.get("source_state") != f"S{idx}":
+                    flag(r, field="event.source_state", emitted=e.get("source_state"),
+                         expected=f"S{idx}")
+                if e.get("target_state") != f"S{idx + 1}":
+                    flag(r, field="event.target_state", emitted=e.get("target_state"),
+                         expected=f"S{idx + 1}")
+            elif fam == "F2":
+                seen.add(("event", "swapped_entities"))
+                sw = span_words(int(e["pos"]))
+                decoded_set = {w for w in sw if w in sigma}
+                if decoded_set != set(e.get("swapped_entities", [])):
+                    flag(r, field="event.swapped_entities", decoded=sorted(decoded_set),
+                         emitted=sorted(e.get("swapped_entities", [])))
+            elif fam == "F3":
+                seen.add(("event", "key"))
+                seen.add(("event", "new"))
+                seen.add(("event", "old"))
+                sw = span_words(int(e["pos"]))
+                dec_key = sw[sw.index("key") + 1] if "key" in sw and sw.index("key") + 1 < len(sw) else None
+                dec_new = sw[sw.index("box") + 1] if "box" in sw and sw.index("box") + 1 < len(sw) else None
+                if dec_key != e.get("key"):
+                    flag(r, field="event.key", decoded=dec_key, emitted=e.get("key"))
+                if dec_new != e.get("new"):
+                    flag(r, field="event.new", decoded=dec_new, emitted=e.get("new"))
+                expected_old = table.get(e.get("key"))
+                if e.get("old") != expected_old:
+                    flag(r, field="event.old", emitted=e.get("old"), expected=expected_old)
+                table[e.get("key")] = e.get("new")
+            elif fam == "F5":
+                seen.add(("event", "old"))
+                seen.add(("event", "new"))
+                regids = r.get("registry_ids", {})
+                if e.get("old") != regids.get("A"):
+                    flag(r, field="event.old", emitted=e.get("old"), expected=regids.get("A"))
+                if e.get("new") != regids.get("B"):
+                    flag(r, field="event.new", emitted=e.get("new"), expected=regids.get("B"))
+        if len(bad) >= 20:
+            break
+
+    return {"name": "content_decode", "ok": not bad and bool(records),
+            "verified_fields": sorted(seen), "bad": bad[:20]}
+
+
 def provenance_audit(out_dir, records):
     """Re-establish provenance fields: corpus_version matches the manifest, registry/placement
     fields are well-typed. Provenance fields are not byte-derived, so they get this owner rather
@@ -1309,6 +1450,7 @@ def run_qa(out_dir, alpha=None, seq_len=4096):
                minimal_suffix_audit(all_records),
                composition_depth_audit(all_records),
                age_flag_audit(all_records),
+               content_decode_audit(out_dir, all_records, alpha, seq_len),
                provenance_audit(out_dir, all_records),
                difficulty_stratum_audit(all_records)]
     checks.append(metadata_recomputation_audit(checks))
