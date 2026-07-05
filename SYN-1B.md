@@ -470,6 +470,11 @@ mixture; QA-8 measures task density **inside synthetic instances**, where the ge
 control. In dry-run mode `--dry-run-tokens` targets synthetic instance tokens before EOS
 padding, not final stream tokens, so the on-disk shard token count can be much larger than the
 flag when many windows contain one or two short inspection instances plus padding.
+Human inspection must not repeatedly decode deterministic shard heads as a proxy for corpus
+coverage. The generator's `--inspect-strata` mode samples decoded instances by seeded audit
+strata: controlled top age-bin gap, F3 depth-2 correction, F4 with F2-shaped distractor, and
+eval/Σ_ev usage. When `--inspect-out-dir` is set, the inspection output writes full decoded
+text and full sidecars with `elided: []`; stdout excerpts are explicitly non-normative.
 
 ---
 
@@ -602,7 +607,10 @@ generator truth label because W is run-specific.
 8. `train/syn/forward_probe.py` — model-side plumbing probe: verifies packed-window
    anchor/answer alignment through the real model input path and reports padding-excluded
    loss diagnostics.
-9. `MANIFEST.syn-1b-v1.3.json` — seeds, hashes, counts, `max_attention_window_planned`, and
+9. `train/gen_SYN-1B.py --inspect-strata --inspect-out-dir <dir>` — seeded human-audit
+   sample exporter covering top-age, F3 depth-2, F4/F2-distractor, and eval/Σ_ev strata with
+   full sidecars and no silent field elision.
+10. `MANIFEST.syn-1b-v1.3.json` — seeds, hashes, counts, `max_attention_window_planned`, and
    per-check QA statistics.
 
 Estimated effort: the five generators are 100–200 lines each; `pack.py` and the QA suite are
